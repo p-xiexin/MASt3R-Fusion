@@ -345,18 +345,32 @@ class FactorGraph:
         shape_j = [kf_j.img_true_shape for kf_j in kf_jj]
         # print('2',time.time())
 
-        (
-            idx_i2j,
-            idx_j2i,
-            valid_match_j,
-            valid_match_i,
-            Qii,
-            Qjj,
-            Qji,
-            Qij,
-        ) = mast3r_match_symmetric(
-            self.model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, self.subpixel_factor
-        )
+        if hasattr(self.model, "match_symmetric_batch"):
+            (
+                idx_i2j,
+                idx_j2i,
+                valid_match_j,
+                valid_match_i,
+                Qii,
+                Qjj,
+                Qji,
+                Qij,
+            ) = self.model.match_symmetric_batch(
+                feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, self.subpixel_factor
+            )
+        else:
+            (
+                idx_i2j,
+                idx_j2i,
+                valid_match_j,
+                valid_match_i,
+                Qii,
+                Qjj,
+                Qji,
+                Qij,
+            ) = mast3r_match_symmetric(
+                self.model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, self.subpixel_factor
+            )
         # print('3',time.time())
 
         batch_inds = torch.arange(idx_i2j.shape[0], device=idx_i2j.device)[

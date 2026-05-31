@@ -34,10 +34,20 @@ class FrameTracker:
     def track(self, frame: Frame):
         keyframe = self.keyframes.last_keyframe()
 
-
-        idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf = mast3r_match_asymmetric(
-            self.model, frame, keyframe, idx_i2j_init=self.idx_f2k
-        )
+        if hasattr(self.model, "match_pair"):
+            match = self.model.match_pair(frame, keyframe, init=self.idx_f2k)
+            idx_f2k = match.idx_i2j
+            valid_match_k = match.valid_match_j
+            Xff = match.Xii
+            Cff = match.Cii
+            Qff = match.Qii
+            Xkf = match.Xji
+            Ckf = match.Cji
+            Qkf = match.Qji
+        else:
+            idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf = mast3r_match_asymmetric(
+                self.model, frame, keyframe, idx_i2j_init=self.idx_f2k
+            )
         # Save idx for next
         self.idx_f2k = idx_f2k.clone()
 

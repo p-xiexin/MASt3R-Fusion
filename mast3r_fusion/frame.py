@@ -26,6 +26,10 @@ class Frame:
     C: Optional[torch.Tensor] = None
     feat: Optional[torch.Tensor] = None
     pos: Optional[torch.Tensor] = None
+    mv_feat: Optional[torch.Tensor] = None
+    mv_context_id: Optional[int] = None
+    mv_pointmap: Optional[torch.Tensor] = None
+    mv_conf: Optional[torch.Tensor] = None
     N: int = 0
     N_updates: int = 0
     K: Optional[torch.Tensor] = None
@@ -125,7 +129,7 @@ def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
 
 
 class SharedStates:
-    def __init__(self, manager, h, w, dtype=torch.float32, device="cuda"):
+    def __init__(self, manager, h, w, dtype=torch.float32, device="cuda", feature_spec=None):
         self.h, self.w = h, w
         self.dtype = dtype
         self.device = device
@@ -138,8 +142,11 @@ class SharedStates:
         self.edges_ii = manager.list()
         self.edges_jj = manager.list()
 
-        self.feat_dim = 1024
-        self.num_patches = h * w // (16 * 16)
+        self.feat_dim = getattr(feature_spec, "feat_dim", 1024)
+        if feature_spec is not None:
+            self.num_patches = feature_spec.num_patches(h, w)
+        else:
+            self.num_patches = h * w // (16 * 16)
 
         # fmt:off
         # shared state for the current frame (used for reloc/visualization)
@@ -220,7 +227,7 @@ class SharedStates:
 
 import cv2
 class SharedKeyframes:
-    def __init__(self, manager, h, w, buffer=64, dtype=torch.float32, device="cuda"):
+    def __init__(self, manager, h, w, buffer=64, dtype=torch.float32, device="cuda", feature_spec=None):
         self.lock = manager.RLock()
         self.n_size = manager.Value("i", 0)
         self.rollup_sum = manager.Value("i", 0)
@@ -230,8 +237,11 @@ class SharedKeyframes:
         self.dtype = dtype
         self.device = device
 
-        self.feat_dim = 1024
-        self.num_patches = h * w // (16 * 16)
+        self.feat_dim = getattr(feature_spec, "feat_dim", 1024)
+        if feature_spec is not None:
+            self.num_patches = feature_spec.num_patches(h, w)
+        else:
+            self.num_patches = h * w // (16 * 16)
 
         # fmt:off
         self.dataset_idx = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()

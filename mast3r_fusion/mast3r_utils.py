@@ -27,7 +27,13 @@ def load_retriever(mast3r_model, retriever_path=None, device="cuda"):
         if retriever_path is None
         else retriever_path
     )
-    retriever = RetrievalDatabase(retriever_path, backbone=mast3r_model, device=device)
+    backbone = getattr(mast3r_model, "model", mast3r_model)
+    if backbone is None:
+        raise NotImplementedError(
+            "The current retriever requires a MASt3R-compatible backbone. "
+            "Provide a retrieval embedding for the selected frontend before running loop retrieval."
+        )
+    retriever = RetrievalDatabase(retriever_path, backbone=backbone, device=device)
     return retriever
 
 

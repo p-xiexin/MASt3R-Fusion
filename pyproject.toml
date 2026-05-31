@@ -19,5 +19,5 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mast3r_fusion"]
+include = ["mast3r_fusion*"]
 namespaces = false

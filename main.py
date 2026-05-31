@@ -14,11 +14,8 @@ from mast3r_fusion.config import load_config, config, set_global_config
 from mast3r_fusion.dataloader import Intrinsics, load_dataset
 import mast3r_fusion.evaluate as eval
 from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
-from mast3r_fusion.mast3r_utils import (
-    load_mast3r,
-    load_retriever,
-    mast3r_inference_mono,
-)
+from mast3r_fusion.frontend_model import load_frontend_model
+from mast3r_fusion.mast3r_utils import load_retriever, mast3r_inference_mono
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
 from mast3r_fusion.tracker import FrameTracker
 from mast3r_fusion.visualization import WindowMsg, run_visualization
@@ -181,8 +178,12 @@ if __name__ == "__main__":
     if not (intrinsics.get("height_new",None) is None):
         h = intrinsics.get("height_new",None) * w // intrinsics["width"]
 
-    keyframes = SharedKeyframes(manager, h, w)
-    states = SharedStates(manager, h, w)
+    model = load_frontend_model(device=device)
+    model.share_memory()
+    feature_spec = model.get_feature_spec() if hasattr(model, "get_feature_spec") else None
+
+    keyframes = SharedKeyframes(manager, h, w, feature_spec=feature_spec)
+    states = SharedStates(manager, h, w, feature_spec=feature_spec)
 
     if not args.no_viz:
         viz = mp.Process(
@@ -190,9 +191,6 @@ if __name__ == "__main__":
             args=(config, states, keyframes, main2viz, viz2main),
         )
         viz.start()
-
-    model = load_mast3r(device=device)
-    model.share_memory()
 
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]
@@ -281,7 +279,10 @@ if __name__ == "__main__":
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
-            X_init, C_init = mast3r_inference_mono(model, frame)
+            if hasattr(model, "infer_single"):
+                X_init, C_init = model.infer_single(frame)
+            else:
+                X_init, C_init = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1 + keyframes.rollup_sum.value)
@@ -296,7 +297,10 @@ if __name__ == "__main__":
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
         elif mode == Mode.RELOC:
-            X, C = mast3r_inference_mono(model, frame)
+            if hasattr(model, "infer_single"):
+                X, C = model.infer_single(frame)
+            else:
+                X, C = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()
