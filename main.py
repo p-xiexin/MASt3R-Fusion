@@ -57,12 +57,15 @@ def run_backend(states, keyframes):
     frame = keyframes[idx]
 
     # find local(!) co-visible frames
-    retrieval_inds = retrieval_database.update(
-        frame,
-        add_after_query=True,
-        k=config["retrieval"]["k"],
-        min_thresh=config["retrieval"]["min_thresh"],
-    )
+    if retrieval_database is not None:
+        retrieval_inds = retrieval_database.update(
+            frame,
+            add_after_query=True,
+            k=config["retrieval"]["k"],
+            min_thresh=config["retrieval"]["min_thresh"],
+        )
+    else:
+        retrieval_inds = []
 
     retrieval_inds_selected = []
     retrieval_inds = find_valid_numbers(idx,retrieval_inds)
@@ -146,6 +149,8 @@ if __name__ == "__main__":
     parser.add_argument("--start_from", type =  int, default=0)
     parser.add_argument("--end_at", type =  int, default=-1)
     parser.add_argument("--save_h5", action="store_true")
+    parser.add_argument("--frontend-model", choices=["mast3r", "pi3", "pi3x"], default=None)
+    parser.add_argument("--frontend-weights", default=None)
 
 
     args = parser.parse_args()
@@ -178,7 +183,11 @@ if __name__ == "__main__":
     if not (intrinsics.get("height_new",None) is None):
         h = intrinsics.get("height_new",None) * w // intrinsics["width"]
 
-    model = load_frontend_model(device=device)
+    model = load_frontend_model(
+        name=args.frontend_model,
+        path=args.frontend_weights,
+        device=device,
+    )
     model.share_memory()
     feature_spec = model.get_feature_spec() if hasattr(model, "get_feature_spec") else None
 
@@ -222,7 +231,10 @@ if __name__ == "__main__":
     factor_graph = FactorGraph(model, keyframes, K, device, args)
     factor_graph.poses_stamps = dataset.timestamps
     
-    retrieval_database = load_retriever(model)
+    if getattr(model, "name", "mast3r") == "mast3r":
+        retrieval_database = load_retriever(model)
+    else:
+        retrieval_database = None
 
     i = 0
     fps_timer = time.time()

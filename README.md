@@ -100,6 +100,21 @@ wget https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge
 wget https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl -P checkpoints/
 ```
 
+Optional PI3X frontend checkpoints can be placed under `checkpoints/pi3x/`.
+The upstream PI3 repository recommends Pi3X for the new model and publishes the
+weights on Hugging Face. Install PI3X first, then set the checkpoint path when
+running this project:
+
+```bash
+git clone https://github.com/yyfz/Pi3.git thirdparty/Pi3
+pip install -e thirdparty/Pi3
+
+mkdir -p checkpoints/pi3x/
+wget https://huggingface.co/yyfz233/Pi3X/resolve/main/model.safetensors -O checkpoints/pi3x/model.safetensors
+
+python main.py --frontend-model pi3x --frontend-weights checkpoints/pi3x/model.safetensors ...
+```
+
 ## Run on KITTI-360 (V + I)
 
 Download the [KITTI-360](https://www.cvlibs.net/datasets/kitti-360/index.php) datasets (we use ``Perspective Images for Train & Val (128G)'' for the evaluation). 

@@ -10,7 +10,7 @@ def load_frontend_model(name=None, path=None, device="cuda", **kwargs):
 
     if name == "mast3r":
         return MASt3RAdapter.load(path=path, device=device, **kwargs)
-    if name == "pi3":
+    if name in ("pi3", "pi3x"):
         return PI3Adapter.load(path=path, device=device, **kwargs)
 
     raise ValueError(f"Unsupported frontend model: {name}")
