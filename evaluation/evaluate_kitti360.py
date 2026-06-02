@@ -22,6 +22,8 @@ import mast3r_fusion.geoFunc.trans as trans
 logger = logging.getLogger(__name__)
 
 SEP = "-" * 80  # separator line
+TRAJECTORY_FIGURE = "KITTI-360 Trajectory and Error"
+ROTATION_ERROR_FIGURE = "KITTI-360 Rotation Error"
 
 def ape(traj_ref: PosePath3D, traj_est: PosePath3D,
         pose_relation: metrics.PoseRelation, align: bool = False,
@@ -92,13 +94,13 @@ def ape(traj_ref: PosePath3D, traj_est: PosePath3D,
 
 if __name__ == '__main__':
     color_list = [[0,0,1],[1,0.6,1],[1,0,0]]
-    plt.figure('1',figsize=[6,6])
     parser = argparse.ArgumentParser()
     parser.add_argument('--seq', type=str, help='seq',default='0005')
     parser.add_argument('--kf_only', type=bool, default = False)
     args = parser.parse_args()
     args.subcommand = 'tum'
     seq = args.seq
+    output_prefix = f'kitti360_{seq}'
     args.ref_file = '/mnt/nas/Dataset/KITTI-360/2013_05_28_drive_%s_sync/gt_local.txt' % seq
     args.pose_relation = 'trans_part'
     args.align = True
@@ -117,7 +119,7 @@ if __name__ == '__main__':
          'result_%s.txt'%seq,
         #  'result_post_%s.txt'%seq,
                               ]
-    label_list = ['MAST3R-Fusion']
+    label_list = ['MASt3R-Fusion']
     color_list = [[1,0,0]]
     args.save_plot = False
     args.serialize_plot = False
@@ -200,7 +202,7 @@ if __name__ == '__main__':
             segment_lengths = np.sqrt(dx**2 + dy**2)
             return segment_lengths.sum()
 
-        plt.figure('123',figsize=[10*0.7,14*0.7])
+        plt.figure(TRAJECTORY_FIGURE,figsize=[10*0.7,14*0.7])
         leng = 0.0
         plt.subplot(3,1,1)
         if iii == 0:
@@ -243,17 +245,32 @@ if __name__ == '__main__':
             qqq = Rotation.from_matrix(TTT[:3, :3]/np.power(np.linalg.det(TTT[:3, :3]),1.0/3)).as_quat()
             t_series.append(traj_est_sel_temp.timestamps[i])
         plt.plot(x_series,y_series,c=color_list[iii],label = label_list[iii])
+        plt.title('Trajectory')
+        plt.xlabel('x [m]')
+        plt.ylabel('y [m]')
+        plt.legend()
+        plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.5)
         plt.gca().set_aspect(1)
 
         plt.subplot(3,1,2)
-        plt.plot(t_series,np.array(x_series) - np.array(x0_series))
-        plt.plot(t_series,np.array(y_series) - np.array(y0_series))
+        plt.plot(t_series,np.array(x_series) - np.array(x0_series),label=f'{label_list[iii]} x error')
+        plt.plot(t_series,np.array(y_series) - np.array(y0_series),label=f'{label_list[iii]} y error')
+        plt.title('Translation Error')
+        plt.xlabel('time [s]')
+        plt.ylabel('error [m]')
+        plt.legend()
+        plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.5)
         plt.subplot(3,1,3)
-        plt.plot(t_series,np.fmod(np.array(ax_series) - np.array(ax0_series)+540,360)-180)
-        plt.plot(t_series,np.fmod(np.array(ay_series) - np.array(ay0_series)+540,360)-180)
-        plt.plot(t_series,np.fmod(np.array(az_series) - np.array(az0_series)+540,360)-180)
-        plt.savefig('result_temp.png',dpi=600)
-    plt.savefig('temp.png')
+        plt.plot(t_series,np.fmod(np.array(ax_series) - np.array(ax0_series)+540,360)-180,label=f'{label_list[iii]} roll error')
+        plt.plot(t_series,np.fmod(np.array(ay_series) - np.array(ay0_series)+540,360)-180,label=f'{label_list[iii]} pitch error')
+        plt.plot(t_series,np.fmod(np.array(az_series) - np.array(az0_series)+540,360)-180,label=f'{label_list[iii]} yaw error')
+        plt.title('Attitude Error')
+        plt.xlabel('time [s]')
+        plt.ylabel('error [deg]')
+        plt.legend()
+        plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.5)
+        plt.tight_layout()
+        plt.savefig(f'{output_prefix}_trajectory_error.png',dpi=600)
 
     t_series=[]
     x_series=[]
@@ -268,10 +285,17 @@ if __name__ == '__main__':
         x_series.append(att[0])
         y_series.append(att[1])
         z_series.append(att[2])
-    plt.figure()
-    plt.plot(t_series,x_series)
-    plt.plot(t_series,y_series)
-    plt.plot(t_series,z_series)
+    plt.figure(ROTATION_ERROR_FIGURE,figsize=[8,4])
+    plt.plot(t_series,x_series,label='rotation error x')
+    plt.plot(t_series,y_series,label='rotation error y')
+    plt.plot(t_series,z_series,label='rotation error z')
+    plt.title(f'KITTI-360 sequence {seq} rotation error')
+    plt.xlabel('time [s]')
+    plt.ylabel('rotation vector [rad]')
+    plt.legend()
+    plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(f'{output_prefix}_rotation_error.png',dpi=300)
     plt.show()
 
     print('Evaluating relative pose error ...')
