@@ -41,9 +41,7 @@ def pose_xyz(pose):
         pose = pose.detach().cpu().numpy()
     return np.asarray(pose).reshape(-1)[:3].astype(np.float64)
 
-def save_trajectory_overview(id_poses, selected_ids, frame_id, output_path):
-    if output_path is None:
-        return
+def save_trajectory_overview(id_poses, selected_ids, frame_id, output_path, show_plot):
     all_ids = sorted(id_poses.keys())
     if not all_ids:
         return
@@ -54,7 +52,6 @@ def save_trajectory_overview(id_poses, selected_ids, frame_id, output_path):
         x_series.append(xyz[0])
         y_series.append(xyz[1])
     selected_ids = [i for i in selected_ids if i in id_poses]
-    ref_ids = [i for i in range(frame_id - 10, frame_id + 10) if i in id_poses]
 
     plt.figure("check_h5_trajectory_window", figsize=[10 * 0.7, 14 * 0.7])
     plt.clf()
@@ -80,37 +77,9 @@ def save_trajectory_overview(id_poses, selected_ids, frame_id, output_path):
             selected_x_series,
             selected_y_series,
             c=[1, 0, 0],
-            linewidth=3.0,
+            linewidth=2.0,
             label="visualized segment",
             zorder=200,
-        )
-        plt.scatter(
-            selected_x_series,
-            selected_y_series,
-            s=42,
-            facecolor="yellow",
-            edgecolor="red",
-            linewidth=1.5,
-            zorder=250,
-        )
-
-    if ref_ids:
-        ref_x_series = []
-        ref_y_series = []
-        for i in ref_ids:
-            xyz = pose_xyz(id_poses[i])
-            ref_x_series.append(xyz[0])
-            ref_y_series.append(xyz[1])
-        plt.scatter(
-            ref_x_series,
-            ref_y_series,
-            s=80,
-            marker="*",
-            facecolor="deepskyblue",
-            edgecolor="black",
-            linewidth=0.8,
-            label="frame_id +/- 10 refs",
-            zorder=300,
         )
 
     if frame_id in id_poses:
@@ -142,8 +111,12 @@ def save_trajectory_overview(id_poses, selected_ids, frame_id, output_path):
     plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
     plt.gca().set_aspect(1)
     plt.tight_layout()
-    plt.savefig(output_path, dpi=600)
-    print(f"Saved trajectory overview to {output_path}")
+    if output_path is not None:
+        plt.savefig(output_path, dpi=600)
+        print(f"Saved trajectory overview to {output_path}")
+    if show_plot:
+        plt.show(block=False)
+        plt.pause(0.1)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run mast3r_fusion visualization with options")
@@ -155,6 +128,7 @@ if __name__ == "__main__":
     parser.add_argument("--pose_file", type=str, default =None)
     parser.add_argument("--traj_viz_output", type=str, default="check_h5_trajectory_window.png")
     parser.add_argument("--no_traj_viz", action="store_true")
+    parser.add_argument("--no_traj_viz_show", action="store_true")
 
     args = parser.parse_args()
 
@@ -244,7 +218,13 @@ if __name__ == "__main__":
         states.set_mode(Mode.TRACKING)
 
     if not args.no_traj_viz:
-        save_trajectory_overview(id_poses, selected_ids, FRAME_ID, args.traj_viz_output)
+        save_trajectory_overview(
+            id_poses,
+            selected_ids,
+            FRAME_ID,
+            args.traj_viz_output,
+            not args.no_traj_viz_show,
+        )
 
     run_visualization(config, states, keyframes, main2viz, viz2main, max_show = 1000)
 
