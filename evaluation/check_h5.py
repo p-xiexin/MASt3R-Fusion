@@ -36,6 +36,115 @@ def mask_sky(img):
     out_mask = (mask == 2)
     return out_mask
 
+def pose_xyz(pose):
+    if hasattr(pose, "detach") and hasattr(pose, "cpu"):
+        pose = pose.detach().cpu().numpy()
+    return np.asarray(pose).reshape(-1)[:3].astype(np.float64)
+
+def save_trajectory_overview(id_poses, selected_ids, frame_id, output_path):
+    if output_path is None:
+        return
+    all_ids = sorted(id_poses.keys())
+    if not all_ids:
+        return
+    x_series = []
+    y_series = []
+    for i in all_ids:
+        xyz = pose_xyz(id_poses[i])
+        x_series.append(xyz[0])
+        y_series.append(xyz[1])
+    selected_ids = [i for i in selected_ids if i in id_poses]
+    ref_ids = [i for i in range(frame_id - 10, frame_id + 10) if i in id_poses]
+
+    plt.figure("check_h5_trajectory_window", figsize=[10 * 0.7, 14 * 0.7])
+    plt.clf()
+    plt.subplot(1, 1, 1)
+    plt.plot(
+        x_series,
+        y_series,
+        c=[0, 0, 0],
+        linestyle="--",
+        linewidth=1.0,
+        label="all poses",
+        zorder=100,
+    )
+
+    if selected_ids:
+        selected_x_series = []
+        selected_y_series = []
+        for i in selected_ids:
+            xyz = pose_xyz(id_poses[i])
+            selected_x_series.append(xyz[0])
+            selected_y_series.append(xyz[1])
+        plt.plot(
+            selected_x_series,
+            selected_y_series,
+            c=[1, 0, 0],
+            linewidth=3.0,
+            label="visualized segment",
+            zorder=200,
+        )
+        plt.scatter(
+            selected_x_series,
+            selected_y_series,
+            s=42,
+            facecolor="yellow",
+            edgecolor="red",
+            linewidth=1.5,
+            zorder=250,
+        )
+
+    if ref_ids:
+        ref_x_series = []
+        ref_y_series = []
+        for i in ref_ids:
+            xyz = pose_xyz(id_poses[i])
+            ref_x_series.append(xyz[0])
+            ref_y_series.append(xyz[1])
+        plt.scatter(
+            ref_x_series,
+            ref_y_series,
+            s=80,
+            marker="*",
+            facecolor="deepskyblue",
+            edgecolor="black",
+            linewidth=0.8,
+            label="frame_id +/- 10 refs",
+            zorder=300,
+        )
+
+    if frame_id in id_poses:
+        center_xyz = pose_xyz(id_poses[frame_id])
+        plt.scatter(
+            [center_xyz[0]],
+            [center_xyz[1]],
+            s=180,
+            marker="*",
+            facecolor="gold",
+            edgecolor="black",
+            linewidth=1.2,
+            label=f"frame_id {frame_id}",
+            zorder=350,
+        )
+        plt.annotate(
+            str(frame_id),
+            (center_xyz[0], center_xyz[1]),
+            xytext=(8, 8),
+            textcoords="offset points",
+            fontsize=10,
+            weight="bold",
+        )
+
+    plt.title("Trajectory")
+    plt.xlabel("x [m]")
+    plt.ylabel("y [m]")
+    plt.legend()
+    plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+    plt.gca().set_aspect(1)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=600)
+    print(f"Saved trajectory overview to {output_path}")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run mast3r_fusion visualization with options")
 
@@ -44,6 +153,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str)
     parser.add_argument("--calib", type=str)
     parser.add_argument("--pose_file", type=str, default =None)
+    parser.add_argument("--traj_viz_output", type=str, default="check_h5_trajectory_window.png")
+    parser.add_argument("--no_traj_viz", action="store_true")
 
     args = parser.parse_args()
 
@@ -104,12 +215,18 @@ if __name__ == "__main__":
 
 
 
+    selected_ids = []
     for i in tqdm.tqdm(range(len_h5(args.h5))):
+        if i not in id_poses:
+            continue
         is_nearby=False
         for ii in range(FRAME_ID-10,FRAME_ID+10):
-            if np.linalg.norm(id_poses[i][0:3] - id_poses[ii][0:3])<30: 
+            if ii not in id_poses:
+                continue
+            if np.linalg.norm(pose_xyz(id_poses[i]) - pose_xyz(id_poses[ii])) < 30:
                 is_nearby = True
         if not is_nearby:continue
+        selected_ids.append(i)
         dd = load_frame_from_h5(H5_FILE, i)
         dd['T_WC'][-1,:] = torch.tensor(id_poses[i])
         dd['X'] *= dd['T_WC'][-1,-1]
@@ -125,6 +242,9 @@ if __name__ == "__main__":
         states.set_frame(frame)
         keyframes.append(frame)
         states.set_mode(Mode.TRACKING)
+
+    if not args.no_traj_viz:
+        save_trajectory_overview(id_poses, selected_ids, FRAME_ID, args.traj_viz_output)
 
     run_visualization(config, states, keyframes, main2viz, viz2main, max_show = 1000)
 

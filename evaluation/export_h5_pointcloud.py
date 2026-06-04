@@ -31,7 +31,16 @@ def parse_args():
         default=None,
         help=(
             "Optional result pose file. For repository result files, columns 1:9 "
-            "are T_WC Sim3 and column 15 is the original frame id."
+            "are T_WC Sim3 and column 15 is the pose index."
+        ),
+    )
+    parser.add_argument(
+        "--pose-index-mode",
+        choices=["h5_key", "frame_id"],
+        default="h5_key",
+        help=(
+            "How to interpret column 15 in --pose-file. Use h5_key for "
+            "main_global_optimization.py outputs and frame_id for online main.py outputs."
         ),
     )
     parser.add_argument(
@@ -85,12 +94,38 @@ def parse_args():
     parser.add_argument(
         "--config",
         default=None,
-        help="Accepted for command-line parity with check_h5.py; not needed for export.",
+        help="Config file. When supplied with --calib, export matches check_h5.py calibration handling.",
     )
     parser.add_argument(
         "--calib",
         default=None,
-        help="Accepted for command-line parity with check_h5.py; not needed for export.",
+        help="Calibration file used to reconstruct calibrated pointmaps like check_h5.py.",
+    )
+    parser.add_argument(
+        "--match-check-h5-window",
+        action="store_true",
+        help=(
+            "Export the same local trajectory segment selected by check_h5.py: "
+            "frames near --frame-id over a pose-distance window."
+        ),
+    )
+    parser.add_argument(
+        "--frame-id",
+        type=int,
+        default=240,
+        help="Reference H5 key used by --match-check-h5-window, matching check_h5.py.",
+    )
+    parser.add_argument(
+        "--nearby-key-window",
+        type=int,
+        default=10,
+        help="Half-window of H5 keys around --frame-id used by --match-check-h5-window.",
+    )
+    parser.add_argument(
+        "--nearby-distance",
+        type=float,
+        default=30.0,
+        help="Pose distance threshold used by --match-check-h5-window.",
     )
     return parser.parse_args()
 
@@ -195,6 +230,36 @@ def load_pose_file(path: Optional[str], prefer_keyframe_poses: bool) -> Dict[int
     return pose_by_frame_id
 
 
+def load_calibration_context(config_path: Optional[str], calib_path: Optional[str]) -> Optional[np.ndarray]:
+    if config_path is None or calib_path is None:
+        return None
+    try:
+        import yaml
+        from mast3r_fusion.config import config, load_config
+        from mast3r_fusion.dataloader import Intrinsics
+    except ImportError as exc:
+        raise ImportError(
+            "--config/--calib export requires the MASt3R-Fusion runtime dependencies."
+        ) from exc
+
+    load_config(config_path)
+    # check_h5.py forces calibrated visualization after loading the config.
+    config["use_calib"] = True
+    with open(calib_path, "r") as f:
+        intrinsics = yaml.load(f, Loader=yaml.SafeLoader)
+    camera_intrinsics = Intrinsics.from_calib(
+        512,
+        intrinsics["width"],
+        intrinsics["height"],
+        intrinsics["calibration"],
+        False,
+        intrinsics.get("model", "pinhole"),
+        intrinsics.get("scale", 1),
+        intrinsics.get("height_new", None),
+    )
+    return camera_intrinsics.K_frame.astype(np.float32)
+
+
 def quaternion_to_matrix(q_xyzw: np.ndarray) -> np.ndarray:
     x, y, z, w = q_xyzw
     xx, yy, zz = x * x, y * y, z * z
@@ -214,9 +279,11 @@ def pose_to_world(points: np.ndarray, pose: np.ndarray) -> np.ndarray:
     pose = normalize_pose(pose)
     translation = pose[:3]
     rotation = quaternion_to_matrix(pose[3:7])
-    scale = pose[7]
-    # check_h5.py scales X by Sim3 scale and then visualizes with scale set to 1.
-    return (points.astype(np.float64, copy=False) * scale) @ rotation.T + translation
+    return points.astype(np.float64, copy=False) @ rotation.T + translation
+
+
+def pose_scale(pose: np.ndarray) -> float:
+    return float(normalize_pose(pose)[7])
 
 
 def average_conf(data) -> np.ndarray:
@@ -230,10 +297,25 @@ def average_conf(data) -> np.ndarray:
     return conf / n_updates
 
 
-def frame_arrays(data, stride: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def calibrated_points_from_depth(points: np.ndarray, image_shape: Tuple[int, int], K: np.ndarray) -> np.ndarray:
+    h, w = image_shape
+    points = points.reshape(h, w, 3)
+    y, x = np.indices((h, w), dtype=np.float32)
+    z = points[..., 2:3]
+    rays = np.empty((h, w, 3), dtype=np.float32)
+    rays[..., 0] = (x - K[0, 2]) / K[0, 0]
+    rays[..., 1] = (y - K[1, 2]) / K[1, 1]
+    rays[..., 2] = 1.0
+    return (z * rays).reshape(-1, 3)
+
+
+def frame_arrays(data, stride: int, K: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     points = to_numpy(data["X"], dtype=np.float32).reshape(-1, 3)
-    conf = average_conf(data)
     colors = to_numpy(data["uimg"])
+    h, w = colors.shape[:2]
+    if K is not None:
+        points = calibrated_points_from_depth(points, (h, w), K)
+    conf = average_conf(data)
     if colors.dtype != np.uint8:
         colors = np.clip(colors.astype(np.float32) * 255.0, 0, 255).astype(np.uint8)
     colors = colors.reshape(-1, 3)
@@ -288,27 +370,38 @@ def write_ply_header(fp, vertex_count: int) -> None:
     fp.write(header.encode("ascii"))
 
 
-def resolve_pose(data, key_idx: int, pose_by_frame_id: Dict[int, np.ndarray]) -> np.ndarray:
+def resolve_pose(
+    data,
+    key_idx: int,
+    pose_by_index: Dict[int, np.ndarray],
+    pose_index_mode: str,
+) -> np.ndarray:
     frame_id = frame_id_from_data(data, key_idx)
-    if frame_id in pose_by_frame_id:
-        return pose_by_frame_id[frame_id]
-    if key_idx in pose_by_frame_id:
-        return pose_by_frame_id[key_idx]
+    primary_idx = key_idx if pose_index_mode == "h5_key" else frame_id
+    fallback_idx = frame_id if pose_index_mode == "h5_key" else key_idx
+    if primary_idx in pose_by_index:
+        return pose_by_index[primary_idx]
+    if fallback_idx in pose_by_index:
+        return pose_by_index[fallback_idx]
     return normalize_pose(data["T_WC"])
 
 
-def count_frame_points(data, args) -> int:
-    points, _, conf = frame_arrays(data, args.stride)
+def count_frame_points(data, key_idx: int, pose_by_index, args, K: Optional[np.ndarray]) -> int:
+    pose = resolve_pose(data, key_idx, pose_by_index, args.pose_index_mode)
+    points, _, conf = frame_arrays(data, args.stride, K)
+    points = points * pose_scale(pose)
     mask = valid_mask(points, conf, args.conf_threshold, args.min_depth, args.max_depth)
     return int(mask.sum())
 
 
-def transformed_frame_vertices(data, key_idx: int, pose_by_frame_id, args) -> np.ndarray:
-    points, colors, conf = frame_arrays(data, args.stride)
+def transformed_frame_vertices(data, key_idx: int, pose_by_index, args, K: Optional[np.ndarray]) -> np.ndarray:
+    pose = resolve_pose(data, key_idx, pose_by_index, args.pose_index_mode)
+    points, colors, conf = frame_arrays(data, args.stride, K)
+    # check_h5.py multiplies X by the Sim3 scale, then sets pose scale to 1.0.
+    points = points * pose_scale(pose)
     mask = valid_mask(points, conf, args.conf_threshold, args.min_depth, args.max_depth)
     points = points[mask]
     colors = colors[mask]
-    pose = resolve_pose(data, key_idx, pose_by_frame_id)
     points_world = pose_to_world(points, pose)
     return pack_vertices(points_world, colors)
 
@@ -316,6 +409,41 @@ def transformed_frame_vertices(data, key_idx: int, pose_by_frame_id, args) -> np
 def iter_frame_data(h5_file, keys: Iterable[Tuple[int, str]]):
     for key_idx, key in keys:
         yield key_idx, key, load_frame(h5_file, key)
+
+
+def pose_by_key(h5_file, keys: Iterable[Tuple[int, str]], pose_by_index, args) -> Dict[int, np.ndarray]:
+    poses = {}
+    for key_idx, key, data in iter_frame_data(h5_file, keys):
+        poses[key_idx] = resolve_pose(data, key_idx, pose_by_index, args.pose_index_mode)
+    return poses
+
+
+def filter_check_h5_window(
+    keys: List[Tuple[int, str]],
+    poses: Dict[int, np.ndarray],
+    frame_id: int,
+    nearby_key_window: int,
+    nearby_distance: float,
+) -> List[Tuple[int, str]]:
+    ref_indices = [
+        idx
+        for idx in range(frame_id - nearby_key_window, frame_id + nearby_key_window)
+        if idx in poses
+    ]
+    if not ref_indices:
+        raise ValueError(
+            "No reference poses found for check_h5 window "
+            f"[{frame_id - nearby_key_window}, {frame_id + nearby_key_window})."
+        )
+    selected = []
+    ref_positions = np.array([poses[idx][:3] for idx in ref_indices], dtype=np.float64)
+    for key_idx, key in keys:
+        if key_idx not in poses:
+            continue
+        distances = np.linalg.norm(ref_positions - poses[key_idx][:3], axis=1)
+        if np.any(distances < nearby_distance):
+            selected.append((key_idx, key))
+    return selected
 
 
 def main():
@@ -333,26 +461,41 @@ def main():
 
     output_path = pathlib.Path(args.output)
     output_path.parent.mkdir(exist_ok=True, parents=True)
-    pose_by_frame_id = load_pose_file(args.pose_file, args.prefer_keyframe_poses)
+    pose_by_index = load_pose_file(args.pose_file, args.prefer_keyframe_poses)
+    K = load_calibration_context(args.config, args.calib)
 
     with h5py.File(args.h5, "r") as h5_file:
         keys = frame_keys(h5_file, args.start_key, args.end_key)
         if not keys:
             raise ValueError(f"No frame_* datasets found in {args.h5}.")
+        poses = pose_by_key(h5_file, keys, pose_by_index, args)
+        if args.match_check_h5_window:
+            keys = filter_check_h5_window(
+                keys,
+                poses,
+                args.frame_id,
+                args.nearby_key_window,
+                args.nearby_distance,
+            )
 
         print(f"Found {len(keys)} H5 keyframes.")
-        if pose_by_frame_id:
-            print(f"Loaded {len(pose_by_frame_id)} poses from {args.pose_file}.")
+        if pose_by_index:
+            print(
+                f"Loaded {len(pose_by_index)} poses from {args.pose_file} "
+                f"using {args.pose_index_mode} indexing."
+            )
+        if K is not None:
+            print("Using calibrated ray projection to match check_h5.py.")
 
         total_vertices = 0
-        for _, _, data in iter_frame_data(h5_file, keys):
-            total_vertices += count_frame_points(data, args)
+        for key_idx, _, data in iter_frame_data(h5_file, keys):
+            total_vertices += count_frame_points(data, key_idx, pose_by_index, args, K)
         print(f"Writing {total_vertices} points to {output_path}.")
 
         with open(output_path, "wb") as fp:
             write_ply_header(fp, total_vertices)
             for key_idx, _, data in iter_frame_data(h5_file, keys):
-                transformed_frame_vertices(data, key_idx, pose_by_frame_id, args).tofile(fp)
+                transformed_frame_vertices(data, key_idx, pose_by_index, args, K).tofile(fp)
 
     print("Done.")
 
