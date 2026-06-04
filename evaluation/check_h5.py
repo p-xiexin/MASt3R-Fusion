@@ -127,8 +127,7 @@ def save_trajectory_overview(id_poses, selected_ids, frame_id, output_path, show
         plt.savefig(output_path, dpi=600)
         print(f"Saved trajectory overview to {output_path}")
     if show_plot:
-        plt.show(block=False)
-        plt.pause(0.1)
+        plt.show()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run mast3r_fusion visualization with options")
