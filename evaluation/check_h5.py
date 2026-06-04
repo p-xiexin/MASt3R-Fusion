@@ -41,6 +41,18 @@ def pose_xyz(pose):
         pose = pose.detach().cpu().numpy()
     return np.asarray(pose).reshape(-1)[:3].astype(np.float64)
 
+def split_contiguous_ids(ids):
+    ids = sorted(ids)
+    if not ids:
+        return []
+    segments = [[ids[0]]]
+    for idx in ids[1:]:
+        if idx == segments[-1][-1] + 1:
+            segments[-1].append(idx)
+        else:
+            segments.append([idx])
+    return segments
+
 def save_trajectory_overview(id_poses, selected_ids, frame_id, output_path, show_plot):
     all_ids = sorted(id_poses.keys())
     if not all_ids:
@@ -66,19 +78,19 @@ def save_trajectory_overview(id_poses, selected_ids, frame_id, output_path, show
         zorder=100,
     )
 
-    if selected_ids:
+    for segment_idx, selected_segment in enumerate(split_contiguous_ids(selected_ids)):
         selected_x_series = []
         selected_y_series = []
-        for i in selected_ids:
+        for i in selected_segment:
             xyz = pose_xyz(id_poses[i])
             selected_x_series.append(xyz[0])
             selected_y_series.append(xyz[1])
         plt.plot(
             selected_x_series,
             selected_y_series,
-            c=[1, 0, 0],
+            c=[0, 0.7, 0],
             linewidth=2.0,
-            label="visualized segment",
+            label="visualized keyframe segment" if segment_idx == 0 else None,
             zorder=200,
         )
 
