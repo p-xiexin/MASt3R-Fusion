@@ -2,9 +2,8 @@ import h5py
 import io
 import torch
 from mast3r_fusion.config import load_config, config, set_global_config
-from mast3r_fusion.mast3r_utils import mast3r_match_symmetric
 from mast3r_fusion.frontend_model import load_frontend_model
-from mast3r_fusion.mast3r_utils import load_retriever, mast3r_inference_mono
+from mast3r_fusion.mast3r_utils import load_retriever
 from mast3r_fusion.frame import Frame
 import lietorch
 import tqdm
@@ -68,7 +67,10 @@ if __name__ == "__main__":
     load_config(args.config)
     model = load_frontend_model(device='cuda')
     model.share_memory()
-    retrieval_database = load_retriever(model)
+    if getattr(model, "name", "mast3r") == "mast3r":
+        retrieval_database = load_retriever(model)
+    else:
+        retrieval_database = None
     all_factors = []
 
 
@@ -297,12 +299,15 @@ if __name__ == "__main__":
         frame.N = data['N']
         frame.feat = data['feat'].to('cuda')
         frame.pos = data['pos'].to('cuda')
-        retrieval_inds = retrieval_database.update(
-        frame,
-        add_after_query=True,
-        k=10,
-        min_thresh=0.0,
-        )
+        if retrieval_database is not None:
+            retrieval_inds = retrieval_database.update(
+                frame,
+                add_after_query=True,
+                k=10,
+                min_thresh=0.0,
+            )
+        else:
+            retrieval_inds = []
         retrieval_inds_selected = []
         retrieval_inds = find_valid_numbers(i,retrieval_inds)
 
@@ -337,36 +342,20 @@ if __name__ == "__main__":
 
             ii = torch.tensor([0])
             jj = torch.tensor([1])
-            if hasattr(model, "match_symmetric_batch"):
-                (
-                    idx_i2j,
-                    idx_j2i,
-                    valid_match_j,
-                    valid_match_i,
-                    Qii,
-                    Qjj,
-                    Qji,
-                    Qij,
-                ) = model.match_symmetric_batch(
-                    data['feat'].to('cuda'), data['pos'].to('cuda'),
-                    data_kkk['feat'].to('cuda'), data_kkk['pos'].to('cuda'),
-                    data['img_shape'][None], data['img_shape'][None], 1
-                )
-            else:
-                (
-                    idx_i2j,
-                    idx_j2i,
-                    valid_match_j,
-                    valid_match_i,
-                    Qii,
-                    Qjj,
-                    Qji,
-                    Qij,
-                ) = mast3r_match_symmetric(
-                    model, data['feat'].to('cuda'), data['pos'].to('cuda'),
-                    data_kkk['feat'].to('cuda'), data_kkk['pos'].to('cuda'), 
-                    data['img_shape'][None], data['img_shape'][None], 1
-                )
+            (
+                idx_i2j,
+                idx_j2i,
+                valid_match_j,
+                valid_match_i,
+                Qii,
+                Qjj,
+                Qji,
+                Qij,
+            ) = model.match_symmetric_batch(
+                data['feat'].to('cuda'), data['pos'].to('cuda'),
+                data_kkk['feat'].to('cuda'), data_kkk['pos'].to('cuda'),
+                data['img_shape'][None], data['img_shape'][None], 1
+            )
 
 
 

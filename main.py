@@ -15,7 +15,7 @@ from mast3r_fusion.dataloader import Intrinsics, load_dataset
 import mast3r_fusion.evaluate as eval
 from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
 from mast3r_fusion.frontend_model import load_frontend_model
-from mast3r_fusion.mast3r_utils import load_retriever, mast3r_inference_mono
+from mast3r_fusion.mast3r_utils import load_retriever
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
 from mast3r_fusion.tracker import FrameTracker
 from mast3r_fusion.visualization import WindowMsg, run_visualization
@@ -291,10 +291,7 @@ if __name__ == "__main__":
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
-            if hasattr(model, "infer_single"):
-                X_init, C_init = model.infer_single(frame)
-            else:
-                X_init, C_init = mast3r_inference_mono(model, frame)
+            X_init, C_init = model.infer_single(frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1 + keyframes.rollup_sum.value)
@@ -309,10 +306,7 @@ if __name__ == "__main__":
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
         elif mode == Mode.RELOC:
-            if hasattr(model, "infer_single"):
-                X, C = model.infer_single(frame)
-            else:
-                X, C = mast3r_inference_mono(model, frame)
+            X, C = model.infer_single(frame)
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()
