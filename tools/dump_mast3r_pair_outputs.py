@@ -322,18 +322,18 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    _load_runtime_imports()
-
-    out_dir = Path(args.output_dir)
+def dump_pair_outputs(model, image_a, image_b, out_dir, args, verbose=True):
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    model = load_mast3r(args.weights, device=args.device)
-    model.eval()
-
-    images = load_images([args.image_a, args.image_b], size=args.image_size, verbose=True)
-    output = inference([tuple(images)], model, args.device, batch_size=args.batch_size, verbose=True)
+    images = load_images([str(image_a), str(image_b)], size=args.image_size, verbose=verbose)
+    output = inference(
+        [tuple(images)],
+        model,
+        args.device,
+        batch_size=args.batch_size,
+        verbose=verbose,
+    )
     view1, pred1 = output["view1"], output["pred1"]
     view2, pred2 = output["view2"], output["pred2"]
 
@@ -383,8 +383,8 @@ def main():
         torch.save(output, out_dir / "raw_output.pt")
 
     summary = {
-        "image_a": str(Path(args.image_a).resolve()),
-        "image_b": str(Path(args.image_b).resolve()),
+        "image_a": str(Path(image_a).resolve()),
+        "image_b": str(Path(image_b).resolve()),
         "weights": args.weights or "<mast3r_utils default>",
         "device": args.device,
         "image_size": args.image_size,
@@ -400,11 +400,23 @@ def main():
     with open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"Saved MASt3R pair outputs to {out_dir.resolve()}")
-    print(f"raw matches: {raw_match_count}")
-    print(f"valid matches after border filtering: {matches0.shape[0]}")
-    for path in sorted(out_dir.iterdir()):
-        print(f"  {path}")
+    if verbose:
+        print(f"Saved MASt3R pair outputs to {out_dir.resolve()}")
+        print(f"raw matches: {raw_match_count}")
+        print(f"valid matches after border filtering: {matches0.shape[0]}")
+        for path in sorted(out_dir.iterdir()):
+            print(f"  {path}")
+
+    return summary
+
+
+def main():
+    args = parse_args()
+    _load_runtime_imports()
+
+    model = load_mast3r(args.weights, device=args.device)
+    model.eval()
+    dump_pair_outputs(model, args.image_a, args.image_b, args.output_dir, args)
 
 
 if __name__ == "__main__":
