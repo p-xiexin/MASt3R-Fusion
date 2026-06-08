@@ -250,8 +250,6 @@ def draw_matches(
             255 - int(255 * x0 / max(w - 1, 1)),
         )
         cv2.line(overlay, (x0, y0), (x1, y1), color, 1, lineType=cv2.LINE_AA)
-        cv2.circle(canvas, (x0, y0), 2, color, -1, lineType=cv2.LINE_AA)
-        cv2.circle(canvas, (x1, y1), 2, color, -1, lineType=cv2.LINE_AA)
 
     canvas = cv2.addWeighted(overlay, 0.65, canvas, 0.35, 0.0)
     Image.fromarray(canvas).save(path)

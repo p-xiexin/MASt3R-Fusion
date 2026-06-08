@@ -61,7 +61,11 @@ class PI3Adapter(FeedForwardFrontend):
             return PairMatchResult(*result)
 
         result = pi3x_match_asymmetric(
-            self.model, frame_i, frame_j, idx_i2j_init=init
+            self.model,
+            frame_i,
+            frame_j,
+            idx_i2j_init=init,
+            init_relative_pose=kwargs.get("init_relative_pose"),
         )
         return PairMatchResult(
             idx_i2j=result[0],

@@ -29,11 +29,17 @@ class FrameTracker:
         except:
             pass
         self.idx_f2k = None
+        self.T_CkCf_init = None
 
     def track(self, frame: Frame):
         keyframe = self.keyframes.last_keyframe()
 
-        match = self.model.match_pair(frame, keyframe, init=self.idx_f2k)
+        match = self.model.match_pair(
+            frame,
+            keyframe,
+            init=self.idx_f2k,
+            init_relative_pose=self.T_CkCf_init,
+        )
         idx_f2k = match.idx_i2j
         valid_match_k = match.valid_match_j
         Xff = match.Xii
@@ -109,6 +115,7 @@ class FrameTracker:
         frame.T_WC = T_WCf
         frame.ref_kf = keyframe.frame_id
         frame.T_CkCf = T_CkCf
+        self.T_CkCf_init = T_CkCf
         dd = keyframe.T_WC[0].data.cpu().numpy()
         dd2 = frame.T_WC[0].data.cpu().numpy()
         self.fp.writelines('%d %d %f %f %f %f %f %f\n'%(keyframe.frame_id,frame.frame_id,dd[0],dd[1],dd[2],dd2[0],dd2[1],dd2[2]));self.fp.flush()

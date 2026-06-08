@@ -4,7 +4,7 @@ import einops
 import torch
 import torch.nn.functional as F
 
-import mast3r_fusion.matching as matching
+import mast3r_fusion.pi3_matching as pi3_matching
 from mast3r_fusion.config import config
 
 
@@ -136,6 +136,21 @@ def _homogeneous_transform(points, transform):
     return transformed.reshape(h, w, 3)
 
 
+def _pose_to_matrix(pose, device, dtype):
+    if pose is None:
+        return None
+    if hasattr(pose, "matrix"):
+        matrix = pose.matrix()
+    else:
+        matrix = torch.as_tensor(pose)
+    matrix = matrix.to(device=device, dtype=dtype)
+    if matrix.ndim == 3:
+        matrix = matrix[0]
+    if matrix.shape != (4, 4):
+        raise ValueError(f"Expected relative pose matrix shape (4,4), got {tuple(matrix.shape)}.")
+    return matrix
+
+
 def _pair_output_to_maps(output, images):
     local_points = _pick_output(output, ("local_points", "points_local", "pts3d"))
     confidences = _pick_output(output, ("conf", "confidence", "confidences"))
@@ -160,7 +175,10 @@ def _pair_output_to_maps(output, images):
 
     Xii = local_points[0]
     Xjj = local_points[1]
+    T_w_ci = None
+    T_w_cj = None
     if poses is not None:
+        poses = torch.as_tensor(poses, device=local_points.device, dtype=local_points.dtype)
         if poses.ndim == 3:
             poses = poses.unsqueeze(0)
         T_w_ci = poses[0, 0]
@@ -175,11 +193,12 @@ def _pair_output_to_maps(output, images):
         Xji = Xjj
         Xij = Xii
 
-    descriptors = images[0].permute(0, 2, 3, 1).contiguous()
-    Dii = F.normalize(descriptors[0], dim=-1)
-    Djj = F.normalize(descriptors[1], dim=-1)
+    # PI3X does not expose MASt3R-style dense descriptors. Keep empty
+    # placeholders for debug/decode APIs; matching uses geometry only.
+    Dii = Xii.new_empty((*Xii.shape[:2], 0))
+    Djj = Xjj.new_empty((*Xjj.shape[:2], 0))
 
-    return Xii, Xji, Xjj, Xij, confidences[0], confidences[1], Dii, Djj
+    return Xii, Xji, Xjj, Xij, confidences[0], confidences[1], Dii, Djj, T_w_ci, T_w_cj
 
 
 @torch.inference_mode()
@@ -188,7 +207,7 @@ def pi3x_inference_pair(model, frame_i, frame_j):
     encode_frame_image(frame_j)
     images = torch.cat((_frame_image(frame_i), _frame_image(frame_j)), dim=0)
     output = _call_pi3x(model, images.unsqueeze(0))
-    Xii, Xji, _, _, Cii, Cji, Dii, Dji = _pair_output_to_maps(output, images.unsqueeze(0))
+    Xii, Xji, _, _, Cii, Cji, Dii, Dji, _, _ = _pair_output_to_maps(output, images.unsqueeze(0))
     X, C, D, Q = torch.stack((Xii, Xji)), torch.stack((Cii, Cji)), torch.stack((Dii, Dji)), torch.stack((Cii, Cji))
     return _downsample(X, C, D, Q)
 
@@ -224,7 +243,7 @@ def pi3x_decode_symmetric_batch(model, feat_i, pos_i, feat_j, pos_j, shape_i, sh
     for b in range(feat_i.shape[0]):
         images = torch.stack((images_i[b], images_j[b]), dim=0).unsqueeze(0)
         output = _call_pi3x(model, images)
-        Xii, Xji, Xjj, Xij, Cii, Cjj, Dii, Djj = _pair_output_to_maps(output, images)
+        Xii, Xji, Xjj, Xij, Cii, Cjj, Dii, Djj, _, _ = _pair_output_to_maps(output, images)
         X.append(torch.stack((Xii, Xji, Xjj, Xij)))
         C.append(torch.stack((Cii, Cjj, Cjj, Cii)))
         D.append(torch.stack((Dii, Djj, Djj, Dii)))
@@ -238,19 +257,38 @@ def pi3x_decode_symmetric_batch(model, feat_i, pos_i, feat_j, pos_j, shape_i, sh
 
 
 def pi3x_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, subpixel_factor=1):
-    X, C, D, Q = pi3x_decode_symmetric_batch(
-        model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
-    )
-    b = X.shape[1]
-    Xii, Xji, Xjj, Xij = X[0], X[1], X[2], X[3]
-    Dii, Dji, Djj, Dij = D[0], D[1], D[2], D[3]
-    Qii, Qji, Qjj, Qij = Q[0], Q[1], Q[2], Q[3]
+    X, C, Q = [], [], []
+    pose_i, pose_j = [], []
+    images_i = _features_to_images(feat_i, shape_i, pos_i)
+    images_j = _features_to_images(feat_j, shape_j, pos_j)
+    for batch_idx in range(feat_i.shape[0]):
+        images = torch.stack((images_i[batch_idx], images_j[batch_idx]), dim=0).unsqueeze(0)
+        output = _call_pi3x(model, images)
+        Xii, Xji, Xjj, Xij, Cii, Cjj, _, _, T_w_ci, T_w_cj = _pair_output_to_maps(output, images)
+        if T_w_ci is None or T_w_cj is None:
+            raise KeyError("PI3X geometry matching requires camera poses.")
+        X.append(torch.stack((Xii, Xji, Xjj, Xij)))
+        C.append(torch.stack((Cii, Cjj, Cjj, Cii)))
+        Q.append(torch.stack((Cii, Cjj, Cjj, Cii)))
+        pose_i.append(T_w_ci)
+        pose_j.append(T_w_cj)
 
-    idx_i2j, valid_match_j = matching.match(
-        Xii, Xji, Dii, Dji, subpixel_factor=subpixel_factor
+    X = torch.stack(X, dim=1)
+    C = torch.stack(C, dim=1)
+    Q = torch.stack(Q, dim=1)
+    X, C, _, Q = _downsample(X, C, X, Q)
+    b = X.shape[1]
+    Xii, _, Xjj, _ = X[0], X[1], X[2], X[3]
+    Cii, Cjj = C[0], C[1]
+    Qii, Qji, Qjj, Qij = Q[0], Q[1], Q[2], Q[3]
+    pose_i = torch.stack(pose_i, dim=0)
+    pose_j = torch.stack(pose_j, dim=0)
+
+    idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
+        Xii, Xjj, pose_i, pose_j, Cii, Cjj, conf_threshold=0.0
     )
-    idx_j2i, valid_match_i = matching.match(
-        Xjj, Xij, Djj, Dij, subpixel_factor=subpixel_factor
+    idx_j2i, valid_match_i, pair_conf_j2i = pi3_matching.match(
+        Xjj, Xii, pose_j, pose_i, Cjj, Cii, conf_threshold=0.0
     )
 
     return (
@@ -260,19 +298,58 @@ def pi3x_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, 
         valid_match_i,
         Qii.view(b, -1, 1),
         Qjj.view(b, -1, 1),
-        Qji.view(b, -1, 1),
-        Qij.view(b, -1, 1),
+        pair_conf_i2j,
+        pair_conf_j2i,
     )
 
 
-def pi3x_match_asymmetric(model, frame_i, frame_j, idx_i2j_init=None):
-    X, C, D, Q = pi3x_inference_pair(model, frame_i, frame_j)
+def pi3x_match_asymmetric(
+    model, frame_i, frame_j, idx_i2j_init=None, init_relative_pose=None
+):
+    encode_frame_image(frame_i)
+    encode_frame_image(frame_j)
+    images = torch.cat((_frame_image(frame_i), _frame_image(frame_j)), dim=0)
+    output = _call_pi3x(model, images.unsqueeze(0))
+    Xii, Xji, Xjj, _, Cii, Cji, _, _, T_w_ci, T_w_cj = _pair_output_to_maps(
+        output, images.unsqueeze(0)
+    )
+    if T_w_ci is None or T_w_cj is None:
+        raise KeyError("PI3X geometry matching requires camera poses.")
+    X, C, D, Q = (
+        torch.stack((Xii, Xji)),
+        torch.stack((Cii, Cji)),
+        Xii.new_empty((2, *Xii.shape[:2], 0)),
+        torch.stack((Cii, Cji)),
+    )
+    X, C, D, Q = _downsample(X, C, D, Q)
+    X_match, C_match, _, _ = _downsample(
+        torch.stack((Xii, Xjj)),
+        torch.stack((Cii, Cji)),
+        torch.stack((Xii, Xjj)),
+        torch.stack((Cii, Cji)),
+    )
+    Xii_match, Xjj_match = X_match[:1], X_match[1:]
+    Cii_match, Cjj_match = C_match[:1], C_match[1:]
+    if init_relative_pose is not None:
+        pose_src = _pose_to_matrix(init_relative_pose, Xii_match.device, Xii_match.dtype)[None]
+        pose_dst = torch.eye(4, device=Xii_match.device, dtype=Xii_match.dtype)[None]
+    else:
+        pose_src = T_w_ci[None]
+        pose_dst = T_w_cj[None]
+
+    idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
+        Xii_match,
+        Xjj_match,
+        pose_src,
+        pose_dst,
+        Cii_match,
+        Cjj_match,
+        conf_threshold=0.0,
+    )
     Xii, Xji = X[:1], X[1:]
-    Dii, Dji = D[:1], D[1:]
-    idx_i2j, valid_match_j = matching.match(
-        Xii, Xji, Dii, Dji, idx_1_to_2_init=idx_i2j_init
-    )
+    Cii, Cji = C[:1], C[1:]
     Xii, Xji = einops.rearrange(X, "b h w c -> b (h w) c")
     Cii, Cji = einops.rearrange(C, "b h w -> b (h w) 1")
     Qii, Qji = einops.rearrange(Q, "b h w -> b (h w) 1")
+    Qji = pair_conf_i2j
     return idx_i2j, valid_match_j, Xii, Cii, Qii, Xji, Cji, Qji
