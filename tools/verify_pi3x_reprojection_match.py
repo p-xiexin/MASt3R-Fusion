@@ -129,6 +129,17 @@ def fit_intrinsics(points: torch.Tensor, conf: torch.Tensor, conf_threshold: flo
     return K, valid, err
 
 
+def scale_intrinsics(K: torch.Tensor, scale: float):
+    if scale == 1:
+        return K
+    K_scaled = K.clone()
+    K_scaled[0, 0] /= scale
+    K_scaled[1, 1] /= scale
+    K_scaled[0, 2] /= scale
+    K_scaled[1, 2] /= scale
+    return K_scaled
+
+
 def transform_points(points: torch.Tensor, pose_src: torch.Tensor, pose_dst: torch.Tensor):
     h, w = points.shape[:2]
     flat = points.reshape(-1, 3)
@@ -176,19 +187,30 @@ def project_to_index(
     return idx.reshape(-1), valid.reshape(-1), u.reshape(-1), v.reshape(-1), pair_conf.reshape(-1)
 
 
-def downsample_inputs(points: torch.Tensor, conf: torch.Tensor, images: torch.Tensor, downsample: int):
+def downsample_maps(points: torch.Tensor, conf: torch.Tensor, downsample: int):
     if downsample <= 1:
-        return points, conf, images
+        return points, conf
     points = points[:, ::downsample, ::downsample, :].contiguous()
     conf = conf[:, ::downsample, ::downsample].contiguous()
-    images = images[..., ::downsample, ::downsample].contiguous()
-    return points, conf, images
+    return points, conf
 
 
-def draw_matches(path: Path, image_a: torch.Tensor, image_b: torch.Tensor, valid: torch.Tensor, u: torch.Tensor, v: torch.Tensor, max_lines: int, seed: int):
+def draw_matches(
+    path: Path,
+    image_a: torch.Tensor,
+    image_b: torch.Tensor,
+    valid: torch.Tensor,
+    u: torch.Tensor,
+    v: torch.Tensor,
+    max_lines: int,
+    seed: int,
+    source_scale: int,
+    match_shape,
+):
     a = (image_a.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     b = (image_b.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     h, w = a.shape[:2]
+    match_h, match_w = match_shape
     canvas = Image.new("RGB", (2 * w, h))
     canvas.paste(Image.fromarray(a), (0, 0))
     canvas.paste(Image.fromarray(b), (w, 0))
@@ -202,7 +224,9 @@ def draw_matches(path: Path, image_a: torch.Tensor, image_b: torch.Tensor, valid
     if valid_indices.size > max_lines:
         valid_indices = rng.choice(valid_indices, size=max_lines, replace=False)
     for idx in valid_indices:
-        y0, x0 = divmod(int(idx), w)
+        y0_match, x0_match = divmod(int(idx), match_w)
+        x0 = x0_match * source_scale
+        y0 = y0_match * source_scale
         x1 = float(u[idx].detach().cpu()) + w
         y1 = float(v[idx].detach().cpu())
         color = (
@@ -249,7 +273,13 @@ def main():
     images = torch.stack((image_a, image_b), dim=0).unsqueeze(0)
     output = model(imgs=images)
     points, conf, poses = normalize_output(output)
-    points, conf, images = downsample_inputs(points, conf, images, args.downsample)
+    K_a_full, fit_valid_a_full, fit_err_a_full = fit_intrinsics(
+        points[0], conf[0], args.conf_threshold, args.min_depth
+    )
+    K_b_full, fit_valid_b_full, fit_err_b_full = fit_intrinsics(
+        points[1], conf[1], args.conf_threshold, args.min_depth
+    )
+    points, conf = downsample_maps(points, conf, args.downsample)
 
     h, w = points.shape[1:3]
     points_a, points_b = points[0], points[1]
@@ -259,14 +289,16 @@ def main():
     save_rgb(output_dir / "image_a.png", image_a)
     save_rgb(output_dir / "image_b.png", image_b)
 
-    K_a, fit_valid_a, fit_err_a = fit_intrinsics(points_a, conf_a, args.conf_threshold, args.min_depth)
-    K_b, fit_valid_b, fit_err_b = fit_intrinsics(points_b, conf_b, args.conf_threshold, args.min_depth)
+    K_a = scale_intrinsics(K_a_full, args.downsample)
+    K_b = scale_intrinsics(K_b_full, args.downsample)
     print(f"K_a=\n{K_a.detach().cpu().numpy()}")
     print(f"K_b=\n{K_b.detach().cpu().numpy()}")
     print(
         "fit_error_px: "
-        f"a_median={fit_err_a.median().item():.3f}, a_p95={fit_err_a.quantile(0.95).item():.3f}, "
-        f"b_median={fit_err_b.median().item():.3f}, b_p95={fit_err_b.quantile(0.95).item():.3f}"
+        f"a_median={fit_err_a_full.median().item():.3f}, "
+        f"a_p95={fit_err_a_full.quantile(0.95).item():.3f}, "
+        f"b_median={fit_err_b_full.median().item():.3f}, "
+        f"b_p95={fit_err_b_full.quantile(0.95).item():.3f}"
     )
     print(
         "confidence: "
@@ -298,8 +330,30 @@ def main():
             f"mean={pair_conf_b2a[valid_b2a].mean().item():.3f}"
         )
 
-    draw_matches(output_dir / "a_to_b_reprojection.png", image_a, image_b, valid_a2b, u_a2b, v_a2b, args.max_lines, args.seed)
-    draw_matches(output_dir / "b_to_a_reprojection.png", image_b, image_a, valid_b2a, u_b2a, v_b2a, args.max_lines, args.seed)
+    draw_matches(
+        output_dir / "a_to_b_reprojection.png",
+        image_a,
+        image_b,
+        valid_a2b,
+        u_a2b * args.downsample,
+        v_a2b * args.downsample,
+        args.max_lines,
+        args.seed,
+        args.downsample,
+        (h, w),
+    )
+    draw_matches(
+        output_dir / "b_to_a_reprojection.png",
+        image_b,
+        image_a,
+        valid_b2a,
+        u_b2a * args.downsample,
+        v_b2a * args.downsample,
+        args.max_lines,
+        args.seed,
+        args.downsample,
+        (h, w),
+    )
 
     np.savez_compressed(
         output_dir / "reprojection_correspondences.npz",
@@ -311,8 +365,9 @@ def main():
         pair_conf_b2a=pair_conf_b2a.detach().cpu().numpy(),
         K_a=K_a.detach().cpu().numpy(),
         K_b=K_b.detach().cpu().numpy(),
-        fit_valid_a=fit_valid_a.detach().cpu().numpy(),
-        fit_valid_b=fit_valid_b.detach().cpu().numpy(),
+        downsample=args.downsample,
+        fit_valid_a=fit_valid_a_full.detach().cpu().numpy(),
+        fit_valid_b=fit_valid_b_full.detach().cpu().numpy(),
     )
     print(f"Saved outputs to {output_dir.resolve()}")
 
