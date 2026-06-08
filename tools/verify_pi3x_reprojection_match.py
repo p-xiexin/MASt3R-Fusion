@@ -1,9 +1,10 @@
 import argparse
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from mast3r_fusion.pi3x_utils import load_pi3x
 
@@ -56,6 +57,18 @@ def load_rgb(path: str, size: int, device: torch.device) -> torch.Tensor:
 def save_rgb(path: Path, image: torch.Tensor):
     array = image.detach().float().cpu().clamp(0, 1).permute(1, 2, 0).numpy()
     Image.fromarray((array * 255).astype(np.uint8)).save(path)
+
+
+def to_uint8_rgb(image: torch.Tensor) -> np.ndarray:
+    return (
+        image.detach()
+        .float()
+        .cpu()
+        .clamp(0, 1)
+        .permute(1, 2, 0)
+        .numpy()
+        * 255
+    ).astype(np.uint8)
 
 
 def pick_output(output, names):
@@ -207,18 +220,16 @@ def draw_matches(
     source_scale: int,
     match_shape,
 ):
-    a = (image_a.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-    b = (image_b.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+    a = to_uint8_rgb(image_a)
+    b = to_uint8_rgb(image_b)
     h, w = a.shape[:2]
     match_h, match_w = match_shape
-    canvas = Image.new("RGB", (2 * w, h))
-    canvas.paste(Image.fromarray(a), (0, 0))
-    canvas.paste(Image.fromarray(b), (w, 0))
-    draw = ImageDraw.Draw(canvas)
+    canvas = np.concatenate((a, b), axis=1)
+    overlay = canvas.copy()
 
     valid_indices = torch.nonzero(valid, as_tuple=False).reshape(-1).cpu().numpy()
     if valid_indices.size == 0:
-        canvas.save(path)
+        Image.fromarray(canvas).save(path)
         return
     rng = np.random.default_rng(seed)
     if valid_indices.size > max_lines:
@@ -227,15 +238,23 @@ def draw_matches(
         y0_match, x0_match = divmod(int(idx), match_w)
         x0 = x0_match * source_scale
         y0 = y0_match * source_scale
-        x1 = float(u[idx].detach().cpu()) + w
-        y1 = float(v[idx].detach().cpu())
+        x1 = int(round(float(u[idx].detach().cpu()))) + w
+        y1 = int(round(float(v[idx].detach().cpu())))
+        x0 = int(np.clip(x0, 0, w - 1))
+        y0 = int(np.clip(y0, 0, h - 1))
+        x1 = int(np.clip(x1, w, 2 * w - 1))
+        y1 = int(np.clip(y1, 0, h - 1))
         color = (
             int(255 * x0 / max(w - 1, 1)),
             int(255 * y0 / max(h - 1, 1)),
-            64,
+            255 - int(255 * x0 / max(w - 1, 1)),
         )
-        draw.line((x0, y0, x1, y1), fill=color, width=1)
-    canvas.save(path)
+        cv2.line(overlay, (x0, y0), (x1, y1), color, 1, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, (x0, y0), 2, color, -1, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, (x1, y1), 2, color, -1, lineType=cv2.LINE_AA)
+
+    canvas = cv2.addWeighted(overlay, 0.65, canvas, 0.35, 0.0)
+    Image.fromarray(canvas).save(path)
 
 
 def print_stats(name: str, idx: torch.Tensor, valid: torch.Tensor, h: int, w: int):
