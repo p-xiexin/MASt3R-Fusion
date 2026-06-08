@@ -127,6 +127,28 @@ def parse_args():
         default=30.0,
         help="Pose distance threshold used by --match-check-h5-window.",
     )
+    parser.add_argument(
+        "--match-surfelmap",
+        action="store_true",
+        help=(
+            "Match the default check_h5.py surfelmap.glsl visibility filter: "
+            "skip the 1-pixel image border before exporting points."
+        ),
+    )
+    parser.add_argument(
+        "--match-trianglemap",
+        action="store_true",
+        help=(
+            "Match trianglemap.glsl visibility filtering: skip the 10-pixel border, "
+            "require top-left quad confidence, and apply the slant threshold."
+        ),
+    )
+    parser.add_argument(
+        "--slant-threshold",
+        type=float,
+        default=0.1,
+        help="Slant threshold used by --match-trianglemap, matching trianglemap.glsl.",
+    )
     return parser.parse_args()
 
 
@@ -245,10 +267,11 @@ def load_calibration_context(config_path: Optional[str], calib_path: Optional[st
     load_config(config_path)
     # check_h5.py forces calibrated visualization after loading the config.
     config["use_calib"] = True
+    img_size = config.get("dataset", {}).get("img_size", 512)
     with open(calib_path, "r") as f:
         intrinsics = yaml.load(f, Loader=yaml.SafeLoader)
     camera_intrinsics = Intrinsics.from_calib(
-        512,
+        img_size,
         intrinsics["width"],
         intrinsics["height"],
         intrinsics["calibration"],
@@ -309,7 +332,7 @@ def calibrated_points_from_depth(points: np.ndarray, image_shape: Tuple[int, int
     return (z * rays).reshape(-1, 3)
 
 
-def frame_arrays(data, stride: int, K: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def frame_arrays(data, K: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Tuple[int, int]]:
     points = to_numpy(data["X"], dtype=np.float32).reshape(-1, 3)
     colors = to_numpy(data["uimg"])
     h, w = colors.shape[:2]
@@ -324,25 +347,89 @@ def frame_arrays(data, stride: int, K: Optional[np.ndarray]) -> Tuple[np.ndarray
             "Frame arrays have inconsistent lengths: "
             f"X={points.shape[0]}, C={conf.shape[0]}, uimg={colors.shape[0]}."
         )
-    if stride > 1:
-        points = points[::stride]
-        colors = colors[::stride]
-        conf = conf[::stride]
-    return points, colors, conf
+    return points, colors, conf, (h, w)
+
+
+def surfelmap_mask(image_shape: Tuple[int, int]) -> np.ndarray:
+    h, w = image_shape
+    y, x = np.indices((h, w), dtype=np.int32)
+    return (x >= 1) & (x < w - 1) & (y >= 1) & (y < h - 1)
+
+
+def normalize_vectors(vectors: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vectors, axis=-1, keepdims=True)
+    return np.divide(vectors, norms, out=np.zeros_like(vectors), where=norms > 0)
+
+
+def trianglemap_mask(
+    points: np.ndarray,
+    conf: np.ndarray,
+    image_shape: Tuple[int, int],
+    conf_threshold: float,
+    slant_threshold: float,
+) -> np.ndarray:
+    h, w = image_shape
+    point_grid = points.reshape(h, w, 3)
+    conf_grid = conf.reshape(h, w)
+    visible = np.zeros((h, w), dtype=bool)
+    if h <= 20 or w <= 20:
+        return visible
+
+    tl = point_grid[:-1, :-1]
+    tr = point_grid[:-1, 1:]
+    bl = point_grid[1:, :-1]
+    br = point_grid[1:, 1:]
+    n1 = normalize_vectors(np.cross(bl - tl, tr - tl))
+    n2 = normalize_vectors(np.cross(bl - tr, br - tr))
+    ray1 = normalize_vectors(tl)
+    ray2 = normalize_vectors(tr)
+
+    finite_quad = (
+        np.isfinite(tl).all(axis=-1)
+        & np.isfinite(tr).all(axis=-1)
+        & np.isfinite(bl).all(axis=-1)
+        & np.isfinite(br).all(axis=-1)
+    )
+    valid_quad = (
+        finite_quad
+        & np.isfinite(conf_grid[:-1, :-1])
+        & (conf_grid[:-1, :-1] >= conf_threshold)
+        & (np.abs(np.sum(n1 * ray1, axis=-1)) >= slant_threshold)
+        & (np.abs(np.sum(n2 * ray2, axis=-1)) >= slant_threshold)
+    )
+    border = np.zeros_like(valid_quad, dtype=bool)
+    border[10 : h - 10, 10 : w - 10] = True
+    valid_quad &= border
+
+    visible[:-1, :-1] |= valid_quad
+    visible[:-1, 1:] |= valid_quad
+    visible[1:, :-1] |= valid_quad
+    visible[1:, 1:] |= valid_quad
+    return visible
 
 
 def valid_mask(
     points: np.ndarray,
     conf: np.ndarray,
+    image_shape: Tuple[int, int],
     conf_threshold: float,
     min_depth: float,
     max_depth: float,
+    match_surfelmap: bool,
+    match_trianglemap: bool,
+    slant_threshold: float,
 ) -> np.ndarray:
     mask = np.isfinite(points).all(axis=1) & np.isfinite(conf) & (conf > conf_threshold)
     if min_depth >= 0:
         mask &= points[:, 2] >= min_depth
     if max_depth > 0:
         mask &= points[:, 2] <= max_depth
+    if match_surfelmap:
+        mask &= surfelmap_mask(image_shape).reshape(-1)
+    if match_trianglemap:
+        mask &= trianglemap_mask(
+            points, conf, image_shape, conf_threshold, slant_threshold
+        ).reshape(-1)
     return mask
 
 
@@ -388,18 +475,44 @@ def resolve_pose(
 
 def count_frame_points(data, key_idx: int, pose_by_index, args, K: Optional[np.ndarray]) -> int:
     pose = resolve_pose(data, key_idx, pose_by_index, args.pose_index_mode)
-    points, _, conf = frame_arrays(data, args.stride, K)
+    points, _, conf, image_shape = frame_arrays(data, K)
     points = points * pose_scale(pose)
-    mask = valid_mask(points, conf, args.conf_threshold, args.min_depth, args.max_depth)
+    mask = valid_mask(
+        points,
+        conf,
+        image_shape,
+        args.conf_threshold,
+        args.min_depth,
+        args.max_depth,
+        args.match_surfelmap,
+        args.match_trianglemap,
+        args.slant_threshold,
+    )
+    if args.stride > 1:
+        mask = mask[:: args.stride]
     return int(mask.sum())
 
 
 def transformed_frame_vertices(data, key_idx: int, pose_by_index, args, K: Optional[np.ndarray]) -> np.ndarray:
     pose = resolve_pose(data, key_idx, pose_by_index, args.pose_index_mode)
-    points, colors, conf = frame_arrays(data, args.stride, K)
+    points, colors, conf, image_shape = frame_arrays(data, K)
     # check_h5.py multiplies X by the Sim3 scale, then sets pose scale to 1.0.
     points = points * pose_scale(pose)
-    mask = valid_mask(points, conf, args.conf_threshold, args.min_depth, args.max_depth)
+    mask = valid_mask(
+        points,
+        conf,
+        image_shape,
+        args.conf_threshold,
+        args.min_depth,
+        args.max_depth,
+        args.match_surfelmap,
+        args.match_trianglemap,
+        args.slant_threshold,
+    )
+    if args.stride > 1:
+        points = points[:: args.stride]
+        colors = colors[:: args.stride]
+        mask = mask[:: args.stride]
     points = points[mask]
     colors = colors[mask]
     points_world = pose_to_world(points, pose)
@@ -450,6 +563,8 @@ def main():
     args = parse_args()
     if args.stride < 1:
         raise ValueError("--stride must be >= 1.")
+    if args.match_surfelmap and args.match_trianglemap:
+        raise ValueError("--match-surfelmap and --match-trianglemap are mutually exclusive.")
 
     try:
         import h5py

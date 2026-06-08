@@ -30,15 +30,55 @@ MASt3R-compatible descriptor head. `pi3x_decoder()` is intentionally left as a
 `NotImplementedError`. Matching currently uses normalized RGB as a weak
 descriptor fallback.
 
+### PI3X Directly Adapted Capabilities
+
+The current adapter does use several PI3X outputs directly instead of
+fabricating the whole frontend result:
+
+- PI3X directly supports multi-image forward inference with input shaped like
+  `(B, N, 3, H, W)` through `model(imgs=images)`. The adapter uses this path for
+  both pair inference and the current single-frame fallback.
+- PI3X directly predicts dense per-view local point maps. The adapter maps
+  `local_points` / `points_local` / `pts3d` to MASt3R-Fusion point maps such as
+  `Xii` and `Xjj`.
+- PI3X directly predicts per-view camera poses. The adapter uses
+  `camera_poses` / `poses` / `extrinsics` to transform one view's local point
+  map into the other view's coordinate convention, producing `Xji` and `Xij`
+  for the existing geometric matcher.
+- PI3X directly predicts point confidence. The adapter converts PI3X `conf`
+  logits with `sigmoid()` and uses them as point confidence `C` and provisional
+  match confidence `Q`.
+
+### PI3X Adapter Core Limitations
+
+PI3X is not a drop-in MASt3R matcher. The current adapter is intended for
+server-side smoke testing first, and these limitations must be checked before
+trusting full SLAM results:
+
+- PI3X does not expose MASt3R-style dense descriptors. The adapter currently
+  uses normalized RGB as a weak descriptor fallback, so descriptor refinement
+  and repeated-texture matching may be much weaker than MASt3R.
+- PI3X does not output explicit pair matching results such as `idx_i2j`,
+  `idx_j2i`, or `valid_match`. The adapter derives dense correspondences from
+  PI3X `local_points` and `camera_poses`, then runs the existing projection
+  matcher. This is a geometric approximation, not a native PI3X match head.
+- PI3X point confidence has a different scale from MASt3R descriptor
+  confidence. PI3X `conf` is treated as raw logits and converted with
+  `sigmoid()`, producing values in `[0, 1]`. Use PI3X-specific `Q_conf`
+  thresholds, such as those in `config/base_kitti360_pi3x.yaml`, instead of the
+  MASt3R default threshold `1.5`.
+
 ### Retrieval Behavior
 
 The MASt3R retrieval database depends on a MASt3R-compatible backbone. For
 non-MASt3R frontends, `main.py` sets `retrieval_database = None` and disables
 retrieval-based loop candidates. Consecutive local factors still run.
 
-### Checkpoint Documentation
+### Checkpoint And Local Documentation
 
-`README.md` now documents the PI3X install and checkpoint setup:
+Do not modify the upstream-style `README.md` for local adapter deployment notes.
+Keep PI3X setup and server debugging details in this document and `AGENTS.md`.
+Install PI3X as an editable third-party package:
 
 ```bash
 git clone https://github.com/yyfz/Pi3.git thirdparty/Pi3
@@ -92,9 +132,10 @@ pip install -e thirdparty/in3d
 pip install --no-build-isolation -e .
 ```
 
-If testing PI3X:
+If testing PI3X, install the PI3 codebase as an editable third-party package:
 
 ```bash
+git clone https://github.com/yyfz/Pi3.git thirdparty/Pi3
 pip install -e thirdparty/Pi3
 ```
 
@@ -172,9 +213,7 @@ Use a short range first:
 
 ```bash
 python main.py \
-  --frontend-model pi3x \
-  --frontend-weights checkpoints/pi3x/model.safetensors \
-  --config config/base_kitti360.yaml \
+  --config config/base_kitti360_pi3x.yaml \
   --calib config/intrinsics_kitti360.yaml \
   --dataset <dataset_path> \
   --imu_path <imu_path> \

@@ -50,16 +50,6 @@ Lightweight syntax check:
 python -m compileall main.py mast3r_fusion evaluation
 ```
 
-Direct frontend output smoke test:
-
-```bash
-python tools/test_frontend_output.py --frontend-model mast3r --config config/base_kitti360.yaml --output-dir frontend_test_outputs/mast3r
-python tools/test_frontend_output.py --frontend-model pi3x --frontend-weights checkpoints/pi3x/model.safetensors --config config/base_kitti360.yaml --output-dir frontend_test_outputs/pi3x
-```
-
-The smoke-test tool saves input images, confidence/depth maps, and `.ply` point
-clouds for manual inspection.
-
 ## Coding Style
 
 Use Python 3 style with 4-space indentation. Keep changes local to the relevant

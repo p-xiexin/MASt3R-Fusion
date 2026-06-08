@@ -30,7 +30,10 @@ def load_pi3x(path=None, device="cuda"):
     if hasattr(Pi3X, "from_pretrained") and (
         not weights_path_obj.exists() or weights_path_obj.is_dir()
     ):
-        return Pi3X.from_pretrained(weights_path).to(device).eval()
+        model = Pi3X.from_pretrained(weights_path).eval()
+        if hasattr(model, "disable_multimodal"):
+            model.disable_multimodal()
+        return model.to(device)
 
     model = Pi3X()
     if str(weights_path).endswith(".safetensors"):
@@ -41,7 +44,10 @@ def load_pi3x(path=None, device="cuda"):
         state = torch.load(weights_path, map_location="cpu")
     state_dict = state.get("state_dict", state) if isinstance(state, dict) else state
     model.load_state_dict(state_dict, strict=False)
-    return model.to(device).eval()
+    model.eval()
+    if hasattr(model, "disable_multimodal"):
+        model.disable_multimodal()
+    return model.to(device)
 
 
 def _frame_image(frame):
@@ -89,9 +95,16 @@ def _features_to_images(feat, shapes, pos=None):
 
 
 def _call_pi3x(model, images):
-    if hasattr(model, "infer"):
-        output = model.infer(images)
-    else:
+    h, w = images.shape[-2:]
+    patch_size = getattr(model, "patch_size", 14)
+    if h % patch_size != 0 or w % patch_size != 0:
+        raise ValueError(
+            f"PI3X expects image height/width divisible by {patch_size}, "
+            f"got {(h, w)}. Adjust the input resize path before PI3X inference."
+        )
+    try:
+        output = model(imgs=images)
+    except TypeError:
         output = model(images)
     if not isinstance(output, dict):
         raise TypeError("PI3X inference must return a dict-like output.")
@@ -142,7 +155,8 @@ def _pair_output_to_maps(output, images):
     h, w = images.shape[-2:]
     local_points = _resize_map(local_points[0], h, w)
     confidences = _resize_map(confidences[0], h, w)[..., 0]
-    confidences = torch.sigmoid(confidences) if confidences.max() > 1 else confidences
+    # Pi3X documents `conf` as raw logits; convert it before thresholding.
+    confidences = torch.sigmoid(confidences)
 
     Xii = local_points[0]
     Xjj = local_points[1]

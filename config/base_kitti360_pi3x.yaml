@@ -1,0 +1,25 @@
+inherit: config/base_kitti360.yaml
+
+dataset:
+  # Pi3X uses patch size 14. The existing 224 resize/crop path keeps H/W
+  # divisible by 14 and Intrinsics.K_frame is computed from the same transform.
+  img_size: 224
+
+frontend_model:
+  name: pi3x
+  weights: checkpoints/pi3x/model.safetensors
+
+matching:
+  # Pi3X does not expose MASt3R descriptors; RGB fallback descriptors are weak.
+  # Start without descriptor-neighborhood refinement for first server tests.
+  radius: 0
+
+tracking:
+  # Pi3X confidence is sigmoid-normalized to [0, 1], unlike MASt3R desc_conf.
+  Q_conf: 0.3
+
+local_opt:
+  Q_conf: 0.3
+
+ms_opt:
+  subpixel_factor: 1
