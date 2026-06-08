@@ -31,6 +31,15 @@ def parse_args():
     )
     parser.add_argument("--conf-threshold", type=float, default=0.2)
     parser.add_argument("--min-depth", type=float, default=1e-6)
+    parser.add_argument(
+        "--downsample",
+        type=int,
+        default=1,
+        help=(
+            "Downsample PI3X point/confidence/image maps before reprojection, "
+            "using the same ::N grid slicing style as MASt3R-Fusion."
+        ),
+    )
     parser.add_argument("--max-lines", type=int, default=300)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", default="pi3x_reprojection_verify")
@@ -167,6 +176,15 @@ def project_to_index(
     return idx.reshape(-1), valid.reshape(-1), u.reshape(-1), v.reshape(-1), pair_conf.reshape(-1)
 
 
+def downsample_inputs(points: torch.Tensor, conf: torch.Tensor, images: torch.Tensor, downsample: int):
+    if downsample <= 1:
+        return points, conf, images
+    points = points[:, ::downsample, ::downsample, :].contiguous()
+    conf = conf[:, ::downsample, ::downsample].contiguous()
+    images = images[..., ::downsample, ::downsample].contiguous()
+    return points, conf, images
+
+
 def draw_matches(path: Path, image_a: torch.Tensor, image_b: torch.Tensor, valid: torch.Tensor, u: torch.Tensor, v: torch.Tensor, max_lines: int, seed: int):
     a = (image_a.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
     b = (image_b.detach().cpu().clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
@@ -217,6 +235,8 @@ def main():
     args = parse_args()
     if args.size % 14 != 0:
         raise ValueError("--size must be divisible by 14 for PI3X.")
+    if args.downsample < 1:
+        raise ValueError("--downsample must be >= 1.")
 
     device = torch.device(args.device)
     output_dir = Path(args.output_dir)
@@ -224,18 +244,20 @@ def main():
 
     image_a = load_rgb(args.image_a, args.size, device)
     image_b = load_rgb(args.image_b, args.size, device)
-    save_rgb(output_dir / "image_a.png", image_a)
-    save_rgb(output_dir / "image_b.png", image_b)
 
     model = load_pi3x(args.weights, device=str(device))
     images = torch.stack((image_a, image_b), dim=0).unsqueeze(0)
     output = model(imgs=images)
     points, conf, poses = normalize_output(output)
+    points, conf, images = downsample_inputs(points, conf, images, args.downsample)
 
     h, w = points.shape[1:3]
     points_a, points_b = points[0], points[1]
     conf_a, conf_b = conf[0], conf[1]
+    image_a, image_b = images[0, 0], images[0, 1]
     pose_a, pose_b = poses[0], poses[1]
+    save_rgb(output_dir / "image_a.png", image_a)
+    save_rgb(output_dir / "image_b.png", image_b)
 
     K_a, fit_valid_a, fit_err_a = fit_intrinsics(points_a, conf_a, args.conf_threshold, args.min_depth)
     K_b, fit_valid_b, fit_err_b = fit_intrinsics(points_b, conf_b, args.conf_threshold, args.min_depth)
