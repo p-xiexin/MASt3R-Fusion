@@ -130,27 +130,41 @@ def transform_points(points: torch.Tensor, pose_src: torch.Tensor, pose_dst: tor
     return transformed.reshape(h, w, 3)
 
 
-def project_to_index(points_dst: torch.Tensor, K_dst: torch.Tensor, conf_src: torch.Tensor, conf_threshold: float, min_depth: float):
+def project_to_index(
+    points_dst: torch.Tensor,
+    K_dst: torch.Tensor,
+    conf_src: torch.Tensor,
+    conf_dst: torch.Tensor,
+    conf_threshold: float,
+    min_depth: float,
+):
     h, w = points_dst.shape[:2]
     z = points_dst[..., 2]
     u = K_dst[0, 0] * (points_dst[..., 0] / z) + K_dst[0, 2]
     v = K_dst[1, 1] * (points_dst[..., 1] / z) + K_dst[1, 2]
     u_round = torch.round(u).long()
     v_round = torch.round(v).long()
+    in_bounds = (
+        (u_round >= 0)
+        & (u_round < w)
+        & (v_round >= 0)
+        & (v_round < h)
+    )
+    conf_projected_dst = torch.zeros_like(conf_src)
+    conf_projected_dst[in_bounds] = conf_dst[v_round[in_bounds], u_round[in_bounds]]
     valid = (
         torch.isfinite(points_dst).all(dim=-1)
         & torch.isfinite(u)
         & torch.isfinite(v)
         & (z > min_depth)
         & (conf_src > conf_threshold)
-        & (u_round >= 0)
-        & (u_round < w)
-        & (v_round >= 0)
-        & (v_round < h)
+        & (conf_projected_dst > conf_threshold)
+        & in_bounds
     )
     idx = torch.zeros(h, w, device=points_dst.device, dtype=torch.long)
     idx[valid] = v_round[valid] * w + u_round[valid]
-    return idx.reshape(-1), valid.reshape(-1), u.reshape(-1), v.reshape(-1)
+    pair_conf = torch.sqrt(conf_src * conf_projected_dst)
+    return idx.reshape(-1), valid.reshape(-1), u.reshape(-1), v.reshape(-1), pair_conf.reshape(-1)
 
 
 def draw_matches(path: Path, image_a: torch.Tensor, image_b: torch.Tensor, valid: torch.Tensor, u: torch.Tensor, v: torch.Tensor, max_lines: int, seed: int):
@@ -240,15 +254,27 @@ def main():
 
     points_a_in_b = transform_points(points_a, pose_a, pose_b)
     points_b_in_a = transform_points(points_b, pose_b, pose_a)
-    idx_a2b, valid_a2b, u_a2b, v_a2b = project_to_index(
-        points_a_in_b, K_b, conf_a, args.conf_threshold, args.min_depth
+    idx_a2b, valid_a2b, u_a2b, v_a2b, pair_conf_a2b = project_to_index(
+        points_a_in_b, K_b, conf_a, conf_b, args.conf_threshold, args.min_depth
     )
-    idx_b2a, valid_b2a, u_b2a, v_b2a = project_to_index(
-        points_b_in_a, K_a, conf_b, args.conf_threshold, args.min_depth
+    idx_b2a, valid_b2a, u_b2a, v_b2a, pair_conf_b2a = project_to_index(
+        points_b_in_a, K_a, conf_b, conf_a, args.conf_threshold, args.min_depth
     )
 
     print_stats("a2b", idx_a2b, valid_a2b, h, w)
     print_stats("b2a", idx_b2a, valid_b2a, h, w)
+    if valid_a2b.any():
+        print(
+            "a2b.pair_conf: "
+            f"median={pair_conf_a2b[valid_a2b].median().item():.3f}, "
+            f"mean={pair_conf_a2b[valid_a2b].mean().item():.3f}"
+        )
+    if valid_b2a.any():
+        print(
+            "b2a.pair_conf: "
+            f"median={pair_conf_b2a[valid_b2a].median().item():.3f}, "
+            f"mean={pair_conf_b2a[valid_b2a].mean().item():.3f}"
+        )
 
     draw_matches(output_dir / "a_to_b_reprojection.png", image_a, image_b, valid_a2b, u_a2b, v_a2b, args.max_lines, args.seed)
     draw_matches(output_dir / "b_to_a_reprojection.png", image_b, image_a, valid_b2a, u_b2a, v_b2a, args.max_lines, args.seed)
@@ -259,6 +285,8 @@ def main():
         valid_a2b=valid_a2b.detach().cpu().numpy(),
         idx_b2a=idx_b2a.detach().cpu().numpy(),
         valid_b2a=valid_b2a.detach().cpu().numpy(),
+        pair_conf_a2b=pair_conf_a2b.detach().cpu().numpy(),
+        pair_conf_b2a=pair_conf_b2a.detach().cpu().numpy(),
         K_a=K_a.detach().cpu().numpy(),
         K_b=K_b.detach().cpu().numpy(),
         fit_valid_a=fit_valid_a.detach().cpu().numpy(),
