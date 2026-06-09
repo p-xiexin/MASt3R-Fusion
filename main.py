@@ -38,6 +38,13 @@ def find_valid_numbers(a, b):
     return result
 
 
+def get_latest_bias_vector(factor_graph):
+    try:
+        return factor_graph.bs[-1].vector()
+    except IndexError:
+        return np.zeros(6)
+
+
 def run_backend(states, keyframes):
     mode = states.get_mode()
     if mode == Mode.INIT or states.is_paused():
@@ -168,6 +175,7 @@ if __name__ == "__main__":
     dataset.subsample(config["dataset"]["subsample"],args.start_from,args.end_at)
     h, w = dataset.get_img_shape()[0]
     
+    intrinsics = {}
     if args.calib and config["use_calib"]:
         with open(args.calib, "r") as f:
             intrinsics = yaml.load(f, Loader=yaml.SafeLoader)
@@ -363,10 +371,7 @@ if __name__ == "__main__":
         # write results
         dd = states.T_WC[0].data.cpu().numpy() # visual tracking
         frame_id = frame.frame_id
-        try:
-            bb = factor_graph.bs[-1].vector()
-        except:
-            bb = np.zeros(6)
+        bb = get_latest_bias_vector(factor_graph)
         if factor_graph.enable_ms and frame.frame_id>100 and 'wTc_pred' in locals() and pred_dt < 5.0: # IMU prediction
             dd = np.concatenate([wTc_pred[0:3,3],Rotation.from_matrix(wTc_pred[0:3,0:3]).as_quat(),np.array([1.0])])
         factor_graph.fp.writelines('%.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %d 0\n' % (factor_graph.poses_stamps[frame_id],
@@ -386,7 +391,7 @@ if __name__ == "__main__":
         if add_new_kf:
             dd = keyframes.last_keyframe().T_WC.data.cpu().numpy()[0]
             frame_id = keyframes.last_keyframe().frame_id
-            bb = factor_graph.bs[-1].vector()
+            bb = get_latest_bias_vector(factor_graph)
             factor_graph.fp.writelines('%.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %d 1\n' % (factor_graph.poses_stamps[frame_id],
                                                                                  dd[0].item(),
                                                                                  dd[1].item(),
@@ -417,25 +422,27 @@ if __name__ == "__main__":
         i += 1
 
 
-    # finally 
-    last_pin = factor_graph.get_unique_kf_idx()[-1]
-    for iframe in range(factor_graph.last_pin,last_pin+1):
-        frame_temp = keyframes[iframe] 
-        buffer = io.BytesIO()
-        torch.save({
-            'feat': frame_temp.feat.cpu(), 
-            'pos': frame_temp.pos.cpu(),   
-            'X': frame_temp.X_canon.cpu(),
-            'C': frame_temp.C.cpu(),
-            'K': frame_temp.K.cpu(),
-            'N': frame_temp.N,
-            'uimg': (frame_temp.uimg * 255).to(torch.uint8).cpu().numpy(),
-            'img_shape': frame_temp.img_shape.cpu(),
-            'T_WC': frame_temp.T_WC.data.cpu(),
-            'id': frame_temp.frame_id,
-        }, buffer)
-        buffer.seek(0)
-        f_h5.create_dataset(f"frame_{iframe}", data=np.void(buffer.read()))
+    # finally
+    unique_kf_idx = factor_graph.get_unique_kf_idx()
+    if args.save_h5 and unique_kf_idx.numel() > 0:
+        last_pin = unique_kf_idx[-1].item()
+        for iframe in range(factor_graph.last_pin,last_pin+1):
+            frame_temp = keyframes[iframe]
+            buffer = io.BytesIO()
+            torch.save({
+                'feat': frame_temp.feat.cpu(),
+                'pos': frame_temp.pos.cpu(),
+                'X': frame_temp.X_canon.cpu(),
+                'C': frame_temp.C.cpu(),
+                'K': frame_temp.K.cpu(),
+                'N': frame_temp.N,
+                'uimg': (frame_temp.uimg * 255).to(torch.uint8).cpu().numpy(),
+                'img_shape': frame_temp.img_shape.cpu(),
+                'T_WC': frame_temp.T_WC.data.cpu(),
+                'id': frame_temp.frame_id,
+            }, buffer)
+            buffer.seek(0)
+            f_h5.create_dataset(f"frame_{iframe}", data=np.void(buffer.read()))
 
     factor_graph.save_graph('graph.pkl')
 

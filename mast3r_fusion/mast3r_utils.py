@@ -331,8 +331,8 @@ def _crop_resize(img, target_img_size, return_transformation=False):
         img.shape[:2], target_img_size
     )
     pil_img = _to_pil_image(img)
-    crop_w = target_w / scale_x
-    crop_h = target_h / scale_y
+    crop_w = int(round(target_w / scale_x))
+    crop_h = int(round(target_h / scale_y))
     cropped = pil_img.crop((left, top, left + crop_w, top + crop_h))
     interp = (
         PIL.Image.LANCZOS

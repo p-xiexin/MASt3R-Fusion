@@ -1,4 +1,5 @@
 from pathlib import Path
+import types
 
 import einops
 import torch
@@ -9,6 +10,23 @@ from mast3r_fusion.config import config
 
 
 DEFAULT_PI3X_WEIGHTS = "checkpoints/pi3x/model.safetensors"
+
+
+def _patch_pi3x_rope_contiguous(model):
+    for module in model.modules():
+        if module.__class__.__name__ == "cuRoPE2D" and hasattr(module, "base"):
+            forward_func = getattr(module.forward, "__func__", module.forward)
+            rope_func = getattr(forward_func, "__globals__", {}).get("cuRoPE2D_func")
+            if rope_func is None:
+                continue
+
+            def contiguous_rope_forward(self, tokens, positions, _rope_func=rope_func):
+                tokens_t = tokens.transpose(1, 2).contiguous()
+                _rope_func.apply(tokens_t, positions, self.base, self.F0)
+                return tokens_t.transpose(1, 2).contiguous()
+
+            module.forward = types.MethodType(contiguous_rope_forward, module)
+    return model
 
 
 def load_pi3x(path=None, device="cuda"):
@@ -33,6 +51,7 @@ def load_pi3x(path=None, device="cuda"):
         model = Pi3X.from_pretrained(weights_path).eval()
         if hasattr(model, "disable_multimodal"):
             model.disable_multimodal()
+        model = _patch_pi3x_rope_contiguous(model)
         return model.to(device)
 
     model = Pi3X()
@@ -47,6 +66,7 @@ def load_pi3x(path=None, device="cuda"):
     model.eval()
     if hasattr(model, "disable_multimodal"):
         model.disable_multimodal()
+    model = _patch_pi3x_rope_contiguous(model)
     return model.to(device)
 
 
