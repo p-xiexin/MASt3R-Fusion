@@ -26,9 +26,9 @@ class PairMatchResult:
     """Pairwise frontend outputs consumed by tracker and factor graph.
 
     Required for tracking:
-    - `idx_i2j`: dense linear indices from frame i pixels to frame j pixels,
+    - `idx_i2j`: dense linear indices into frame i, indexed by frame j pixels,
       shape `(B, H*W)` or `(B, H*W*subpixel_factor^2)` for subpixel matching.
-    - `valid_match_j`: validity mask for `idx_i2j`, shape `(B, H*W, 1)`.
+    - `valid_match_j`: frame-j validity mask for `idx_i2j`, shape `(B, H*W, 1)`.
     - `Xii`, `Cii`, `Qii`: frame-i point map, confidence, and match confidence
       flattened to `(B, H*W, 3)`, `(B, H*W, 1)`, `(B, H*W, 1)`.
     - `Xji`, `Cji`, `Qji`: frame-j or cross-view point map in frame-i matching

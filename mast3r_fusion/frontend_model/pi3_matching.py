@@ -204,7 +204,8 @@ def match(
 
     Returns:
         `(idx_src_to_dst, valid_match_dst, pair_conf)` with flattened shapes
-        `(B,H*W)`, `(B,H*W,1)`, and `(B,H*W,1)`.
+        `(B,H*W)`, `(B,H*W,1)`, and `(B,H*W,1)`. The returned index is ordered
+        by source pixels and stores linear destination indices.
     """
 
     points_src = _ensure_batch_points(points_src)
