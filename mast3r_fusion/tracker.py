@@ -29,7 +29,6 @@ class FrameTracker:
         except:
             pass
         self.idx_f2k = None
-        self.T_CkCf_init = None
 
     def track(self, frame: Frame):
         keyframe = self.keyframes.last_keyframe()
@@ -38,7 +37,6 @@ class FrameTracker:
             frame,
             keyframe,
             init=self.idx_f2k,
-            init_relative_pose=self.T_CkCf_init,
         )
         idx_f2k = match.idx_i2j
         valid_match_k = match.valid_match_j
@@ -81,16 +79,7 @@ class FrameTracker:
         valid_opt = valid_match_k & valid_Cf & valid_Ck & valid_Q
         valid_kf = valid_match_k & valid_Q
 
-        n_valid_opt = valid_opt.sum()
         match_frac = valid_opt.sum() / valid_opt.numel()
-        min_valid_opt = self.cfg.get("min_valid_opt", 0)
-        if n_valid_opt < min_valid_opt:
-            print(
-                f"Skipped frame {frame.frame_id}: valid_opt={int(n_valid_opt)} "
-                f"below min_valid_opt={min_valid_opt}, "
-                f"match_frac={float(match_frac):.6f}"
-            )
-            return False, [], True
         if match_frac < self.cfg["min_match_frac"]:
             print(f"Skipped frame {frame.frame_id}")
             return False, [], True
@@ -116,12 +105,7 @@ class FrameTracker:
                 )
             print('[INFO] track.',time.time())
         except Exception as e:
-            print(
-                f"Cholesky failed {frame.frame_id}: {type(e).__name__}: {e}; "
-                f"valid_opt={int(n_valid_opt)}, match_frac={float(match_frac):.6f}, "
-                f"Qk=({float(torch.nan_to_num(Qk).min()):.6g}, "
-                f"{float(torch.nan_to_num(Qk).max()):.6g})"
-            )
+            print(f"Cholesky failed {frame.frame_id}")
             # return False, [], True
             T_WCf = lietorch.Sim3(T_WCk.data.clone())
             T_CkCf = T_WCf.inv() * T_WCk
@@ -129,7 +113,6 @@ class FrameTracker:
         frame.T_WC = T_WCf
         frame.ref_kf = keyframe.frame_id
         frame.T_CkCf = T_CkCf
-        self.T_CkCf_init = T_CkCf
         dd = keyframe.T_WC[0].data.cpu().numpy()
         dd2 = frame.T_WC[0].data.cpu().numpy()
         self.fp.writelines('%d %d %f %f %f %f %f %f\n'%(keyframe.frame_id,frame.frame_id,dd[0],dd[1],dd[2],dd2[0],dd2[1],dd2[2]));self.fp.flush()
@@ -204,13 +187,6 @@ class FrameTracker:
         H = A.T @ A
         g = -A.T @ b
         cost = 0.5 * (b.T @ b).item()
-
-        if not torch.isfinite(H).all() or not torch.isfinite(g).all():
-            raise RuntimeError("non-finite normal equation in tracker solve")
-
-        damping = self.cfg.get("damping", 0.0)
-        if damping > 0:
-            H = H + damping * torch.eye(mdim, device=H.device, dtype=H.dtype)
 
         L = torch.linalg.cholesky(H, upper=False)
         tau_j = torch.cholesky_solve(g, L, upper=False).view(1, -1)

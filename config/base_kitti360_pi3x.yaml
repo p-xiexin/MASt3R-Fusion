@@ -21,8 +21,6 @@ tracking:
   # Pi3X confidence is sigmoid-normalized to [0, 1], unlike MASt3R desc_conf.
   Q_conf: 0.3
   min_match_frac: 0.01
-  min_valid_opt: 128
-  damping: 1.0e-4
 
 local_opt:
   Q_conf: 0.3

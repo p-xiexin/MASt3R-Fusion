@@ -26,10 +26,6 @@ class Frame:
     C: Optional[torch.Tensor] = None
     feat: Optional[torch.Tensor] = None
     pos: Optional[torch.Tensor] = None
-    mv_feat: Optional[torch.Tensor] = None
-    mv_context_id: Optional[int] = None
-    mv_pointmap: Optional[torch.Tensor] = None
-    mv_conf: Optional[torch.Tensor] = None
     N: int = 0
     N_updates: int = 0
     K: Optional[torch.Tensor] = None
