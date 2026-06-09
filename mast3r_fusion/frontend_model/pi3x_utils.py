@@ -254,6 +254,54 @@ def _match_conf_threshold():
     return config.get("pi3x", {}).get("match_conf_threshold", 0.0)
 
 
+def _match_debug_enabled():
+    return config.get("pi3x", {}).get("debug_match", True)
+
+
+def _ratio(mask):
+    return float(mask.float().mean().item()) if mask.numel() else 0.0
+
+
+def _print_match_debug(name, frame_i, frame_j, valid, pair_conf, conf_src, conf_dst, debug, pose_source):
+    valid_flat = valid.reshape(valid.shape[0], -1)
+    pair_flat = pair_conf.reshape(pair_conf.shape[0], -1)
+    for batch_idx in range(valid_flat.shape[0]):
+        valid_b = valid_flat[batch_idx]
+        pair_b = pair_flat[batch_idx]
+        valid_count = int(valid_b.sum().item())
+        total = valid_b.numel()
+        if valid_count:
+            pair_valid = pair_b[valid_b]
+            pair_summary = (
+                f"pair_conf[min={pair_valid.min().item():.3f}, "
+                f"mean={pair_valid.mean().item():.3f}, "
+                f"max={pair_valid.max().item():.3f}]"
+            )
+        else:
+            pair_summary = "pair_conf[empty]"
+        z = debug["z"][batch_idx]
+        print(
+            f"[PI3X match:{name}] "
+            f"frame_i={getattr(frame_i, 'frame_id', '?')} "
+            f"frame_j={getattr(frame_j, 'frame_id', '?')} "
+            f"pose={pose_source} "
+            f"valid={valid_count}/{total} ({valid_count / max(total, 1):.6f}) "
+            f"in_bounds={_ratio(debug['in_bounds'][batch_idx]):.6f} "
+            f"depth={_ratio(debug['positive_depth'][batch_idx]):.6f} "
+            f"src_conf={_ratio(debug['valid_conf_src'][batch_idx]):.6f} "
+            f"dst_conf={_ratio(debug['valid_conf_dst'][batch_idx]):.6f} "
+            f"z[min={torch.nan_to_num(z).min().item():.3g}, "
+            f"max={torch.nan_to_num(z).max().item():.3g}] "
+            f"Cii[min={conf_src[batch_idx].min().item():.3f}, "
+            f"mean={conf_src[batch_idx].mean().item():.3f}, "
+            f"max={conf_src[batch_idx].max().item():.3f}] "
+            f"Cjj[min={conf_dst[batch_idx].min().item():.3f}, "
+            f"mean={conf_dst[batch_idx].mean().item():.3f}, "
+            f"max={conf_dst[batch_idx].max().item():.3f}] "
+            f"{pair_summary}"
+        )
+
+
 def pi3x_decoder(*args, **kwargs):
     # PI3X does not expose MASt3R's private _decoder/_downstream_head API.
     # Pair inference must go through pi3x_inference_pair instead.
@@ -358,11 +406,13 @@ def pi3x_match_asymmetric(
     if init_relative_pose is not None:
         pose_src = _pose_to_matrix(init_relative_pose, Xii_match.device, Xii_match.dtype)[None]
         pose_dst = torch.eye(4, device=Xii_match.device, dtype=Xii_match.dtype)[None]
+        pose_source = "init_relative_pose"
     else:
         pose_src = T_w_ci[None]
         pose_dst = T_w_cj[None]
+        pose_source = "pi3x_camera_poses"
 
-    idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
+    idx_i2j, valid_match_j, pair_conf_i2j, debug = pi3_matching.match(
         Xii_match,
         Xjj_match,
         pose_src,
@@ -370,11 +420,24 @@ def pi3x_match_asymmetric(
         Cii_match,
         Cjj_match,
         conf_threshold=_match_conf_threshold(),
+        return_debug=True,
     )
+    if _match_debug_enabled():
+        _print_match_debug(
+            "asym",
+            frame_i,
+            frame_j,
+            valid_match_j,
+            pair_conf_i2j,
+            Cii_match,
+            Cjj_match,
+            debug,
+            pose_source,
+        )
     Xii, Xji = X[:1], X[1:]
     Cii, Cji = C[:1], C[1:]
     Xii, Xji = einops.rearrange(X, "b h w c -> b (h w) c")
     Cii, Cji = einops.rearrange(C, "b h w -> b (h w) 1")
     Qii, Qji = einops.rearrange(Q, "b h w -> b (h w) 1")
-    Qji = pair_conf_i2j
+    Qji = pair_conf_i2j[0]
     return idx_i2j, valid_match_j, Xii, Cii, Qii, Xji, Cji, Qji

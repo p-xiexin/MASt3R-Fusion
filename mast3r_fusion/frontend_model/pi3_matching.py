@@ -114,6 +114,7 @@ def project_to_index(
     conf_dst: torch.Tensor,
     conf_threshold: float = 0.0,
     min_depth: float = 1e-6,
+    return_debug: bool = False,
 ):
     """Project source-grid points in destination coordinates to destination indices."""
 
@@ -142,19 +143,39 @@ def project_to_index(
     conf_projected_dst[in_bounds] = conf_dst[
         batch_idx[in_bounds], v_round[in_bounds], u_round[in_bounds]
     ]
+    finite_points = torch.isfinite(points_dst).all(dim=-1)
+    finite_projection = torch.isfinite(u) & torch.isfinite(v)
+    positive_depth = z > min_depth
+    valid_conf_src = conf_src > conf_threshold
+    valid_conf_dst = conf_projected_dst > conf_threshold
     valid = (
-        torch.isfinite(points_dst).all(dim=-1)
-        & torch.isfinite(u)
-        & torch.isfinite(v)
-        & (z > min_depth)
-        & (conf_src > conf_threshold)
-        & (conf_projected_dst > conf_threshold)
+        finite_points
+        & finite_projection
+        & positive_depth
+        & valid_conf_src
+        & valid_conf_dst
         & in_bounds
     )
     idx = torch.zeros(b, h, w, device=points_dst.device, dtype=torch.long)
     idx[valid] = v_round[valid] * w + u_round[valid]
     pair_conf = torch.sqrt(conf_src * conf_projected_dst)
-    return idx.view(b, -1), valid.view(b, -1, 1), pair_conf.view(b, -1, 1)
+
+    if not return_debug:
+        return idx.view(b, -1), valid.view(b, -1, 1), pair_conf.view(b, -1, 1)
+
+    debug = {
+        "u": u.view(b, -1),
+        "v": v.view(b, -1),
+        "in_bounds": in_bounds.view(b, -1),
+        "finite_points": finite_points.view(b, -1),
+        "finite_projection": finite_projection.view(b, -1),
+        "positive_depth": positive_depth.view(b, -1),
+        "valid_conf_src": valid_conf_src.view(b, -1),
+        "valid_conf_dst": valid_conf_dst.view(b, -1),
+        "conf_projected_dst": conf_projected_dst.view(b, -1, 1),
+        "z": z.view(b, -1),
+    }
+    return idx.view(b, -1), valid.view(b, -1, 1), pair_conf.view(b, -1, 1), debug
 
 
 def match(
@@ -167,6 +188,7 @@ def match(
     K_dst: torch.Tensor = None,
     conf_threshold: float = 0.0,
     min_depth: float = 1e-6,
+    return_debug: bool = False,
 ):
     """Return dense source-to-destination correspondences from PI3 geometry.
 
@@ -197,11 +219,15 @@ def match(
     if K_dst is None:
         K_dst = fit_intrinsics(points_dst, conf_dst, conf_threshold, min_depth)
     points_src_in_dst = transform_points(points_src, pose_src, pose_dst)
-    return project_to_index(
+    result = project_to_index(
         points_src_in_dst,
         K_dst,
         conf_src,
         conf_dst,
         conf_threshold,
         min_depth,
+        return_debug=return_debug,
     )
+    if return_debug:
+        result = (*result[:3], {**result[3], "K_dst": K_dst, "points_src_in_dst": points_src_in_dst})
+    return result

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+import mast3r_fusion.frontend_model.pi3_matching as pi3_matching
 from mast3r_fusion.frontend_model.pi3x_utils import load_pi3x
 
 
@@ -153,53 +154,6 @@ def scale_intrinsics(K: torch.Tensor, scale: float):
     return K_scaled
 
 
-def transform_points(points: torch.Tensor, pose_src: torch.Tensor, pose_dst: torch.Tensor):
-    h, w = points.shape[:2]
-    flat = points.reshape(-1, 3)
-    ones = torch.ones(flat.shape[0], 1, device=points.device, dtype=points.dtype)
-    homogeneous = torch.cat((flat, ones), dim=-1)
-    dst_from_src = torch.linalg.inv(pose_dst) @ pose_src
-    transformed = (dst_from_src @ homogeneous.T).T[..., :3]
-    return transformed.reshape(h, w, 3)
-
-
-def project_to_index(
-    points_dst: torch.Tensor,
-    K_dst: torch.Tensor,
-    conf_src: torch.Tensor,
-    conf_dst: torch.Tensor,
-    conf_threshold: float,
-    min_depth: float,
-):
-    h, w = points_dst.shape[:2]
-    z = points_dst[..., 2]
-    u = K_dst[0, 0] * (points_dst[..., 0] / z) + K_dst[0, 2]
-    v = K_dst[1, 1] * (points_dst[..., 1] / z) + K_dst[1, 2]
-    u_round = torch.round(u).long()
-    v_round = torch.round(v).long()
-    in_bounds = (
-        (u_round >= 0)
-        & (u_round < w)
-        & (v_round >= 0)
-        & (v_round < h)
-    )
-    conf_projected_dst = torch.zeros_like(conf_src)
-    conf_projected_dst[in_bounds] = conf_dst[v_round[in_bounds], u_round[in_bounds]]
-    valid = (
-        torch.isfinite(points_dst).all(dim=-1)
-        & torch.isfinite(u)
-        & torch.isfinite(v)
-        & (z > min_depth)
-        & (conf_src > conf_threshold)
-        & (conf_projected_dst > conf_threshold)
-        & in_bounds
-    )
-    idx = torch.zeros(h, w, device=points_dst.device, dtype=torch.long)
-    idx[valid] = v_round[valid] * w + u_round[valid]
-    pair_conf = torch.sqrt(conf_src * conf_projected_dst)
-    return idx.reshape(-1), valid.reshape(-1), u.reshape(-1), v.reshape(-1), pair_conf.reshape(-1)
-
-
 def downsample_maps(points: torch.Tensor, conf: torch.Tensor, downsample: int):
     if downsample <= 1:
         return points, conf
@@ -290,10 +244,16 @@ def main():
     images = torch.stack((image_a, image_b), dim=0).unsqueeze(0)
     output = model(imgs=images)
     points, conf, poses = normalize_output(output)
-    K_a_full, fit_valid_a_full, fit_err_a_full = fit_intrinsics(
+    K_a_full = pi3_matching.fit_intrinsics(
+        points[:1], conf[:1], args.conf_threshold, args.min_depth
+    )[0]
+    K_b_full = pi3_matching.fit_intrinsics(
+        points[1:2], conf[1:2], args.conf_threshold, args.min_depth
+    )[0]
+    _, fit_valid_a_full, fit_err_a_full = fit_intrinsics(
         points[0], conf[0], args.conf_threshold, args.min_depth
     )
-    K_b_full, fit_valid_b_full, fit_err_b_full = fit_intrinsics(
+    _, fit_valid_b_full, fit_err_b_full = fit_intrinsics(
         points[1], conf[1], args.conf_threshold, args.min_depth
     )
     points, conf = downsample_maps(points, conf, args.downsample)
@@ -323,14 +283,40 @@ def main():
         f"b[min={conf_b.min().item():.3f}, max={conf_b.max().item():.3f}, mean={conf_b.mean().item():.3f}]"
     )
 
-    points_a_in_b = transform_points(points_a, pose_a, pose_b)
-    points_b_in_a = transform_points(points_b, pose_b, pose_a)
-    idx_a2b, valid_a2b, u_a2b, v_a2b, pair_conf_a2b = project_to_index(
-        points_a_in_b, K_b, conf_a, conf_b, args.conf_threshold, args.min_depth
+    idx_a2b, valid_a2b, pair_conf_a2b, debug_a2b = pi3_matching.match(
+        points_a[None],
+        points_b[None],
+        pose_a[None],
+        pose_b[None],
+        conf_a[None],
+        conf_b[None],
+        K_dst=K_b,
+        conf_threshold=args.conf_threshold,
+        min_depth=args.min_depth,
+        return_debug=True,
     )
-    idx_b2a, valid_b2a, u_b2a, v_b2a, pair_conf_b2a = project_to_index(
-        points_b_in_a, K_a, conf_b, conf_a, args.conf_threshold, args.min_depth
+    idx_b2a, valid_b2a, pair_conf_b2a, debug_b2a = pi3_matching.match(
+        points_b[None],
+        points_a[None],
+        pose_b[None],
+        pose_a[None],
+        conf_b[None],
+        conf_a[None],
+        K_dst=K_a,
+        conf_threshold=args.conf_threshold,
+        min_depth=args.min_depth,
+        return_debug=True,
     )
+    idx_a2b = idx_a2b[0]
+    idx_b2a = idx_b2a[0]
+    valid_a2b = valid_a2b[0, :, 0]
+    valid_b2a = valid_b2a[0, :, 0]
+    pair_conf_a2b = pair_conf_a2b[0, :, 0]
+    pair_conf_b2a = pair_conf_b2a[0, :, 0]
+    u_a2b = debug_a2b["u"][0]
+    v_a2b = debug_a2b["v"][0]
+    u_b2a = debug_b2a["u"][0]
+    v_b2a = debug_b2a["v"][0]
 
     print_stats("a2b", idx_a2b, valid_a2b, h, w)
     print_stats("b2a", idx_b2a, valid_b2a, h, w)
