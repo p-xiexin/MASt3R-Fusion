@@ -4,7 +4,7 @@ import einops
 import torch
 import torch.nn.functional as F
 
-import mast3r_fusion.pi3_matching as pi3_matching
+import mast3r_fusion.frontend_model.pi3_matching as pi3_matching
 from mast3r_fusion.config import config
 
 
@@ -100,7 +100,7 @@ def _call_pi3x(model, images):
     if h % patch_size != 0 or w % patch_size != 0:
         raise ValueError(
             f"PI3X expects image height/width divisible by {patch_size}, "
-            f"got {(h, w)}. Adjust the input resize path before PI3X inference."
+            f"got {(h, w)}. Set dataset.target_img_size to multiples of {patch_size}."
         )
     try:
         output = model(imgs=images)

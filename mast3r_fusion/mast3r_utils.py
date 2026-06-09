@@ -282,3 +282,82 @@ def resize_img(img, size, square_ok=False, return_transformation=False):
         return res, (scale_w, scale_h, half_crop_w, half_crop_h)
 
     return res
+
+
+def _target_hw(target_img_size):
+    if target_img_size is None:
+        return None
+    if isinstance(target_img_size, int):
+        return target_img_size, target_img_size
+    if len(target_img_size) != 2:
+        raise ValueError(
+            f"target_img_size must be an int or [height, width], got {target_img_size}."
+        )
+    return int(target_img_size[0]), int(target_img_size[1])
+
+
+def _crop_resize_transform(source_hw, target_img_size):
+    target_h, target_w = _target_hw(target_img_size)
+    source_h, source_w = int(source_hw[0]), int(source_hw[1])
+    target_aspect = target_w / target_h
+    source_aspect = source_w / source_h
+
+    if source_aspect > target_aspect:
+        crop_h = source_h
+        crop_w = int(round(source_h * target_aspect))
+    else:
+        crop_w = source_w
+        crop_h = int(round(source_w / target_aspect))
+
+    crop_w = min(crop_w, source_w)
+    crop_h = min(crop_h, source_h)
+    left = (source_w - crop_w) // 2
+    top = (source_h - crop_h) // 2
+    scale_x = target_w / crop_w
+    scale_y = target_h / crop_h
+    return target_h, target_w, left, top, scale_x, scale_y
+
+
+def _to_pil_image(img):
+    if np.issubdtype(img.dtype, np.floating):
+        array = np.uint8(np.clip(img, 0.0, 1.0) * 255)
+    else:
+        array = np.uint8(img)
+    return PIL.Image.fromarray(array)
+
+
+def _crop_resize(img, target_img_size, return_transformation=False):
+    target_h, target_w, left, top, scale_x, scale_y = _crop_resize_transform(
+        img.shape[:2], target_img_size
+    )
+    pil_img = _to_pil_image(img)
+    crop_w = target_w / scale_x
+    crop_h = target_h / scale_y
+    cropped = pil_img.crop((left, top, left + crop_w, top + crop_h))
+    interp = (
+        PIL.Image.LANCZOS
+        if max(img.shape[:2]) > max(target_h, target_w)
+        else PIL.Image.BICUBIC
+    )
+    resized = cropped.resize((target_w, target_h), interp)
+
+    res = dict(
+        img=ImgNorm(resized)[None],
+        true_shape=np.int32([[target_h, target_w]]),
+        unnormalized_img=np.asarray(resized),
+    )
+    if return_transformation:
+        return res, (left, top, scale_x, scale_y)
+    return res
+
+
+def crop_resize_K(K, source_hw, target_img_size):
+    _, _, left, top, scale_x, scale_y = _crop_resize_transform(
+        source_hw, target_img_size
+    )
+    K_frame = K.copy()
+    K_frame[0, 0] = K[0, 0] * scale_x
+    K_frame[1, 1] = K[1, 1] * scale_y
+    K_frame[0, 2] = (K[0, 2] - left) * scale_x
+    K_frame[1, 2] = (K[1, 2] - top) * scale_y
+    return K_frame

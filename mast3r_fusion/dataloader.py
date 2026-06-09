@@ -7,7 +7,7 @@ import torch
 import pyrealsense2 as rs
 import yaml
 
-from mast3r_fusion.mast3r_utils import resize_img
+from mast3r_fusion.mast3r_utils import _crop_resize, crop_resize_K, resize_img
 from mast3r_fusion.config import config
 
 from torchcodec.decoders import VideoDecoder
@@ -50,7 +50,11 @@ class MonocularDataset(torch.utils.data.Dataset):
     def get_img_shape(self):
         img = self.read_img(0)
         raw_img_shape = img.shape
-        img = resize_img(img, self.img_size)
+        target_img_size = config.get("dataset", {}).get("target_img_size")
+        if target_img_size is not None:
+            img = _crop_resize(img, target_img_size)
+        else:
+            img = resize_img(img, self.img_size)
         # 3XHxW, HxWx3 -> HxW, HxW
         return img["img"][0].shape[1:], raw_img_shape[:2]
 
@@ -292,14 +296,18 @@ class Intrinsics:
         self.distortion = distortion
         self.mapx = mapx
         self.mapy = mapy
-        _, (scale_w, scale_h, half_crop_w, half_crop_h) = resize_img(
-            np.zeros((H, W, 3)), self.img_size, return_transformation=True
-        )
-        self.K_frame = self.K.copy()
-        self.K_frame[0, 0] = self.K[0, 0] / scale_w
-        self.K_frame[1, 1] = self.K[1, 1] / scale_h
-        self.K_frame[0, 2] = self.K[0, 2] / scale_w - half_crop_w
-        self.K_frame[1, 2] = self.K[1, 2] / scale_h - half_crop_h
+        target_img_size = config.get("dataset", {}).get("target_img_size")
+        if target_img_size is not None:
+            self.K_frame = crop_resize_K(self.K, (H, W), target_img_size)
+        else:
+            _, (scale_w, scale_h, half_crop_w, half_crop_h) = resize_img(
+                np.zeros((H, W, 3)), self.img_size, return_transformation=True
+            )
+            self.K_frame = self.K.copy()
+            self.K_frame[0, 0] = self.K[0, 0] / scale_w
+            self.K_frame[1, 1] = self.K[1, 1] / scale_h
+            self.K_frame[0, 2] = self.K[0, 2] / scale_w - half_crop_w
+            self.K_frame[1, 2] = self.K[1, 2] / scale_h - half_crop_h
 
     def remap(self, img):
         return cv2.remap(img, self.mapx, self.mapy, cv2.INTER_LINEAR)

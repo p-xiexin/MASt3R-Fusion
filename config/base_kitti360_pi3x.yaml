@@ -1,9 +1,9 @@
 inherit: config/base_kitti360.yaml
 
 dataset:
-  # Pi3X uses patch size 14. The existing 224 resize/crop path keeps H/W
-  # divisible by 14 and Intrinsics.K_frame is computed from the same transform.
-  img_size: 224
+  # Pi3X uses patch size 14. Crop/resize images to a fixed H,W target and
+  # update Intrinsics.K_frame with the same transform.
+  target_img_size: [378, 504]
 
 frontend_model:
   name: pi3x

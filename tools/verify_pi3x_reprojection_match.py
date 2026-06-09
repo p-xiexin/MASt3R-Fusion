@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from mast3r_fusion.pi3x_utils import load_pi3x
+from mast3r_fusion.frontend_model.pi3x_utils import load_pi3x
 
 
 def parse_args():

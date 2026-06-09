@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Optional
 import lietorch
 import torch
-from mast3r_fusion.mast3r_utils import resize_img
+from mast3r_fusion.mast3r_utils import _crop_resize, resize_img
 from mast3r_fusion.config import config
 
 
@@ -115,7 +115,11 @@ class Frame:
 
 
 def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
-    img = resize_img(img, img_size)
+    target_img_size = config.get("dataset", {}).get("target_img_size")
+    if target_img_size is not None:
+        img = _crop_resize(img, target_img_size)
+    else:
+        img = resize_img(img, img_size)
     rgb = img["img"].to(device=device)
     img_shape = torch.tensor(img["true_shape"], device=device)
     img_true_shape = img_shape.clone()

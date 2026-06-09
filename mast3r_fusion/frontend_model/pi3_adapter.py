@@ -6,7 +6,7 @@ from mast3r_fusion.frontend_model.base import (
     PairMatchResult,
     WindowInferenceResult,
 )
-from mast3r_fusion.pi3x_utils import (
+from mast3r_fusion.frontend_model.pi3x_utils import (
     encode_frame_image,
     load_pi3x,
     pi3x_decode_symmetric_batch,

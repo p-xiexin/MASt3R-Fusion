@@ -180,7 +180,10 @@ if __name__ == "__main__":
             intrinsics["calibration"],
             False, intrinsics.get("model","pinhole"), intrinsics.get("scale",1), intrinsics.get("height_new",None)
         )
-    if not (intrinsics.get("height_new",None) is None):
+    if (
+        config.get("dataset", {}).get("target_img_size") is None
+        and not (intrinsics.get("height_new",None) is None)
+    ):
         h = intrinsics.get("height_new",None) * w // intrinsics["width"]
 
     model = load_frontend_model(
