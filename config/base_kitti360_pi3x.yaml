@@ -9,6 +9,9 @@ frontend_model:
   name: pi3x
   weights: checkpoints/pi3x/model.safetensors
 
+pi3x:
+  match_conf_threshold: 0.3
+
 matching:
   # Pi3X does not expose MASt3R descriptors; RGB fallback descriptors are weak.
   # Start without descriptor-neighborhood refinement for first server tests.
@@ -17,6 +20,9 @@ matching:
 tracking:
   # Pi3X confidence is sigmoid-normalized to [0, 1], unlike MASt3R desc_conf.
   Q_conf: 0.3
+  min_match_frac: 0.01
+  min_valid_opt: 128
+  damping: 1.0e-4
 
 local_opt:
   Q_conf: 0.3

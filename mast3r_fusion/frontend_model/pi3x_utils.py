@@ -250,6 +250,10 @@ def _downsample(X, C, D, Q):
     return X, C, D, Q
 
 
+def _match_conf_threshold():
+    return config.get("pi3x", {}).get("match_conf_threshold", 0.0)
+
+
 def pi3x_decoder(*args, **kwargs):
     # PI3X does not expose MASt3R's private _decoder/_downstream_head API.
     # Pair inference must go through pi3x_inference_pair instead.
@@ -304,11 +308,12 @@ def pi3x_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, 
     pose_i = torch.stack(pose_i, dim=0)
     pose_j = torch.stack(pose_j, dim=0)
 
+    conf_threshold = _match_conf_threshold()
     idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
-        Xii, Xjj, pose_i, pose_j, Cii, Cjj, conf_threshold=0.0
+        Xii, Xjj, pose_i, pose_j, Cii, Cjj, conf_threshold=conf_threshold
     )
     idx_j2i, valid_match_i, pair_conf_j2i = pi3_matching.match(
-        Xjj, Xii, pose_j, pose_i, Cjj, Cii, conf_threshold=0.0
+        Xjj, Xii, pose_j, pose_i, Cjj, Cii, conf_threshold=conf_threshold
     )
 
     return (
@@ -364,7 +369,7 @@ def pi3x_match_asymmetric(
         pose_dst,
         Cii_match,
         Cjj_match,
-        conf_threshold=0.0,
+        conf_threshold=_match_conf_threshold(),
     )
     Xii, Xji = X[:1], X[1:]
     Cii, Cji = C[:1], C[1:]
