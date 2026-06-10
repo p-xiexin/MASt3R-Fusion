@@ -8,6 +8,7 @@ from PIL import Image
 
 import mast3r_fusion.frontend_model.pi3_matching as pi3_matching
 from mast3r_fusion.frontend_model.pi3x_utils import load_pi3x
+from mast3r_fusion.mast3r_utils import _crop_resize
 
 
 def parse_args():
@@ -28,8 +29,22 @@ def parse_args():
     parser.add_argument(
         "--size",
         type=int,
-        default=224,
-        help="Square resize size. Must be divisible by PI3X patch size 14.",
+        default=None,
+        help=(
+            "Legacy square resize size. Prefer --target-size H W for the same "
+            "crop/resize pipeline used by MASt3R-Fusion."
+        ),
+    )
+    parser.add_argument(
+        "--target-size",
+        type=int,
+        nargs=2,
+        metavar=("H", "W"),
+        default=(224, 840),
+        help=(
+            "Target image size [H W]. Uses MASt3R-Fusion _crop_resize(), and "
+            "both dimensions must be divisible by PI3X patch size 14."
+        ),
     )
     parser.add_argument("--conf-threshold", type=float, default=0.2)
     parser.add_argument("--min-depth", type=float, default=1e-6)
@@ -48,9 +63,10 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_rgb(path: str, size: int, device: torch.device) -> torch.Tensor:
-    image = Image.open(path).convert("RGB").resize((size, size), Image.BICUBIC)
-    array = np.asarray(image).astype(np.float32) / 255.0
+def load_rgb(path: str, target_size, device: torch.device) -> torch.Tensor:
+    image = np.asarray(Image.open(path).convert("RGB"))
+    processed = _crop_resize(image, target_size)
+    array = processed["unnormalized_img"].astype(np.float32) / 255.0
     tensor = torch.from_numpy(array).permute(2, 0, 1).to(device)
     return tensor.contiguous()
 
@@ -228,8 +244,9 @@ def print_stats(name: str, idx: torch.Tensor, valid: torch.Tensor, h: int, w: in
 @torch.inference_mode()
 def main():
     args = parse_args()
-    if args.size % 14 != 0:
-        raise ValueError("--size must be divisible by 14 for PI3X.")
+    target_size = (args.size, args.size) if args.size is not None else tuple(args.target_size)
+    if target_size[0] % 14 != 0 or target_size[1] % 14 != 0:
+        raise ValueError("--target-size/--size dimensions must be divisible by 14 for PI3X.")
     if args.downsample < 1:
         raise ValueError("--downsample must be >= 1.")
 
@@ -237,8 +254,9 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    image_a = load_rgb(args.image_a, args.size, device)
-    image_b = load_rgb(args.image_b, args.size, device)
+    image_a = load_rgb(args.image_a, target_size, device)
+    image_b = load_rgb(args.image_b, target_size, device)
+    print(f"target_size={target_size}")
 
     model = load_pi3x(args.weights, device=str(device))
     images = torch.stack((image_a, image_b), dim=0).unsqueeze(0)

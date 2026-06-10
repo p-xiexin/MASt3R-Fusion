@@ -10,6 +10,6 @@ python tools/verify_pi3x_reprojection_match.py \
   --image-b "$IMAGE_B" \
   --weights checkpoints/pi3x/model.safetensors \
   --device cuda:0 \
-  --size 224 \
+  --target-size 224 840 \
   --output-dir pi3x_reprojection_verify \
   "$@"
