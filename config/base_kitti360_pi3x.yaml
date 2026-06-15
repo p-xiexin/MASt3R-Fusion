@@ -17,7 +17,6 @@ pi3x:
   use_intrinsics_prior: false
   imu_predict: false
   pose_prior_max_dt: 5.0
-  pose_prior_rotation_only: true
 
 matching:
   # Pi3X does not expose MASt3R descriptors; RGB fallback descriptors are weak.

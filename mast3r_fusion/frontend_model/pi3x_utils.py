@@ -133,7 +133,7 @@ def encode_frame_pi3x(model, frame):
     return frame.feat, frame.pos
 
 
-def _sim3_to_c2w_matrix(T_WC, device, dtype, rotation_only=False):
+def _sim3_to_c2w_matrix(T_WC, device, dtype):
     if T_WC is None:
         return None
     matrix = T_WC.matrix()
@@ -145,8 +145,6 @@ def _sim3_to_c2w_matrix(T_WC, device, dtype, rotation_only=False):
         scale = data.reshape(-1, data.shape[-1])[0, -1].to(device=device, dtype=dtype)
         if torch.isfinite(scale).item() and torch.abs(scale).item() > 1e-8:
             matrix[:3, :3] = matrix[:3, :3] / scale
-    if rotation_only:
-        matrix[:3, 3] = 0
     matrix[3] = matrix.new_tensor([0, 0, 0, 1])
     return matrix
 
@@ -176,14 +174,12 @@ def _stack_frame_poses(frames, images):
         return None
     if frames is None:
         raise ValueError("PI3X pose prior requires pair frames.")
-    rotation_only = config.get("pi3x", {}).get("pose_prior_rotation_only", True)
     poses = []
     for frame in frames:
         pose = _sim3_to_c2w_matrix(
             getattr(frame, "T_WC", None),
             images.device,
             images.dtype,
-            rotation_only=rotation_only,
         )
         if pose is None:
             raise ValueError("PI3X pose prior requires frame.T_WC for all pair frames.")
@@ -267,20 +263,20 @@ def _call_pi3x_from_cached_encoder(model, images, cached_feat, frames=None):
         b, n, -1, cached_feat.shape[-1]
     )
     poses = None
-    use_pose_mask = None
+    use_pose_mask = torch.zeros((b, n), device=images.device, dtype=torch.bool)
     if _prior_enabled() and getattr(model, "use_multimodal", False):
         with _disabled_autocast(images.device):
-            ray_emb, mask_add_ray, poses, use_pose_mask = _cached_multimodal_priors(
+            ray_emb, mask_add_ray, poses, prior_pose_mask = _cached_multimodal_priors(
                 model,
                 images,
                 frames,
             )
+        if prior_pose_mask is not None:
+            use_pose_mask = prior_pose_mask
         if ray_emb is not None:
             hidden = hidden.reshape(b * n, -1, hidden.shape[-1])
             hidden = hidden + ray_emb.to(hidden.dtype) * mask_add_ray.reshape(b * n, 1, 1)
             hidden = hidden.reshape(b, n, -1, hidden.shape[-1])
-    elif getattr(model, "use_multimodal", False):
-        use_pose_mask = torch.zeros((b, n), device=images.device, dtype=torch.bool)
 
     decoded, pos = model.decode(hidden, n, h, w, poses=poses, use_pose_mask=use_pose_mask)
     return model.forward_head(decoded, pos, b, n, h, w, patch_h, patch_w)
