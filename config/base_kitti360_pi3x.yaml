@@ -16,9 +16,9 @@ pi3x:
   # with rotation only and with full translation/scale.
   use_intrinsics_prior: false
   use_pose_prior: false
-  # frame_pose uses the current MASt3R-Fusion pose estimate. imu_prediction
-  # uses FactorGraph.predict_pose() before PI3X inference when MS/IMU is active.
-  pose_prior_source: frame_pose
+  # When enabled, update the pose prior with FactorGraph.predict_pose() before
+  # PI3X inference. Otherwise PI3X uses the frame's initialized T_WC.
+  imu_predict: false
   pose_prior_max_dt: 5.0
   pose_prior_rotation_only: true
 

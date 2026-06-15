@@ -308,7 +308,7 @@ if __name__ == "__main__":
         use_imu_pose_prior = (
             getattr(model, "name", "mast3r") == "pi3x"
             and pi3x_cfg.get("use_pose_prior", False)
-            and pi3x_cfg.get("pose_prior_source", "frame_pose") == "imu_prediction"
+            and pi3x_cfg.get("imu_predict", False)
             and factor_graph.enable_ms
             and i > 100
         )
