@@ -15,7 +15,7 @@ DEFAULT_PI3X_WEIGHTS = "checkpoints/pi3x/model.safetensors"
 
 def _prior_enabled():
     cfg = config.get("pi3x", {})
-    return bool(cfg.get("use_intrinsics_prior", False) or cfg.get("use_pose_prior", False))
+    return bool(cfg.get("use_intrinsics_prior", False) or cfg.get("imu_predict", False))
 
 
 def _patch_pi3x_rope_contiguous(model):
@@ -203,7 +203,7 @@ def _stack_frame_intrinsics(frames, images):
     pi3x_cfg = config.get("pi3x", {})
     if not (
         pi3x_cfg.get("use_intrinsics_prior", False)
-        or pi3x_cfg.get("use_pose_prior", False)
+        or pi3x_cfg.get("imu_predict", False)
     ):
         return None
     if frames is None:
@@ -220,7 +220,7 @@ def _stack_frame_intrinsics(frames, images):
 
 
 def _stack_frame_poses(frames, images):
-    if not config.get("pi3x", {}).get("use_pose_prior", False):
+    if not config.get("pi3x", {}).get("imu_predict", False):
         return None
     if frames is None:
         raise ValueError("PI3X pose prior requires pair frames.")

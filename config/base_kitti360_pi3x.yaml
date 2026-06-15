@@ -12,12 +12,9 @@ frontend_model:
 pi3x:
   match_conf_threshold: 0.3
   # Optional Pi3X multimodal conditioning. Keep these as experiment switches:
-  # intrinsics is usually the safest prior; pose prior should be tested both
-  # with rotation only and with full translation/scale.
+  # intrinsics is usually the safest prior. imu_predict enables IMU-predicted
+  # pose prior and should be tested both with rotation only and full translation.
   use_intrinsics_prior: false
-  use_pose_prior: false
-  # When enabled, update the pose prior with FactorGraph.predict_pose() before
-  # PI3X inference. Otherwise PI3X uses the frame's initialized T_WC.
   imu_predict: false
   pose_prior_max_dt: 5.0
   pose_prior_rotation_only: true
