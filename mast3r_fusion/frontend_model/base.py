@@ -125,7 +125,7 @@ class FeedForwardFrontend:
         raise NotImplementedError
 
     def match_symmetric_batch(
-        self, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, subpixel_factor=1
+        self, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, subpixel_factor=1, **kwargs
     ):
         """Infer batched symmetric matches for factor graph construction.
 

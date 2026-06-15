@@ -11,6 +11,16 @@ frontend_model:
 
 pi3x:
   match_conf_threshold: 0.3
+  # Optional Pi3X multimodal conditioning. Keep these as experiment switches:
+  # intrinsics is usually the safest prior; pose prior should be tested both
+  # with rotation only and with full translation/scale.
+  use_intrinsics_prior: false
+  use_pose_prior: false
+  # frame_pose uses the current MASt3R-Fusion pose estimate. imu_prediction
+  # uses FactorGraph.predict_pose() before PI3X inference when MS/IMU is active.
+  pose_prior_source: frame_pose
+  pose_prior_max_dt: 5.0
+  pose_prior_rotation_only: true
 
 matching:
   # Pi3X does not expose MASt3R descriptors; RGB fallback descriptors are weak.

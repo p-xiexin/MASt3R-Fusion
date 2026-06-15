@@ -38,6 +38,20 @@ def find_valid_numbers(a, b):
     return result
 
 
+def matrix_to_sim3(T, device='cpu'):
+    TSim3 = lietorch.Sim3.Identity(1, device=device)
+    q = Rotation.from_matrix(T[0:3, 0:3]).as_quat()
+    TSim3[0].data[0] = T[0, 3]
+    TSim3[0].data[1] = T[1, 3]
+    TSim3[0].data[2] = T[2, 3]
+    TSim3[0].data[3] = q[0]
+    TSim3[0].data[4] = q[1]
+    TSim3[0].data[5] = q[2]
+    TSim3[0].data[6] = q[3]
+    TSim3[0].data[7] = 1.0
+    return TSim3
+
+
 def run_backend(states, keyframes):
     mode = states.get_mode()
     if mode == Mode.INIT or states.is_paused():
@@ -290,7 +304,21 @@ if __name__ == "__main__":
             if i == 0
             else states.get_frame().T_WC
         )
+        pi3x_cfg = config.get("pi3x", {})
+        use_imu_pose_prior = (
+            getattr(model, "name", "mast3r") == "pi3x"
+            and pi3x_cfg.get("use_pose_prior", False)
+            and pi3x_cfg.get("pose_prior_source", "frame_pose") == "imu_prediction"
+            and factor_graph.enable_ms
+            and i > 100
+        )
+        if use_imu_pose_prior:
+            dT, wTc_pred, pred_dt = factor_graph.predict_pose(i)
+            if pred_dt <= pi3x_cfg.get("pose_prior_max_dt", 5.0):
+                T_WC = matrix_to_sim3(wTc_pred)
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+        if use_calib:
+            frame.K = K
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database

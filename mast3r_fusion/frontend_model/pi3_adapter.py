@@ -7,7 +7,7 @@ from mast3r_fusion.frontend_model.base import (
     WindowInferenceResult,
 )
 from mast3r_fusion.frontend_model.pi3x_utils import (
-    encode_frame_image,
+    encode_frame_pi3x,
     load_pi3x,
     pi3x_decode_symmetric_batch,
     pi3x_inference_mono,
@@ -33,13 +33,10 @@ class PI3Adapter(FeedForwardFrontend):
         return cls(model=model, weights_path=path, device=device)
 
     def get_feature_spec(self) -> FeatureSpec:
-        # Store RGB pixels as the per-frame feature so batch loop matching can
-        # reconstruct pair images even though PI3X does not expose reusable
-        # MASt3R-style encoded tokens.
-        return FeatureSpec(feat_dim=3, patch_size=1)
+        return FeatureSpec(feat_dim=1024, patch_size=14)
 
     def encode_frame(self, frame):
-        return encode_frame_image(frame)
+        return encode_frame_pi3x(self.model, frame)
 
     def infer_single(self, frame):
         return pi3x_inference_mono(self.model, frame)
@@ -57,6 +54,8 @@ class PI3Adapter(FeedForwardFrontend):
                 [frame_i.img_true_shape],
                 [frame_j.img_true_shape],
                 kwargs.get("subpixel_factor", 1),
+                frames_i=[frame_i],
+                frames_j=[frame_j],
             )
             return PairMatchResult(*result)
 
@@ -100,7 +99,7 @@ class PI3Adapter(FeedForwardFrontend):
         )
 
     def match_symmetric_batch(
-        self, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, subpixel_factor=1
+        self, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, subpixel_factor=1, **kwargs
     ):
         return pi3x_match_symmetric(
             self.model,
@@ -111,9 +110,19 @@ class PI3Adapter(FeedForwardFrontend):
             shape_i,
             shape_j,
             subpixel_factor,
+            frames_i=kwargs.get("frames_i"),
+            frames_j=kwargs.get("frames_j"),
         )
 
-    def decode_symmetric_batch(self, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j):
+    def decode_symmetric_batch(self, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, **kwargs):
         return pi3x_decode_symmetric_batch(
-            self.model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j
+            self.model,
+            feat_i,
+            pos_i,
+            feat_j,
+            pos_j,
+            shape_i,
+            shape_j,
+            frames_i=kwargs.get("frames_i"),
+            frames_j=kwargs.get("frames_j"),
         )

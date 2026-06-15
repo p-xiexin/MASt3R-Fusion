@@ -1,5 +1,6 @@
 from pathlib import Path
 import types
+import contextlib
 
 import einops
 import torch
@@ -10,6 +11,11 @@ from mast3r_fusion.config import config
 
 
 DEFAULT_PI3X_WEIGHTS = "checkpoints/pi3x/model.safetensors"
+
+
+def _prior_enabled():
+    cfg = config.get("pi3x", {})
+    return bool(cfg.get("use_intrinsics_prior", False) or cfg.get("use_pose_prior", False))
 
 
 def _patch_pi3x_rope_contiguous(model):
@@ -49,7 +55,7 @@ def load_pi3x(path=None, device="cuda"):
         not weights_path_obj.exists() or weights_path_obj.is_dir()
     ):
         model = Pi3X.from_pretrained(weights_path).eval()
-        if hasattr(model, "disable_multimodal"):
+        if not _prior_enabled() and hasattr(model, "disable_multimodal"):
             model.disable_multimodal()
         model = _patch_pi3x_rope_contiguous(model)
         return model.to(device)
@@ -64,7 +70,7 @@ def load_pi3x(path=None, device="cuda"):
     state_dict = state.get("state_dict", state) if isinstance(state, dict) else state
     model.load_state_dict(state_dict, strict=False)
     model.eval()
-    if hasattr(model, "disable_multimodal"):
+    if not _prior_enabled() and hasattr(model, "disable_multimodal"):
         model.disable_multimodal()
     model = _patch_pi3x_rope_contiguous(model)
     return model.to(device)
@@ -73,6 +79,17 @@ def load_pi3x(path=None, device="cuda"):
 def _frame_image(frame):
     image = frame.uimg.to(device=frame.img.device, dtype=frame.img.dtype)
     return image.permute(2, 0, 1).unsqueeze(0).contiguous()
+
+
+def _patch_positions(h, w, patch_size, device):
+    patch_h = h // patch_size
+    patch_w = w // patch_size
+    ys, xs = torch.meshgrid(
+        torch.arange(patch_h, device=device),
+        torch.arange(patch_w, device=device),
+        indexing="ij",
+    )
+    return torch.stack((xs, ys), dim=-1).view(1, patch_h * patch_w, 2).long()
 
 
 def encode_frame_image(frame):
@@ -90,9 +107,55 @@ def encode_frame_image(frame):
     return frame.feat, frame.pos
 
 
+@torch.inference_mode()
+def encode_frame_pi3x(model, frame):
+    image = _frame_image(frame)
+    h, w = image.shape[-2:]
+    patch_size = getattr(model, "patch_size", 14)
+    if h % patch_size != 0 or w % patch_size != 0:
+        raise ValueError(
+            f"PI3X encoder expects image height/width divisible by {patch_size}, "
+            f"got {(h, w)}. Set dataset.target_img_size to multiples of {patch_size}."
+        )
+
+    if not hasattr(model, "encoder"):
+        raise AttributeError("PI3X model does not expose an encoder for frame feature caching.")
+
+    image_mean = getattr(model, "image_mean", None)
+    image_std = getattr(model, "image_std", None)
+    if image_mean is not None and image_std is not None:
+        image_for_encoder = (image - image_mean.to(image.device, image.dtype)) / image_std.to(
+            image.device, image.dtype
+        )
+    else:
+        image_for_encoder = image
+
+    try:
+        encoded = model.encoder(image_for_encoder, is_training=True)
+    except TypeError:
+        encoded = model.encoder(image_for_encoder)
+    if isinstance(encoded, dict):
+        feat = encoded.get("x_norm_patchtokens")
+        if feat is None:
+            feat = encoded.get("patch_tokens")
+    else:
+        feat = encoded
+    if feat is None:
+        raise KeyError("PI3X encoder did not expose patch tokens.")
+
+    frame.feat = feat.contiguous()
+    frame.pos = _patch_positions(h, w, patch_size, feat.device)
+    return frame.feat, frame.pos
+
+
 def _features_to_images(feat, shapes, pos=None):
     images = []
     for b in range(feat.shape[0]):
+        if feat.shape[-1] != 3:
+            raise ValueError(
+                "Cannot reconstruct PI3X RGB images from encoder tokens. "
+                "Pass frames_i/frames_j so images can be read from frame.uimg."
+            )
         shape = shapes[b]
         if isinstance(shape, torch.Tensor):
             h, w = int(shape.reshape(-1)[0].item()), int(shape.reshape(-1)[1].item())
@@ -114,7 +177,164 @@ def _features_to_images(feat, shapes, pos=None):
     return torch.stack(images, dim=0).contiguous()
 
 
-def _call_pi3x(model, images):
+def _frames_to_images(frames):
+    return torch.cat([_frame_image(frame) for frame in frames], dim=0).contiguous()
+
+
+def _sim3_to_c2w_matrix(T_WC, device, dtype, rotation_only=False):
+    if T_WC is None:
+        return None
+    matrix = T_WC.matrix()
+    if matrix.ndim == 3:
+        matrix = matrix[0]
+    matrix = matrix.to(device=device, dtype=dtype).clone()
+    data = getattr(T_WC, "data", None)
+    if data is not None:
+        scale = data.reshape(-1, data.shape[-1])[0, -1].to(device=device, dtype=dtype)
+        if torch.isfinite(scale).item() and torch.abs(scale).item() > 1e-8:
+            matrix[:3, :3] = matrix[:3, :3] / scale
+    if rotation_only:
+        matrix[:3, 3] = 0
+    matrix[3] = matrix.new_tensor([0, 0, 0, 1])
+    return matrix
+
+
+def _stack_frame_intrinsics(frames, images):
+    pi3x_cfg = config.get("pi3x", {})
+    if not (
+        pi3x_cfg.get("use_intrinsics_prior", False)
+        or pi3x_cfg.get("use_pose_prior", False)
+    ):
+        return None
+    if frames is None:
+        raise ValueError("PI3X pose/intrinsics prior requires pair frames.")
+    Ks = []
+    for frame in frames:
+        K = getattr(frame, "K", None)
+        if K is None:
+            raise ValueError("PI3X pose/intrinsics prior requires frame.K for all pair frames.")
+        Ks.append(K.to(device=images.device, dtype=images.dtype))
+    if len(Ks) != images.shape[1]:
+        raise ValueError("PI3X prior frame count must match the image pair count.")
+    return torch.stack(Ks, dim=0).unsqueeze(0).contiguous()
+
+
+def _stack_frame_poses(frames, images):
+    if not config.get("pi3x", {}).get("use_pose_prior", False):
+        return None
+    if frames is None:
+        raise ValueError("PI3X pose prior requires pair frames.")
+    rotation_only = config.get("pi3x", {}).get("pose_prior_rotation_only", True)
+    poses = []
+    for frame in frames:
+        pose = _sim3_to_c2w_matrix(
+            getattr(frame, "T_WC", None),
+            images.device,
+            images.dtype,
+            rotation_only=rotation_only,
+        )
+        if pose is None:
+            raise ValueError("PI3X pose prior requires frame.T_WC for all pair frames.")
+        poses.append(pose)
+    if len(poses) != images.shape[1]:
+        raise ValueError("PI3X prior frame count must match the image pair count.")
+    return torch.stack(poses, dim=0).unsqueeze(0).contiguous()
+
+
+def _pixel_grid_homogeneous(h, w, device, dtype):
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=device, dtype=dtype),
+        torch.arange(w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    return torch.stack((xs, ys, torch.ones_like(xs)), dim=-1)
+
+
+def _require_cached_encoder_output(model, cached_feat):
+    if cached_feat is None:
+        raise ValueError("PI3X matching requires cached encoder tokens from encode_frame_pi3x().")
+    missing = [
+        name for name in ("decode", "forward_head") if not hasattr(model, name)
+    ]
+    if missing:
+        raise AttributeError(
+            "PI3X cached matching requires model methods: " + ", ".join(missing)
+        )
+
+
+def _cached_multimodal_priors(model, images, frames):
+    b, n, _, h, w = images.shape
+    device = images.device
+    dtype = images.dtype
+    poses = _stack_frame_poses(frames, images)
+    intrinsics = _stack_frame_intrinsics(frames, images)
+    use_ray = config.get("pi3x", {}).get("use_intrinsics_prior", False) or poses is not None
+    mask_add_ray = None
+    mask_add_pose = None
+    ray_emb = None
+    poses_relative = None
+
+    if use_ray:
+        if intrinsics is None:
+            raise ValueError("PI3X pose/intrinsics prior requires frame.K for all pair frames.")
+        pixel_grid = _pixel_grid_homogeneous(h, w, device, dtype)
+        rays = torch.einsum(
+            "bnij,hwj->bnhwi",
+            torch.linalg.inv(intrinsics),
+            pixel_grid,
+        )[..., :2]
+        ray_emb = model.ray_embed(rays.reshape(b * n, h, w, 2).permute(0, 3, 1, 2))
+        mask_add_ray = torch.ones((b, n), device=device, dtype=torch.bool)
+
+    if poses is not None:
+        poses_relative = torch.linalg.inv(poses[:, :1]) @ poses
+        pose_scale = poses_relative[..., 1:, :3, 3].norm(dim=-1)
+        static_threshold = 2e-2
+        is_static = pose_scale.max(dim=1)[0] < static_threshold
+        mean_scale = pose_scale.mean(dim=1)
+        moving = ~is_static
+        poses_relative[moving, ..., :3, 3] /= mean_scale.view(b, 1, 1)[moving] + 1e-8
+        mask_add_pose = torch.ones((b, n), device=device, dtype=torch.bool)
+        bad_pose = mask_add_pose.sum(dim=1) == 1
+        mask_add_pose[bad_pose] = False
+
+    return ray_emb, mask_add_ray, poses_relative, mask_add_pose
+
+
+def _disabled_autocast(device):
+    if device.type == "cuda":
+        return torch.amp.autocast(device_type="cuda", enabled=False)
+    return contextlib.nullcontext()
+
+
+def _call_pi3x_from_cached_encoder(model, images, cached_feat, frames=None):
+    b, n, _, h, w = images.shape
+    patch_size = getattr(model, "patch_size", 14)
+    patch_h, patch_w = h // patch_size, w // patch_size
+    hidden = cached_feat.to(device=images.device, dtype=images.dtype).reshape(
+        b, n, -1, cached_feat.shape[-1]
+    )
+    poses = None
+    use_pose_mask = None
+    if _prior_enabled() and getattr(model, "use_multimodal", False):
+        with _disabled_autocast(images.device):
+            ray_emb, mask_add_ray, poses, use_pose_mask = _cached_multimodal_priors(
+                model,
+                images,
+                frames,
+            )
+        if ray_emb is not None:
+            hidden = hidden.reshape(b * n, -1, hidden.shape[-1])
+            hidden = hidden + ray_emb.to(hidden.dtype) * mask_add_ray.reshape(b * n, 1, 1)
+            hidden = hidden.reshape(b, n, -1, hidden.shape[-1])
+    elif getattr(model, "use_multimodal", False):
+        use_pose_mask = torch.zeros((b, n), device=images.device, dtype=torch.bool)
+
+    decoded, pos = model.decode(hidden, n, h, w, poses=poses, use_pose_mask=use_pose_mask)
+    return model.forward_head(decoded, pos, b, n, h, w, patch_h, patch_w)
+
+
+def _call_pi3x(model, images, frames=None, cached_feat=None):
     h, w = images.shape[-2:]
     patch_size = getattr(model, "patch_size", 14)
     if h % patch_size != 0 or w % patch_size != 0:
@@ -122,10 +342,8 @@ def _call_pi3x(model, images):
             f"PI3X expects image height/width divisible by {patch_size}, "
             f"got {(h, w)}. Set dataset.target_img_size to multiples of {patch_size}."
         )
-    try:
-        output = model(imgs=images)
-    except TypeError:
-        output = model(images)
+    _require_cached_encoder_output(model, cached_feat)
+    output = _call_pi3x_from_cached_encoder(model, images, cached_feat, frames=frames)
     if not isinstance(output, dict):
         raise TypeError("PI3X inference must return a dict-like output.")
     return output
@@ -223,10 +441,16 @@ def _pair_output_to_maps(output, images):
 
 @torch.inference_mode()
 def pi3x_inference_pair(model, frame_i, frame_j):
-    encode_frame_image(frame_i)
-    encode_frame_image(frame_j)
+    encode_frame_pi3x(model, frame_i)
+    encode_frame_pi3x(model, frame_j)
     images = torch.cat((_frame_image(frame_i), _frame_image(frame_j)), dim=0)
-    output = _call_pi3x(model, images.unsqueeze(0))
+    cached_feat = torch.stack((frame_i.feat[0], frame_j.feat[0]), dim=0).unsqueeze(0)
+    output = _call_pi3x(
+        model,
+        images.unsqueeze(0),
+        frames=[frame_i, frame_j],
+        cached_feat=cached_feat,
+    )
     Xii, Xji, _, _, Cii, Cji, Dii, Dji, _, _ = _pair_output_to_maps(output, images.unsqueeze(0))
     X, C, D, Q = torch.stack((Xii, Xji)), torch.stack((Cii, Cji)), torch.stack((Dii, Dji)), torch.stack((Cii, Cji))
     return _downsample(X, C, D, Q)
@@ -308,13 +532,23 @@ def pi3x_decoder(*args, **kwargs):
     raise NotImplementedError("PI3X does not provide a MASt3R-compatible decoder.")
 
 
-def pi3x_decode_symmetric_batch(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j):
+def pi3x_decode_symmetric_batch(
+    model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, frames_i=None, frames_j=None
+):
     X, C, D, Q = [], [], [], []
-    images_i = _features_to_images(feat_i, shape_i, pos_i)
-    images_j = _features_to_images(feat_j, shape_j, pos_j)
+    if frames_i is not None and frames_j is not None:
+        images_i = _frames_to_images(frames_i)
+        images_j = _frames_to_images(frames_j)
+    else:
+        images_i = _features_to_images(feat_i, shape_i, pos_i)
+        images_j = _features_to_images(feat_j, shape_j, pos_j)
     for b in range(feat_i.shape[0]):
         images = torch.stack((images_i[b], images_j[b]), dim=0).unsqueeze(0)
-        output = _call_pi3x(model, images)
+        cached_feat = torch.stack((feat_i[b], feat_j[b]), dim=0).unsqueeze(0)
+        frames = None
+        if frames_i is not None and frames_j is not None:
+            frames = [frames_i[b], frames_j[b]]
+        output = _call_pi3x(model, images, frames=frames, cached_feat=cached_feat)
         Xii, Xji, Xjj, Xij, Cii, Cjj, Dii, Djj, _, _ = _pair_output_to_maps(output, images)
         X.append(torch.stack((Xii, Xji, Xjj, Xij)))
         C.append(torch.stack((Cii, Cjj, Cjj, Cii)))
@@ -328,14 +562,33 @@ def pi3x_decode_symmetric_batch(model, feat_i, pos_i, feat_j, pos_j, shape_i, sh
     return _downsample(X, C, D, Q)
 
 
-def pi3x_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, subpixel_factor=1):
+def pi3x_match_symmetric(
+    model,
+    feat_i,
+    pos_i,
+    feat_j,
+    pos_j,
+    shape_i,
+    shape_j,
+    subpixel_factor=1,
+    frames_i=None,
+    frames_j=None,
+):
     X, C, Q = [], [], []
     pose_i, pose_j = [], []
-    images_i = _features_to_images(feat_i, shape_i, pos_i)
-    images_j = _features_to_images(feat_j, shape_j, pos_j)
+    if frames_i is not None and frames_j is not None:
+        images_i = _frames_to_images(frames_i)
+        images_j = _frames_to_images(frames_j)
+    else:
+        images_i = _features_to_images(feat_i, shape_i, pos_i)
+        images_j = _features_to_images(feat_j, shape_j, pos_j)
     for batch_idx in range(feat_i.shape[0]):
         images = torch.stack((images_i[batch_idx], images_j[batch_idx]), dim=0).unsqueeze(0)
-        output = _call_pi3x(model, images)
+        cached_feat = torch.stack((feat_i[batch_idx], feat_j[batch_idx]), dim=0).unsqueeze(0)
+        frames = None
+        if frames_i is not None and frames_j is not None:
+            frames = [frames_i[batch_idx], frames_j[batch_idx]]
+        output = _call_pi3x(model, images, frames=frames, cached_feat=cached_feat)
         Xii, Xji, Xjj, Xij, Cii, Cjj, _, _, T_w_ci, T_w_cj = _pair_output_to_maps(output, images)
         if T_w_ci is None or T_w_cj is None:
             raise KeyError("PI3X geometry matching requires camera poses.")
@@ -379,10 +632,16 @@ def pi3x_match_symmetric(model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, 
 def pi3x_match_asymmetric(
     model, frame_i, frame_j, idx_i2j_init=None, init_relative_pose=None
 ):
-    encode_frame_image(frame_i)
-    encode_frame_image(frame_j)
+    encode_frame_pi3x(model, frame_i)
+    encode_frame_pi3x(model, frame_j)
     images = torch.cat((_frame_image(frame_i), _frame_image(frame_j)), dim=0)
-    output = _call_pi3x(model, images.unsqueeze(0))
+    cached_feat = torch.stack((frame_i.feat[0], frame_j.feat[0]), dim=0).unsqueeze(0)
+    output = _call_pi3x(
+        model,
+        images.unsqueeze(0),
+        frames=[frame_i, frame_j],
+        cached_feat=cached_feat,
+    )
     Xii, Xji, Xjj, _, Cii, Cji, _, _, T_w_ci, T_w_cj = _pair_output_to_maps(
         output, images.unsqueeze(0)
     )

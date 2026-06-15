@@ -88,7 +88,7 @@ class MASt3RAdapter(FeedForwardFrontend):
         )
 
     def match_symmetric_batch(
-        self, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, subpixel_factor=1
+        self, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, subpixel_factor=1, **kwargs
     ):
         return mast3r_match_symmetric(
             self.model,

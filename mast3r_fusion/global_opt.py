@@ -354,7 +354,15 @@ class FactorGraph:
             Qji,
             Qij,
         ) = self.model.match_symmetric_batch(
-            feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, self.subpixel_factor
+            feat_i,
+            pos_i,
+            feat_j,
+            pos_j,
+            shape_i,
+            shape_j,
+            self.subpixel_factor,
+            frames_i=kf_ii,
+            frames_j=kf_jj,
         )
         # print('3',time.time())
 
