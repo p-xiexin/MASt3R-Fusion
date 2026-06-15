@@ -92,21 +92,6 @@ def _patch_positions(h, w, patch_size, device):
     return torch.stack((xs, ys), dim=-1).view(1, patch_h * patch_w, 2).long()
 
 
-def encode_frame_image(frame):
-    image = _frame_image(frame)
-    h, w = image.shape[-2:]
-    feat = image.permute(0, 2, 3, 1).reshape(1, h * w, 3).contiguous()
-    ys, xs = torch.meshgrid(
-        torch.arange(h, device=image.device),
-        torch.arange(w, device=image.device),
-        indexing="ij",
-    )
-    pos = torch.stack((xs, ys), dim=-1).view(1, h * w, 2).long()
-    frame.feat = feat
-    frame.pos = pos
-    return frame.feat, frame.pos
-
-
 @torch.inference_mode()
 def encode_frame_pi3x(model, frame):
     image = _frame_image(frame)
@@ -146,39 +131,6 @@ def encode_frame_pi3x(model, frame):
     frame.feat = feat.contiguous()
     frame.pos = _patch_positions(h, w, patch_size, feat.device)
     return frame.feat, frame.pos
-
-
-def _features_to_images(feat, shapes, pos=None):
-    images = []
-    for b in range(feat.shape[0]):
-        if feat.shape[-1] != 3:
-            raise ValueError(
-                "Cannot reconstruct PI3X RGB images from encoder tokens. "
-                "Pass frames_i/frames_j so images can be read from frame.uimg."
-            )
-        shape = shapes[b]
-        if isinstance(shape, torch.Tensor):
-            h, w = int(shape.reshape(-1)[0].item()), int(shape.reshape(-1)[1].item())
-        else:
-            h, w = int(shape[0]), int(shape[1])
-        if h * w != feat.shape[1] and pos is not None:
-            w = int(pos[b, :, 0].max().item()) + 1
-            h = int(pos[b, :, 1].max().item()) + 1
-        if h * w != feat.shape[1]:
-            side = int(feat.shape[1] ** 0.5)
-            if side * side == feat.shape[1]:
-                h, w = side, side
-            else:
-                raise ValueError(
-                    f"Cannot reshape PI3X image features of length {feat.shape[1]} "
-                    f"to requested shape {(h, w)}."
-                )
-        images.append(feat[b].reshape(h, w, 3).permute(2, 0, 1))
-    return torch.stack(images, dim=0).contiguous()
-
-
-def _frames_to_images(frames):
-    return torch.cat([_frame_image(frame) for frame in frames], dim=0).contiguous()
 
 
 def _sim3_to_c2w_matrix(T_WC, device, dtype, rotation_only=False):
@@ -374,21 +326,6 @@ def _homogeneous_transform(points, transform):
     return transformed.reshape(h, w, 3)
 
 
-def _pose_to_matrix(pose, device, dtype):
-    if pose is None:
-        return None
-    if hasattr(pose, "matrix"):
-        matrix = pose.matrix()
-    else:
-        matrix = torch.as_tensor(pose)
-    matrix = matrix.to(device=device, dtype=dtype)
-    if matrix.ndim == 3:
-        matrix = matrix[0]
-    if matrix.shape != (4, 4):
-        raise ValueError(f"Expected relative pose matrix shape (4,4), got {tuple(matrix.shape)}.")
-    return matrix
-
-
 def _pair_output_to_maps(output, images):
     local_points = _pick_output(output, ("local_points", "points_local", "pts3d"))
     confidences = _pick_output(output, ("conf", "confidence", "confidences"))
@@ -526,28 +463,18 @@ def _print_match_debug(name, frame_i, frame_j, valid, pair_conf, conf_src, conf_
         )
 
 
-def pi3x_decoder(*args, **kwargs):
-    # PI3X does not expose MASt3R's private _decoder/_downstream_head API.
-    # Pair inference must go through pi3x_inference_pair instead.
-    raise NotImplementedError("PI3X does not provide a MASt3R-compatible decoder.")
-
-
 def pi3x_decode_symmetric_batch(
     model, feat_i, pos_i, feat_j, pos_j, shape_i, shape_j, frames_i=None, frames_j=None
 ):
     X, C, D, Q = [], [], [], []
-    if frames_i is not None and frames_j is not None:
-        images_i = _frames_to_images(frames_i)
-        images_j = _frames_to_images(frames_j)
-    else:
-        images_i = _features_to_images(feat_i, shape_i, pos_i)
-        images_j = _features_to_images(feat_j, shape_j, pos_j)
+    if frames_i is None or frames_j is None:
+        raise ValueError("PI3X symmetric decode requires frames_i/frames_j for RGB images.")
     for b in range(feat_i.shape[0]):
-        images = torch.stack((images_i[b], images_j[b]), dim=0).unsqueeze(0)
+        frames = [frames_i[b], frames_j[b]]
+        images = torch.cat(
+            (_frame_image(frames[0]), _frame_image(frames[1])), dim=0
+        ).unsqueeze(0)
         cached_feat = torch.stack((feat_i[b], feat_j[b]), dim=0).unsqueeze(0)
-        frames = None
-        if frames_i is not None and frames_j is not None:
-            frames = [frames_i[b], frames_j[b]]
         output = _call_pi3x(model, images, frames=frames, cached_feat=cached_feat)
         Xii, Xji, Xjj, Xij, Cii, Cjj, Dii, Djj, _, _ = _pair_output_to_maps(output, images)
         X.append(torch.stack((Xii, Xji, Xjj, Xij)))
@@ -576,18 +503,14 @@ def pi3x_match_symmetric(
 ):
     X, C, Q = [], [], []
     pose_i, pose_j = [], []
-    if frames_i is not None and frames_j is not None:
-        images_i = _frames_to_images(frames_i)
-        images_j = _frames_to_images(frames_j)
-    else:
-        images_i = _features_to_images(feat_i, shape_i, pos_i)
-        images_j = _features_to_images(feat_j, shape_j, pos_j)
+    if frames_i is None or frames_j is None:
+        raise ValueError("PI3X symmetric matching requires frames_i/frames_j for RGB images.")
     for batch_idx in range(feat_i.shape[0]):
-        images = torch.stack((images_i[batch_idx], images_j[batch_idx]), dim=0).unsqueeze(0)
+        frames = [frames_i[batch_idx], frames_j[batch_idx]]
+        images = torch.cat(
+            (_frame_image(frames[0]), _frame_image(frames[1])), dim=0
+        ).unsqueeze(0)
         cached_feat = torch.stack((feat_i[batch_idx], feat_j[batch_idx]), dim=0).unsqueeze(0)
-        frames = None
-        if frames_i is not None and frames_j is not None:
-            frames = [frames_i[batch_idx], frames_j[batch_idx]]
         output = _call_pi3x(model, images, frames=frames, cached_feat=cached_feat)
         Xii, Xji, Xjj, Xij, Cii, Cjj, _, _, T_w_ci, T_w_cj = _pair_output_to_maps(output, images)
         if T_w_ci is None or T_w_cj is None:
