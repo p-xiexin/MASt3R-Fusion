@@ -114,9 +114,6 @@ def project_to_index(
     conf_dst: torch.Tensor,
     conf_threshold: float = 0.0,
     min_depth: float = 1e-6,
-    balance_grid_size: int = 0,
-    max_matches_per_cell: int = 0,
-    unique_target: bool = False,
     return_debug: bool = False,
 ):
     """Project source-grid points in destination coordinates to destination indices."""
@@ -151,7 +148,6 @@ def project_to_index(
     positive_depth = z > min_depth
     valid_conf_src = conf_src > conf_threshold
     valid_conf_dst = conf_projected_dst > conf_threshold
-    pair_conf = torch.sqrt(conf_src * conf_projected_dst)
     valid = (
         finite_points
         & finite_projection
@@ -159,15 +155,10 @@ def project_to_index(
         & valid_conf_src
         & valid_conf_dst
         & in_bounds
-        & torch.isfinite(pair_conf)
     )
     idx = torch.zeros(b, h, w, device=points_dst.device, dtype=torch.long)
     idx[valid] = v_round[valid] * w + u_round[valid]
-    valid_before_balance = valid
-    if unique_target:
-        valid = _filter_unique_target(idx, valid, pair_conf, h, w)
-    if balance_grid_size > 0 and max_matches_per_cell > 0:
-        valid = _filter_grid_topk(valid, pair_conf, balance_grid_size, max_matches_per_cell)
+    pair_conf = torch.sqrt(conf_src * conf_projected_dst)
 
     if not return_debug:
         return idx.view(b, -1), valid.view(b, -1, 1), pair_conf.view(b, -1, 1)
@@ -181,57 +172,10 @@ def project_to_index(
         "positive_depth": positive_depth.view(b, -1),
         "valid_conf_src": valid_conf_src.view(b, -1),
         "valid_conf_dst": valid_conf_dst.view(b, -1),
-        "valid_before_balance": valid_before_balance.view(b, -1),
         "conf_projected_dst": conf_projected_dst.view(b, -1, 1),
         "z": z.view(b, -1),
     }
     return idx.view(b, -1), valid.view(b, -1, 1), pair_conf.view(b, -1, 1), debug
-
-
-def _filter_unique_target(idx, valid, score, h, w):
-    valid_flat = valid.view(valid.shape[0], -1)
-    idx_flat = idx.view(idx.shape[0], -1)
-    score_flat = score.view(score.shape[0], -1)
-    filtered = torch.zeros_like(valid_flat)
-    neg_inf = -torch.inf
-    for batch_idx in range(valid_flat.shape[0]):
-        valid_b = valid_flat[batch_idx]
-        if not valid_b.any():
-            continue
-        src_ids = torch.nonzero(valid_b, as_tuple=False).squeeze(1)
-        dst_ids = idx_flat[batch_idx, src_ids]
-        scores = score_flat[batch_idx, src_ids]
-        max_scores = torch.full(
-            (h * w,), neg_inf, device=score.device, dtype=score.dtype
-        )
-        max_scores.scatter_reduce_(0, dst_ids, scores, reduce="amax", include_self=True)
-        keep = scores >= max_scores[dst_ids]
-        filtered[batch_idx, src_ids[keep]] = True
-    return filtered.view_as(valid)
-
-
-def _filter_grid_topk(valid, score, grid_size, max_per_cell):
-    filtered = torch.zeros_like(valid)
-    _, h, w = valid.shape
-    for batch_idx in range(valid.shape[0]):
-        for y0 in range(0, h, grid_size):
-            y1 = min(y0 + grid_size, h)
-            for x0 in range(0, w, grid_size):
-                x1 = min(x0 + grid_size, w)
-                cell_valid = valid[batch_idx, y0:y1, x0:x1]
-                count = int(cell_valid.sum().item())
-                if count == 0:
-                    continue
-                cell_filtered = filtered[batch_idx, y0:y1, x0:x1]
-                if count <= max_per_cell:
-                    cell_filtered[cell_valid] = True
-                    continue
-                cell_score = score[batch_idx, y0:y1, x0:x1]
-                valid_yx = torch.nonzero(cell_valid, as_tuple=False)
-                topk = torch.topk(cell_score[cell_valid], max_per_cell).indices
-                keep_yx = valid_yx[topk]
-                cell_filtered[keep_yx[:, 0], keep_yx[:, 1]] = True
-    return filtered
 
 
 def match(
@@ -244,9 +188,6 @@ def match(
     K_dst: torch.Tensor = None,
     conf_threshold: float = 0.0,
     min_depth: float = 1e-6,
-    balance_grid_size: int = 0,
-    max_matches_per_cell: int = 0,
-    unique_target: bool = False,
     return_debug: bool = False,
 ):
     """Return dense source-to-destination correspondences from PI3 geometry.
@@ -286,9 +227,6 @@ def match(
         conf_dst,
         conf_threshold,
         min_depth,
-        balance_grid_size=balance_grid_size,
-        max_matches_per_cell=max_matches_per_cell,
-        unique_target=unique_target,
         return_debug=return_debug,
     )
     if return_debug:
