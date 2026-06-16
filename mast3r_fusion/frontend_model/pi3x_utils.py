@@ -398,17 +398,20 @@ def pi3x_inference_mono(model, frame):
 
 
 def _downsample(X, C, D, Q):
-    downsample = config["dataset"]["img_downsample"]
-    if downsample > 1:
-        X = X[..., ::downsample, ::downsample, :].contiguous()
-        C = C[..., ::downsample, ::downsample].contiguous()
-        D = D[..., ::downsample, ::downsample, :].contiguous()
-        Q = Q[..., ::downsample, ::downsample].contiguous()
     return X, C, D, Q
 
 
 def _match_conf_threshold():
     return config.get("pi3x", {}).get("match_conf_threshold", 0.0)
+
+
+def _match_filter_kwargs():
+    cfg = config.get("pi3x", {})
+    return {
+        "balance_grid_size": int(cfg.get("match_grid_size", 32)),
+        "max_matches_per_cell": int(cfg.get("match_max_per_cell", 32)),
+        "unique_target": bool(cfg.get("match_unique_target", True)),
+    }
 
 
 def _match_debug_enabled():
@@ -436,6 +439,15 @@ def _print_match_debug(name, frame_i, frame_j, valid, pair_conf, conf_src, conf_
             )
         else:
             pair_summary = "pair_conf[empty]"
+        valid_before_balance = debug.get("valid_before_balance")
+        if valid_before_balance is not None:
+            raw_count = int(valid_before_balance[batch_idx].sum().item())
+            balance_summary = (
+                f" balanced={valid_count}/{raw_count} "
+                f"({valid_count / max(raw_count, 1):.6f})"
+            )
+        else:
+            balance_summary = ""
         z = debug["z"][batch_idx]
         print(
             f"[PI3X match:{name}] "
@@ -456,6 +468,7 @@ def _print_match_debug(name, frame_i, frame_j, valid, pair_conf, conf_src, conf_
             f"mean={conf_dst[batch_idx].mean().item():.3f}, "
             f"max={conf_dst[batch_idx].max().item():.3f}] "
             f"{pair_summary}"
+            f"{balance_summary}"
         )
 
 
@@ -530,10 +543,24 @@ def pi3x_match_symmetric(
 
     conf_threshold = _match_conf_threshold()
     idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
-        Xjj, Xii, pose_j, pose_i, Cjj, Cii, conf_threshold=conf_threshold
+        Xjj,
+        Xii,
+        pose_j,
+        pose_i,
+        Cjj,
+        Cii,
+        conf_threshold=conf_threshold,
+        **_match_filter_kwargs(),
     )
     idx_j2i, valid_match_i, pair_conf_j2i = pi3_matching.match(
-        Xii, Xjj, pose_i, pose_j, Cii, Cjj, conf_threshold=conf_threshold
+        Xii,
+        Xjj,
+        pose_i,
+        pose_j,
+        Cii,
+        Cjj,
+        conf_threshold=conf_threshold,
+        **_match_filter_kwargs(),
     )
 
     return (
@@ -595,6 +622,7 @@ def pi3x_match_asymmetric(
         Cjj_match,
         Cii_match,
         conf_threshold=_match_conf_threshold(),
+        **_match_filter_kwargs(),
         return_debug=True,
     )
     if _match_debug_enabled():

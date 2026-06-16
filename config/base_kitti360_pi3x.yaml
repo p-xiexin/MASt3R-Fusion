@@ -11,9 +11,14 @@ frontend_model:
 
 pi3x:
   match_conf_threshold: 0.3
+  # Geometry projection can create dense local clusters. Keep only high-score
+  # matches per source-grid cell and suppress duplicate target pixels.
+  match_grid_size: 32
+  match_max_per_cell: 32
+  match_unique_target: true
   # Optional Pi3X multimodal conditioning. Keep these as experiment switches:
   # intrinsics is usually the safest prior. imu_predict enables IMU-predicted
-  # pose prior and should be tested both with rotation only and full translation.
+  # pose prior.
   use_intrinsics_prior: false
   imu_predict: false
   pose_prior_max_dt: 5.0
