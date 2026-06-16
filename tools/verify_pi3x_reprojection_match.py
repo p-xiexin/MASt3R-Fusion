@@ -46,17 +46,27 @@ def parse_args():
             "both dimensions must be divisible by PI3X patch size 14."
         ),
     )
-    parser.add_argument("--conf-threshold", type=float, default=0.2)
+    parser.add_argument("--conf-threshold", type=float, default=0.3)
     parser.add_argument("--min-depth", type=float, default=1e-6)
     parser.add_argument(
-        "--downsample",
+        "--match-grid-size",
         type=int,
-        default=1,
-        help=(
-            "Downsample PI3X point/confidence/image maps before reprojection, "
-            "using the same ::N grid slicing style as MASt3R-Fusion."
-        ),
+        default=32,
+        help="Source-grid cell size used to keep spatially balanced PI3X matches.",
     )
+    parser.add_argument(
+        "--match-max-per-cell",
+        type=int,
+        default=32,
+        help="Maximum high-confidence matches kept per source-grid cell.",
+    )
+    parser.add_argument(
+        "--no-unique-target",
+        dest="unique_target",
+        action="store_false",
+        help="Allow multiple source pixels to match the same target pixel.",
+    )
+    parser.set_defaults(unique_target=True)
     parser.add_argument("--max-lines", type=int, default=300)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output-dir", default="pi3x_reprojection_verify")
@@ -159,25 +169,6 @@ def fit_intrinsics(points: torch.Tensor, conf: torch.Tensor, conf_threshold: flo
     return K, valid, err
 
 
-def scale_intrinsics(K: torch.Tensor, scale: float):
-    if scale == 1:
-        return K
-    K_scaled = K.clone()
-    K_scaled[0, 0] /= scale
-    K_scaled[1, 1] /= scale
-    K_scaled[0, 2] /= scale
-    K_scaled[1, 2] /= scale
-    return K_scaled
-
-
-def downsample_maps(points: torch.Tensor, conf: torch.Tensor, downsample: int):
-    if downsample <= 1:
-        return points, conf
-    points = points[:, ::downsample, ::downsample, :].contiguous()
-    conf = conf[:, ::downsample, ::downsample].contiguous()
-    return points, conf
-
-
 def draw_matches(
     path: Path,
     image_a: torch.Tensor,
@@ -187,7 +178,6 @@ def draw_matches(
     v: torch.Tensor,
     max_lines: int,
     seed: int,
-    source_scale: int,
     match_shape,
 ):
     a = to_uint8_rgb(image_a)
@@ -206,8 +196,8 @@ def draw_matches(
         valid_indices = rng.choice(valid_indices, size=max_lines, replace=False)
     for idx in valid_indices:
         y0_match, x0_match = divmod(int(idx), match_w)
-        x0 = x0_match * source_scale
-        y0 = y0_match * source_scale
+        x0 = x0_match
+        y0 = y0_match
         x1 = int(round(float(u[idx].detach().cpu()))) + w
         y1 = int(round(float(v[idx].detach().cpu())))
         x0 = int(np.clip(x0, 0, w - 1))
@@ -225,9 +215,16 @@ def draw_matches(
     Image.fromarray(canvas).save(path)
 
 
-def print_stats(name: str, idx: torch.Tensor, valid: torch.Tensor, h: int, w: int):
+def print_stats(name: str, idx: torch.Tensor, valid: torch.Tensor, h: int, w: int, debug):
     valid_count = int(valid.sum().item())
     total = valid.numel()
+    valid_before_balance = debug.get("valid_before_balance")
+    if valid_before_balance is not None:
+        raw_count = int(valid_before_balance[0].sum().item())
+        print(
+            f"{name}.balanced_ratio={valid_count / max(raw_count, 1):.4f} "
+            f"({valid_count}/{raw_count})"
+        )
     unique = int(torch.unique(idx[valid]).numel()) if valid_count else 0
     print(f"{name}.valid_ratio={valid_count / total:.4f} ({valid_count}/{total})")
     print(f"{name}.unique_target_ratio={unique / max(valid_count, 1):.4f} ({unique}/{valid_count})")
@@ -247,8 +244,10 @@ def main():
     target_size = (args.size, args.size) if args.size is not None else tuple(args.target_size)
     if target_size[0] % 14 != 0 or target_size[1] % 14 != 0:
         raise ValueError("--target-size/--size dimensions must be divisible by 14 for PI3X.")
-    if args.downsample < 1:
-        raise ValueError("--downsample must be >= 1.")
+    if args.match_grid_size < 0:
+        raise ValueError("--match-grid-size must be >= 0.")
+    if args.match_max_per_cell < 0:
+        raise ValueError("--match-max-per-cell must be >= 0.")
 
     device = torch.device(args.device)
     output_dir = Path(args.output_dir)
@@ -262,10 +261,10 @@ def main():
     images = torch.stack((image_a, image_b), dim=0).unsqueeze(0)
     output = model(imgs=images)
     points, conf, poses = normalize_output(output)
-    K_a_full = pi3_matching.fit_intrinsics(
+    K_a = pi3_matching.fit_intrinsics(
         points[:1], conf[:1], args.conf_threshold, args.min_depth
     )[0]
-    K_b_full = pi3_matching.fit_intrinsics(
+    K_b = pi3_matching.fit_intrinsics(
         points[1:2], conf[1:2], args.conf_threshold, args.min_depth
     )[0]
     _, fit_valid_a_full, fit_err_a_full = fit_intrinsics(
@@ -274,7 +273,6 @@ def main():
     _, fit_valid_b_full, fit_err_b_full = fit_intrinsics(
         points[1], conf[1], args.conf_threshold, args.min_depth
     )
-    points, conf = downsample_maps(points, conf, args.downsample)
 
     h, w = points.shape[1:3]
     points_a, points_b = points[0], points[1]
@@ -284,8 +282,6 @@ def main():
     save_rgb(output_dir / "image_a.png", image_a)
     save_rgb(output_dir / "image_b.png", image_b)
 
-    K_a = scale_intrinsics(K_a_full, args.downsample)
-    K_b = scale_intrinsics(K_b_full, args.downsample)
     print(f"K_a=\n{K_a.detach().cpu().numpy()}")
     print(f"K_b=\n{K_b.detach().cpu().numpy()}")
     print(
@@ -311,6 +307,9 @@ def main():
         K_dst=K_b,
         conf_threshold=args.conf_threshold,
         min_depth=args.min_depth,
+        balance_grid_size=args.match_grid_size,
+        max_matches_per_cell=args.match_max_per_cell,
+        unique_target=args.unique_target,
         return_debug=True,
     )
     idx_b2a, valid_b2a, pair_conf_b2a, debug_b2a = pi3_matching.match(
@@ -323,6 +322,9 @@ def main():
         K_dst=K_a,
         conf_threshold=args.conf_threshold,
         min_depth=args.min_depth,
+        balance_grid_size=args.match_grid_size,
+        max_matches_per_cell=args.match_max_per_cell,
+        unique_target=args.unique_target,
         return_debug=True,
     )
     idx_a2b = idx_a2b[0]
@@ -336,8 +338,14 @@ def main():
     u_b2a = debug_b2a["u"][0]
     v_b2a = debug_b2a["v"][0]
 
-    print_stats("a2b", idx_a2b, valid_a2b, h, w)
-    print_stats("b2a", idx_b2a, valid_b2a, h, w)
+    print(
+        "match_filter: "
+        f"grid_size={args.match_grid_size}, "
+        f"max_per_cell={args.match_max_per_cell}, "
+        f"unique_target={args.unique_target}"
+    )
+    print_stats("a2b", idx_a2b, valid_a2b, h, w, debug_a2b)
+    print_stats("b2a", idx_b2a, valid_b2a, h, w, debug_b2a)
     if valid_a2b.any():
         print(
             "a2b.pair_conf: "
@@ -356,11 +364,10 @@ def main():
         image_a,
         image_b,
         valid_a2b,
-        u_a2b * args.downsample,
-        v_a2b * args.downsample,
+        u_a2b,
+        v_a2b,
         args.max_lines,
         args.seed,
-        args.downsample,
         (h, w),
     )
     draw_matches(
@@ -368,11 +375,10 @@ def main():
         image_b,
         image_a,
         valid_b2a,
-        u_b2a * args.downsample,
-        v_b2a * args.downsample,
+        u_b2a,
+        v_b2a,
         args.max_lines,
         args.seed,
-        args.downsample,
         (h, w),
     )
 
@@ -386,7 +392,9 @@ def main():
         pair_conf_b2a=pair_conf_b2a.detach().cpu().numpy(),
         K_a=K_a.detach().cpu().numpy(),
         K_b=K_b.detach().cpu().numpy(),
-        downsample=args.downsample,
+        match_grid_size=args.match_grid_size,
+        match_max_per_cell=args.match_max_per_cell,
+        unique_target=args.unique_target,
         fit_valid_a=fit_valid_a_full.detach().cpu().numpy(),
         fit_valid_b=fit_valid_b_full.detach().cpu().numpy(),
     )
