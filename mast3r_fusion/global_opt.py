@@ -438,31 +438,39 @@ class FactorGraph:
                 img_j = frame_j.uimg
                 h_i, w_i = img_i.shape[:2]
                 h_j, w_j = img_j.shape[:2]
-                target_w = w_j * self.subpixel_factor
+                target_w = w_i * self.subpixel_factor
 
                 plt.figure('1',figsize=[5,6])
                 plt.subplot(2,1,1)
                 plt.imshow(img_i)
 
                 mask = valid_match_j[iiii,::100,0].cpu().numpy()
-                pts_src = np.arange(valid_match_j.shape[1])[::100]
-                pts_dst = idx_i2j[iiii,::100].cpu().numpy()
+                pts_j = np.arange(valid_match_j.shape[1])[::100]
+                pts_i = idx_i2j[iiii,::100].cpu().numpy()
                 clr = np.arange(valid_match_j.shape[1])[::100]
-                pts_src = pts_src[mask]
-                pts_dst = pts_dst[mask]
+                pts_j = pts_j[mask]
+                pts_i = pts_i[mask]
                 clr = clr[mask]
 
-                plt.scatter(pts_src % w_i, pts_src // w_i, s=0.7, c=clr, cmap='jet')
+                x_i = (pts_i % target_w) // self.subpixel_factor
+                y_i = (pts_i // target_w) // self.subpixel_factor
+                plt.scatter(x_i, y_i, s=0.7, c=clr, cmap='jet')
                 plt.gca().tick_params(labelbottom=False, labelleft=False)
 
                 plt.subplot(2,1,2)
                 plt.imshow(img_j)
-                x_dst = (pts_dst % target_w) // self.subpixel_factor
-                y_dst = (pts_dst // target_w) // self.subpixel_factor
-                plt.scatter(x_dst, y_dst, s=0.7, c=clr, cmap='jet')
+                plt.scatter(pts_j % w_j, pts_j // w_j, s=0.7, c=clr, cmap='jet')
                 plt.gca().tick_params(labelbottom=False, labelleft=False)
                 plt.tight_layout()
-                plt.savefig('temp/%d_%d.jpg'%(ii_tensor[iiii].item(),jj_tensor[iiii].item()))
+                plt.savefig(
+                    'temp/kf%d_frame%d__kf%d_frame%d.jpg'
+                    % (
+                        ii_tensor[iiii].item(),
+                        frame_i.frame_id,
+                        jj_tensor[iiii].item(),
+                        frame_j.frame_id,
+                    )
+                )
                 plt.close('all')
 
         retain_mask = torch.logical_not(torch.logical_and(self.ii<torch.max(self.ii)-20,self.jj<torch.max(self.jj)-self.retain_num))
