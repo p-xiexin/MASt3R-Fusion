@@ -432,27 +432,37 @@ class FactorGraph:
             if not os.path.exists('temp'):
                 os.mkdir('temp')
             for iiii in range(ii_tensor.shape[0]):
+                frame_i = self.frames[ii_tensor[iiii].item()]
+                frame_j = self.frames[jj_tensor[iiii].item()]
+                img_i = frame_i.uimg
+                img_j = frame_j.uimg
+                h_i, w_i = img_i.shape[:2]
+                h_j, w_j = img_j.shape[:2]
+                target_w = w_j * self.subpixel_factor
+
                 plt.figure('1',figsize=[5,6])
                 plt.subplot(2,1,1)
-                plt.imshow(self.frames[self.ii[iiii].item()].uimg)
+                plt.imshow(img_i)
 
-                mask = self.valid_match_j[iiii,::100,0].cpu().numpy()
-                pts = self.idx_ii2jj[iiii,::100].cpu().numpy()
-                clr = np.arange(self.valid_match_j.shape[1])[::100]
-                pts = pts[mask]
+                mask = valid_match_j[iiii,::100,0].cpu().numpy()
+                pts_src = np.arange(valid_match_j.shape[1])[::100]
+                pts_dst = idx_i2j[iiii,::100].cpu().numpy()
+                clr = np.arange(valid_match_j.shape[1])[::100]
+                pts_src = pts_src[mask]
+                pts_dst = pts_dst[mask]
                 clr = clr[mask]
 
-                plt.scatter(pts % 512,pts // 512,s=0.7,c=clr,cmap='jet')
+                plt.scatter(pts_src % w_i, pts_src // w_i, s=0.7, c=clr, cmap='jet')
                 plt.gca().tick_params(labelbottom=False, labelleft=False)
 
                 plt.subplot(2,1,2)
-                plt.imshow(self.frames[self.jj[iiii].item()].uimg)
-                pts1 = np.arange(self.valid_match_j.shape[1])[::100]
-                pts1 =pts1[mask]
-                plt.scatter(pts1 % 512,pts1 // 512,s=0.7,c=clr,cmap='jet')
+                plt.imshow(img_j)
+                x_dst = (pts_dst % target_w) // self.subpixel_factor
+                y_dst = (pts_dst // target_w) // self.subpixel_factor
+                plt.scatter(x_dst, y_dst, s=0.7, c=clr, cmap='jet')
                 plt.gca().tick_params(labelbottom=False, labelleft=False)
                 plt.tight_layout()
-                plt.savefig('temp/%d_%d.jpg'%(self.ii[iiii].item(),self.jj[iiii].item()))
+                plt.savefig('temp/%d_%d.jpg'%(ii_tensor[iiii].item(),jj_tensor[iiii].item()))
                 plt.close('all')
 
         retain_mask = torch.logical_not(torch.logical_and(self.ii<torch.max(self.ii)-20,self.jj<torch.max(self.jj)-self.retain_num))
