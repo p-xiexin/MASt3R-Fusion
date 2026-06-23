@@ -84,223 +84,6 @@ $$
 
 这一路径计算效率较高，但代价是很多点级诊断信息在进入 GTSAM 前被聚合；如果没有额外的因子级筛查、动态权重或后验 outlier rejection，坏匹配对状态的影响会更难隔离。
 
-## 当前 MASt3R-Fusion 后端实现梳理
-
-### 1. 前端 tracking 有基础鲁棒性
-
-`FrameTracker.track()` 调用前端模型进行当前帧与最近关键帧匹配，使用置信度筛选和 Huber 加权优化相对 Sim(3) 位姿。关键逻辑包括：
-
-```python
-valid_opt = valid_match_k & valid_Cf & valid_Ck & valid_Q
-match_frac = valid_opt.sum() / valid_opt.numel()
-```
-
-若 `match_frac` 低于 tracking 阈值，则进入重定位模式。位姿优化中使用：
-
-```python
-robust_sqrt_info = sqrt_info * torch.sqrt(huber(whitened_r, k=self.cfg["huber"]))
-```
-
-因此，用户观察到“前端 tracking 可视化较稳”是合理的：前端有局部帧间匹配、置信度筛选、Huber 权重和关键帧选择逻辑。
-
-### 2. 后端图构建偏激进，连续边几乎无条件进入
-
-`main.py` 中 `run_backend()` 对每个新关键帧默认添加一条前一关键帧边，并选择局部 retrieval 边：
-
-```python
-n_consec = 1
-kf_idx.append(idx - 1 - j)
-factor_graph.add_factors(kf_idx, frame_idx, config["local_opt"]["min_match_frac"])
-```
-
-在 `FactorGraph.add_factors()` 中，候选边的双向 match fraction 会用于判定无效边：
-
-```python
-invalid_edges = torch.minimum(match_frac_j, match_frac_i) < min_match_frac
-consecutive_edges = ii_tensor == (jj_tensor - 1)
-invalid_edges = (~consecutive_edges) & invalid_edges
-```
-
-这意味着：**非连续 retrieval 边可以按匹配率剔除，但连续关键帧边即使低于阈值也会保留**。在视觉前端偶尔失真、动态物体、弱纹理、过曝、快速转向或尺度突变时，这一策略容易把坏连续边固定进优化图。
-
-### 3. 当前配置使后端门槛更宽松
-
-以 `config/base_kitti360.yaml` 为例：
-
-```yaml
-tracking:
-  min_match_frac: 0.00
-  Q_conf: 1.5
-  huber: 1.345
-
-local_opt:
-  min_match_frac: 0.0
-  pixel_border: -10000
-  sigma_pixel: 0.0005
-```
-
-这里有两个后果：
-
-1. 后端局部边的 `min_match_frac` 默认为 0，几乎不按匹配比例拒绝边。
-2. `pixel_border: -10000` 使投影有效区域判断极宽松，许多几何上已经离开图像范围的投影仍可能进入残差构造。
-
-这并不必然错误，因为 dense pointmap 和 feed-forward prior 的尺度与投影关系不同于传统稀疏特征；但它降低了后端对坏观测的早期拦截能力。
-
-### 4. 检索边缺少独立几何验收，室内扫描易产生负贡献
-
-`run_backend()` 中 retrieval edge 的构造主要依赖检索数据库返回的候选索引，并通过 `find_valid_numbers()` 做非常轻量的距离与聚类筛选：
-
-```python
-retrieval_inds = retrieval_database.update(frame, add_after_query=True, ...)
-retrieval_inds = find_valid_numbers(idx, retrieval_inds)
-
-for kkk in retrieval_inds:
-    if np.fabs(idx - kkk) < 20:
-        retrieval_inds_selected.append(kkk)
-```
-
-随后这些 retrieval candidates 与当前关键帧一起进入 `factor_graph.add_factors()`。边级筛选主要由双向 match fraction 控制：
-
-```python
-invalid_edges = torch.minimum(match_frac_j, match_frac_i) < min_match_frac
-valid_edges = ~invalid_edges
-```
-
-在室内扫描场景中，这一策略存在一个典型风险：外观相似并不等价于几何一致。重复门框、墙面、走廊、桌椅、纹理块和局部扫描回访都可能触发较高的外观相似度；但当视角重叠不足或平移基线不合适时，MASt3R matching 产生的 dense correspondence 可能在局部视觉上可解释，却不能提供稳定的全局相对位姿约束。当前后端没有看到类似 pose graph loop-closure verification 中常见的 RANSAC/PnP/Sim(3) consistency check、switchable constraint 或优化后边级残差剔除。因此，在室内扫描类数据上，retrieval edge 可能从“补充约束”变成“错误长程约束”。
-
-### 5. 点级 Huber 存在，但缺少边级和后验剔除闭环
-
-CUDA 后端在 `calib_proj_kernel` 与 `calib_proj_kernel_pieces` 中对像素和 log-depth 残差使用 Huber 权重：
-
-```cpp
-w[0] = huber(sqrt_w_pixel * err[0]);
-w[1] = huber(sqrt_w_pixel * err[1]);
-w[2] = huber(sqrt_w_depth * err[2]);
-```
-
-并使用置信度与深度一致性项：
-
-```cpp
-if(d_diff_thresh > 0 && Xj[2] * (*sij) > Xi[2] * d_diff_thresh)
-    downweight_factor = 0.01;
-```
-
-这说明 MASt3R-Fusion 后端并非完全没有鲁棒权重。但这些机制主要在**点级残差组装 Hessian 前**生效。当前本地实现中没有看到类似 VINS 的“优化后根据重投影误差删除 feature，再更新 feature manager/track manager”的闭环。因此，一条边只要被接纳，其聚合 Hessian 就会持续参与局部优化、边缘化和图保存。
-
-### 6. GTSAM 优化迭代较浅，且没有显式失败回滚
-
-`solve_GN_calib()` 中，每轮构造视觉 Hessian factor，再用 GTSAM Levenberg-Marquardt 优化：
-
-```python
-params = gtsam.LevenbergMarquardtParams()
-params.setMaxIterations(2)
-optimizer = gtsam.LevenbergMarquardtOptimizer(cur_graph, initials, params)
-cur_result = optimizer.optimize()
-```
-
-外层循环由 `local_opt.max_iters` 控制，但每次 GTSAM 内部 LM 只迭代 2 次。若当前线性化点较差，或者视觉 Hessian 与 IMU/先验冲突较强，浅迭代可能不足以收敛，也没有显式检查优化 summary、残差下降、尺度异常或位姿跳变后再决定是否接受结果。
-
-### 7. 视觉-惯性初始化检查存在明显退化
-
-`solve_VI_init()` 中计算 IMU excitation 的方差：
-
-```python
-var_g = math.sqrt(var_g / ccount)
-if var_g < 0.0:
-    print("IMU excitation not enough!")
-else:
-    vi_result = VisualIMUAlignment(...)
-```
-
-由于 `var_g` 是平方和开根号，不可能小于 0。因此该检查事实上永远不会拒绝低激励初始化。这与 VINS-Mono/VINS-Fusion 中强调初始化鲁棒性和 IMU 可观测性判断的设计思想明显不一致。低激励、时间偏差、外参误差或初始尺度不稳时，当前实现更容易进入错误的 VI 状态。
-
-### 8. 滑窗边缘化存在，但信息保留较粗
-
-当前实现中，`solve_GN_calib()` 使用 `window_num` 计算 `pin`，旧状态通过 `gtsam.marginalizeOut()` 形成 `marg_factor`。这说明系统具备滑窗边缘化框架。但边缘化之前的视觉信息已经是 pairwise Hessian factor；如果早期坏边进入并被边缘化，其影响会固化为 prior。VINS 中同样有边缘化固化问题，但其在边缘化前有 feature 级跟踪、三角化、鲁棒核、outlier rejection 和 failure handling 作为缓冲。
-
-## VINS-Fusion 后端鲁棒机制概述
-
-VINS-Fusion/VINS-Mono 代表传统优化式 VIO 的成熟工程路径。其鲁棒性来自多个层级的共同作用。
-
-### 1. 状态设计显式包含 IMU 动力学变量
-
-VINS-Fusion 的局部 odometry 论文将视觉与惯性传感器统一为 factor graph，并显式优化 pose、velocity、accelerometer bias、gyroscope bias、camera landmark depth 等状态。IMU 预积分因子在相邻关键帧间提供高频运动约束，视觉因子通过多帧 feature observation 约束位姿和逆深度。
-
-其基本代价可写为：
-
-$$
-\min_{\mathcal{X}}
-\left(
-\sum_{(i,j)\in \mathcal{I}}
-\left\|
-\mathbf{r}^{imu}_{ij}
-\right\|^2_{\Omega_{ij}^{imu}}
-+
-\sum_{l,t}
-\rho
-\left(
-\left\|
-\mathbf{r}^{cam}_{l,t}
-\right\|^2_{\Omega^{cam}}
-\right)
-+
-\left\|
-\mathbf{r}^{prior}
-\right\|^2_{\Omega^{prior}}
-\right).
-$$
-
-IMU 不只是给关键帧选择提供辅助，而是贯穿初始化、传播、优化和边缘化。
-
-### 2. 视觉残差使用鲁棒核
-
-VINS-Fusion 官方源码中，视觉 projection factor 加入 Ceres problem 时使用 Huber loss。抽象地说，视觉残差不直接以平方误差进入，而是：
-
-$$
-\rho_{\delta}(s)
-=
-\begin{cases}
-s, & s \leq \delta^2,\\
-2\delta\sqrt{s}-\delta^2, & s > \delta^2.
-\end{cases}
-$$
-
-这使单个异常视觉观测的影响从二次增长变成近似线性增长。
-
-### 3. 优化后显式 outlier rejection
-
-VINS-Fusion 在优化后调用 `outliersRejection()`，根据 feature 的平均重投影误差筛选异常 feature；再由 feature manager 与 feature tracker 删除这些 outlier。这是一种重要闭环：
-
-```text
-构建视觉残差 -> 非线性优化 -> 计算后验重投影误差 -> 删除异常 feature -> 滑窗推进
-```
-
-相比之下，当前 MASt3R-Fusion 后端更接近：
-
-```text
-dense match -> 聚合 Hessian factor -> GTSAM 优化 -> 接受状态 -> 滑窗/边缘化
-```
-
-缺失的正是“后验误差诊断并删除坏观测”的环节。
-
-### 4. 滑窗状态迁移更完整
-
-VINS-Fusion 的 `slideWindow()` 会同步迁移：
-
-- pose；
-- velocity；
-- accelerometer bias；
-- gyroscope bias；
-- IMU preintegration；
-- feature manager 中的观测关系；
-- 边缘化 prior。
-
-当前 MASt3R-Fusion 也维护 `wTcs/ss/vs/bs/preintegrations/marg_factor`，但视觉观测不以长期 landmark track 形式存在，旧视觉信息主要以 Hessian factor 和边缘化 prior 形式保留。因此当视觉因子本身质量控制不足时，滑窗反而会加速错误固化。
-
-### 5. 初始化与失败恢复体系更完整
-
-VINS-Mono 论文明确强调 robust initialization and failure recovery。VINS-Fusion 官方源码中虽有部分 failure detection 逻辑被直接 `return false` 短路，但整体系统仍保留了初始化、滑窗、outlier rejection、feature failure removal、IMU propagation 和 loop fusion 等链路。当前 MASt3R-Fusion 本地实现没有看到同等级别的状态回滚、重启、坏窗口拒绝或优化结果验收机制。
-
 ## 逐项问题-机制对照
 
 上文分别说明了当前 MASt3R-Fusion 的后端问题和 VINS-Fusion 的后端机制。为了更清晰地解释“为什么相同现象下 VINS 更稳”，本节按**问题 -> VINS 对应处理 -> 稳定性来源**的方式展开。
@@ -440,6 +223,57 @@ VINS 在边缘化前已经经历 feature tracking、triangulation、Huber loss�
 
 **为什么更稳。**  
 两者都会受到错误 prior 固化的风险影响；差异在于 VINS 在固化之前有更多清洗步骤。当前 MASt3R-Fusion 若缺少边级验收，边缘化会放大早期错误，而不是简单地平滑它。
+
+## VINS 中额外可借鉴的后端设计
+
+本节只列出前面逐项对比中尚未展开的 VINS 设计点。也就是说，这里不再重复几何验收、后验 outlier rejection、低视差退化检测、VI 初始化验收、边缘化前清理和前后端分层，而是补充一些更细的工程机制。
+
+### 1. IMU 传播用于实时状态预测和优化初值
+
+VINS 不仅在后端优化中加入 IMU factor，还会用 IMU propagation 维持最新状态预测，为下一帧 tracking、PnP 或滑窗优化提供更稳定的初值。该设计的核心价值是降低视觉前端在快速旋转、短时模糊或帧间视差不足时对上一帧视觉位姿的单点依赖。
+
+对 MASt3R-Fusion 来说，这一点可以借鉴为：即使暂不完全依赖 IMU 约束尺度，也可以把 IMU prediction 作为 tracking 和后端局部优化的 motion prior，尤其用于大角度旋转但平移不足的片段。这样做的目标不是替代视觉约束，而是给 Sim(3)/SE(3) 优化一个更合理的初始姿态。
+
+### 2. Bias 更新后的预积分重传播
+
+VINS 在估计陀螺 bias 后，会对已有 preintegration 执行 repropagation，使 IMU 约束与最新 bias 估计保持一致。这个细节很重要：IMU bias 一旦变化，旧的预积分量如果不更新，会把错误惯性信息继续带入滑窗。
+
+对应到当前系统，如果后端维护 `bs/vs/preintegrations`，就需要关注 bias 更新和预积分量之间的一致性。否则视觉约束已经在修正尺度或姿态，而 IMU factor 仍使用旧 bias 线性化结果，可能产生视觉-惯性冲突。
+
+### 3. 按关键帧质量选择边缘化策略
+
+VINS 的滑窗不是简单固定删除最老帧；它会区分 marginalize old frame 和 marginalize second-newest frame 等策略，使窗口保留对当前运动更有价值的关键帧。这个设计没有直接等同于前文的“边缘化前清理信息”，它更强调**该保留哪一帧、该丢弃哪一帧**。
+
+MASt3R-Fusion 当前按 `window_num` 和 `pin` 推进窗口，更偏固定窗口。可借鉴 VINS 的策略，将关键帧保留与视差、旋转量、retrieval 可靠性、尺度稳定性和边连接质量关联起来。对近似纯旋转片段，不一定应该急于把低基线帧作为强关键帧固化进窗口。
+
+### 4. 参数估计采用“条件开启”而非始终自由
+
+VINS 中外参、时间延迟等参数并非始终无条件优化，而是根据运动激励和配置决定是否开启估计。例如外参估计通常需要足够运动，否则保持固定更稳。这一设计原则可以抽象为：**只有当数据对某个自由度有足够可观测性时，才释放该自由度**。
+
+对 MASt3R-Fusion 最直接的启发是尺度、外参和可能的相机-IMU对齐参数不应始终等权自由优化。在低视差、纯旋转或弱 IMU 激励阶段，应该临时固定或强正则化不可观自由度；等运动提供足够约束后再释放。
+
+### 5. 用运行时健康指标驱动模式切换
+
+VINS 内部维护诸如 tracked feature 数量、parallax、solver 状态、bias 范数、最新位姿变化等健康指标。这些指标不仅用于日志，也用于初始化、滑窗、失败检测或输出状态判断。
+
+MASt3R-Fusion 可以建立类似的后端健康指标体系，但指标应适配 dense 前端，例如：
+
+```text
+valid dense match ratio
+edge cost percentile
+scale jump magnitude
+rotation-baseline ratio
+retrieval edge disagreement
+IMU prediction residual
+```
+
+这些指标可以驱动 `TRACKING / RELOC / DEGRADED / HOLD_SCALE` 等模式，而不是让所有帧都走同一条后端接受路径。
+
+### 6. 求解器时间预算和优化强度自适应
+
+VINS 会根据实时性需求限制 Ceres 求解时间，并在不同 marginalization 情况下设置不同预算。这个机制的重点不是“迭代越多越好”，而是让后端优化强度与当前窗口复杂度、实时约束和状态风险匹配。
+
+当前 MASt3R-Fusion 的 GTSAM 内层 LM 迭代数较固定。可借鉴 VINS 的思路：普通帧采用轻量优化；检测到尺度跳变、retrieval 边冲突或纯旋转退化时，临时提高优化/诊断强度；若仍不能稳定下降，则拒绝该次状态更新或降级处理。
 
 ## 鲁棒性差异总表
 
