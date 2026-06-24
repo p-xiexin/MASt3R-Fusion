@@ -162,7 +162,7 @@ def parse_args():
     parser.add_argument(
         "--export-cameras",
         action="store_true",
-        help="Also write camera frustums and trajectory tubes into the output PLY.",
+        help="Also export camera frustums and trajectory tubes to <output_stem>_cameras.ply.",
     )
     return parser.parse_args()
 
@@ -495,6 +495,26 @@ def write_faces(fp, faces: List[Tuple[int, int, int]]) -> None:
         fp.write(struct.pack("<Biii", 3, face[0], face[1], face[2]))
 
 
+def camera_output_path(output_path: pathlib.Path) -> pathlib.Path:
+    return output_path.with_name(f"{output_path.stem}_cameras.ply")
+
+
+def write_camera_mesh_ply(
+    path: pathlib.Path,
+    vertices: np.ndarray,
+    faces: List[Tuple[int, int, int]],
+) -> None:
+    path.parent.mkdir(exist_ok=True, parents=True)
+    print(
+        f"Writing {vertices.shape[0]} camera/trajectory vertices and "
+        f"{len(faces)} faces to {path}."
+    )
+    with open(path, "wb") as fp:
+        write_ply_header(fp, vertices.shape[0], len(faces))
+        vertices.tofile(fp)
+        write_faces(fp, faces)
+
+
 def camera_local_vertices(image_shape: Tuple[int, int], scale: float) -> np.ndarray:
     h, w = image_shape
     aspect = max(float(w) / max(float(h), 1.0), 1e-6)
@@ -528,16 +548,16 @@ def image_shape_from_data(data) -> Tuple[int, int]:
 
 def auto_camera_scale(centers: np.ndarray) -> float:
     if centers.shape[0] == 0:
-        return 0.3
+        return 0.05
     extent = np.linalg.norm(centers.max(axis=0) - centers.min(axis=0))
-    scale_from_extent = extent * 0.02 if np.isfinite(extent) else 0.0
+    scale_from_extent = extent * 0.008 if np.isfinite(extent) else 0.0
     if centers.shape[0] > 1:
         steps = np.linalg.norm(np.diff(centers, axis=0), axis=1)
         finite_steps = steps[np.isfinite(steps) & (steps > 0)]
-        scale_from_step = np.median(finite_steps) * 0.5 if finite_steps.size else 0.0
+        scale_from_step = np.median(finite_steps) * 0.2 if finite_steps.size else 0.0
     else:
         scale_from_step = 0.0
-    return float(max(scale_from_extent, scale_from_step, 0.3))
+    return float(max(scale_from_extent, scale_from_step, 0.05))
 
 
 def append_tube_segment(
@@ -822,34 +842,18 @@ def main():
                 pose_by_index,
                 args,
             )
-            if camera_faces:
-                camera_faces = [
-                    (
-                        face[0] + total_vertices,
-                        face[1] + total_vertices,
-                        face[2] + total_vertices,
-                    )
-                    for face in camera_faces
-                ]
 
-        output_vertex_count = total_vertices + camera_vertices.shape[0]
-        print(
-            f"Writing {total_vertices} points, {camera_vertices.shape[0]} camera vertices, "
-            f"and {len(camera_faces)} camera/trajectory faces "
-            f"to {output_path}."
-        )
+        print(f"Writing {total_vertices} points to {output_path}.")
 
         bounds = None
         with open(output_path, "wb") as fp:
-            write_ply_header(fp, output_vertex_count, len(camera_faces))
+            write_ply_header(fp, total_vertices)
             for key_idx, _, data in iter_frame_data(h5_file, keys):
                 points_world, colors = transformed_frame_arrays(
                     data, key_idx, pose_by_index, args, K
                 )
                 bounds = update_bounds(bounds, points_world)
                 pack_vertices(points_world, colors).tofile(fp)
-            camera_vertices.tofile(fp)
-            write_faces(fp, camera_faces)
 
         if bounds is None:
             print("No finite world points were exported.")
@@ -858,6 +862,12 @@ def main():
                 "World bounds: "
                 f"min=({bounds[0][0]:.6g}, {bounds[0][1]:.6g}, {bounds[0][2]:.6g}), "
                 f"max=({bounds[1][0]:.6g}, {bounds[1][1]:.6g}, {bounds[1][2]:.6g})"
+            )
+        if args.export_cameras:
+            write_camera_mesh_ply(
+                camera_output_path(output_path),
+                camera_vertices,
+                camera_faces,
             )
 
     print("Done.")
