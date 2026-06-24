@@ -162,7 +162,7 @@ def parse_args():
     parser.add_argument(
         "--export-cameras",
         action="store_true",
-        help="Also export a separate PLY with camera frustums and trajectory edges.",
+        help="Also write camera frustums and trajectory edges into the output PLY.",
     )
     return parser.parse_args()
 
@@ -478,7 +478,7 @@ def pack_edges(edge_pairs: List[Tuple[int, int]]) -> np.ndarray:
     return edges
 
 
-def write_ply_header(fp, vertex_count: int) -> None:
+def write_ply_header(fp, vertex_count: int, edge_count: int = 0) -> None:
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
@@ -489,32 +489,15 @@ def write_ply_header(fp, vertex_count: int) -> None:
         "property uchar red\n"
         "property uchar green\n"
         "property uchar blue\n"
-        "end_header\n"
     )
+    if edge_count > 0:
+        header += (
+            f"element edge {edge_count}\n"
+            "property int vertex1\n"
+            "property int vertex2\n"
+        )
+    header += "end_header\n"
     fp.write(header.encode("ascii"))
-
-
-def write_camera_ply_header(fp, vertex_count: int, edge_count: int) -> None:
-    header = (
-        "ply\n"
-        "format binary_little_endian 1.0\n"
-        f"element vertex {vertex_count}\n"
-        "property float x\n"
-        "property float y\n"
-        "property float z\n"
-        "property uchar red\n"
-        "property uchar green\n"
-        "property uchar blue\n"
-        f"element edge {edge_count}\n"
-        "property int vertex1\n"
-        "property int vertex2\n"
-        "end_header\n"
-    )
-    fp.write(header.encode("ascii"))
-
-
-def camera_output_path(output_path: pathlib.Path) -> pathlib.Path:
-    return output_path.with_name(f"{output_path.stem}_cameras.ply")
 
 
 def camera_local_vertices(image_shape: Tuple[int, int], scale: float) -> np.ndarray:
@@ -580,15 +563,13 @@ def append_camera_geometry(
     return base
 
 
-def write_camera_ply(
-    path: pathlib.Path,
+def collect_camera_geometry(
     h5_file,
     keys: List[Tuple[int, str]],
     pose_by_index,
     args,
-) -> None:
+) -> Tuple[np.ndarray, np.ndarray]:
     camera_scale = 0.3
-    path.parent.mkdir(exist_ok=True, parents=True)
     vertices: List[np.ndarray] = []
     edges: List[Tuple[int, int]] = []
     previous_center_index: Optional[int] = None
@@ -610,12 +591,10 @@ def write_camera_ply(
         )
     vertex_count = sum(chunk.shape[0] for chunk in vertices)
     edge_count = len(edges)
-    print(f"Writing {vertex_count} camera vertices and {edge_count} edges to {path}.")
-    with open(path, "wb") as fp:
-        write_camera_ply_header(fp, vertex_count, edge_count)
-        if vertices:
-            np.concatenate(vertices).tofile(fp)
-        pack_edges(edges).tofile(fp)
+    camera_vertices = np.concatenate(vertices) if vertices else np.empty(0, dtype=PLY_DTYPE)
+    camera_edges = pack_edges(edges)
+    print(f"Prepared {vertex_count} camera vertices and {edge_count} trajectory/frustum edges.")
+    return camera_vertices, camera_edges
 
 
 def resolve_pose(
@@ -778,17 +757,38 @@ def main():
         total_vertices = 0
         for key_idx, _, data in iter_frame_data(h5_file, keys):
             total_vertices += count_frame_points(data, key_idx, pose_by_index, args, K)
-        print(f"Writing {total_vertices} points to {output_path}.")
+
+        camera_vertices = np.empty(0, dtype=PLY_DTYPE)
+        camera_edges = np.empty(0, dtype=PLY_EDGE_DTYPE)
+        if args.export_cameras:
+            camera_vertices, camera_edges = collect_camera_geometry(
+                h5_file,
+                keys,
+                pose_by_index,
+                args,
+            )
+            if camera_edges.shape[0] > 0:
+                camera_edges = camera_edges.copy()
+                camera_edges["vertex1"] += total_vertices
+                camera_edges["vertex2"] += total_vertices
+
+        output_vertex_count = total_vertices + camera_vertices.shape[0]
+        print(
+            f"Writing {total_vertices} points and {camera_vertices.shape[0]} camera vertices "
+            f"to {output_path}."
+        )
 
         bounds = None
         with open(output_path, "wb") as fp:
-            write_ply_header(fp, total_vertices)
+            write_ply_header(fp, output_vertex_count, camera_edges.shape[0])
             for key_idx, _, data in iter_frame_data(h5_file, keys):
                 points_world, colors = transformed_frame_arrays(
                     data, key_idx, pose_by_index, args, K
                 )
                 bounds = update_bounds(bounds, points_world)
                 pack_vertices(points_world, colors).tofile(fp)
+            camera_vertices.tofile(fp)
+            camera_edges.tofile(fp)
 
         if bounds is None:
             print("No finite world points were exported.")
@@ -797,15 +797,6 @@ def main():
                 "World bounds: "
                 f"min=({bounds[0][0]:.6g}, {bounds[0][1]:.6g}, {bounds[0][2]:.6g}), "
                 f"max=({bounds[1][0]:.6g}, {bounds[1][1]:.6g}, {bounds[1][2]:.6g})"
-            )
-
-        if args.export_cameras:
-            write_camera_ply(
-                camera_output_path(output_path),
-                h5_file,
-                keys,
-                pose_by_index,
-                args,
             )
 
     print("Done.")
