@@ -2,6 +2,7 @@ import argparse
 import io
 import pathlib
 import re
+import struct
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -18,7 +19,6 @@ PLY_DTYPE = np.dtype(
         ("blue", "u1"),
     ]
 )
-PLY_EDGE_DTYPE = np.dtype([("vertex1", "<i4"), ("vertex2", "<i4")])
 
 
 def parse_args():
@@ -162,7 +162,7 @@ def parse_args():
     parser.add_argument(
         "--export-cameras",
         action="store_true",
-        help="Also write camera frustums and trajectory edges into the output PLY.",
+        help="Also write camera frustums and trajectory tubes into the output PLY.",
     )
     return parser.parse_args()
 
@@ -469,16 +469,7 @@ def pack_camera_vertices(points: np.ndarray, color: Tuple[int, int, int]) -> np.
     return pack_vertices(points, colors)
 
 
-def pack_edges(edge_pairs: List[Tuple[int, int]]) -> np.ndarray:
-    edges = np.empty(len(edge_pairs), dtype=PLY_EDGE_DTYPE)
-    if edge_pairs:
-        edge_array = np.asarray(edge_pairs, dtype=np.int32)
-        edges["vertex1"] = edge_array[:, 0]
-        edges["vertex2"] = edge_array[:, 1]
-    return edges
-
-
-def write_ply_header(fp, vertex_count: int, edge_count: int = 0) -> None:
+def write_ply_header(fp, vertex_count: int, face_count: int = 0) -> None:
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
@@ -490,14 +481,18 @@ def write_ply_header(fp, vertex_count: int, edge_count: int = 0) -> None:
         "property uchar green\n"
         "property uchar blue\n"
     )
-    if edge_count > 0:
+    if face_count > 0:
         header += (
-            f"element edge {edge_count}\n"
-            "property int vertex1\n"
-            "property int vertex2\n"
+            f"element face {face_count}\n"
+            "property list uchar int vertex_indices\n"
         )
     header += "end_header\n"
     fp.write(header.encode("ascii"))
+
+
+def write_faces(fp, faces: List[Tuple[int, int, int]]) -> None:
+    for face in faces:
+        fp.write(struct.pack("<Biii", 3, face[0], face[1], face[2]))
 
 
 def camera_local_vertices(image_shape: Tuple[int, int], scale: float) -> np.ndarray:
@@ -531,36 +526,77 @@ def image_shape_from_data(data) -> Tuple[int, int]:
     raise ValueError("Cannot infer image shape for camera frustum export.")
 
 
+def auto_camera_scale(centers: np.ndarray) -> float:
+    if centers.shape[0] == 0:
+        return 0.3
+    extent = np.linalg.norm(centers.max(axis=0) - centers.min(axis=0))
+    scale_from_extent = extent * 0.02 if np.isfinite(extent) else 0.0
+    if centers.shape[0] > 1:
+        steps = np.linalg.norm(np.diff(centers, axis=0), axis=1)
+        finite_steps = steps[np.isfinite(steps) & (steps > 0)]
+        scale_from_step = np.median(finite_steps) * 0.5 if finite_steps.size else 0.0
+    else:
+        scale_from_step = 0.0
+    return float(max(scale_from_extent, scale_from_step, 0.3))
+
+
+def append_tube_segment(
+    vertices: List[np.ndarray],
+    faces: List[Tuple[int, int, int]],
+    p0: np.ndarray,
+    p1: np.ndarray,
+    radius: float,
+    color: Tuple[int, int, int],
+    sides: int = 8,
+) -> None:
+    axis = p1 - p0
+    length = np.linalg.norm(axis)
+    if not np.isfinite(length) or length <= 1e-12:
+        return
+    direction = axis / length
+    ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    if abs(float(np.dot(direction, ref))) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    u = np.cross(direction, ref)
+    u /= np.linalg.norm(u)
+    v = np.cross(direction, u)
+    angles = np.linspace(0.0, 2.0 * np.pi, sides, endpoint=False)
+    ring_offsets = radius * (
+        np.cos(angles)[:, None] * u[None, :] + np.sin(angles)[:, None] * v[None, :]
+    )
+    tube_points = np.concatenate([p0[None, :] + ring_offsets, p1[None, :] + ring_offsets])
+    base = sum(chunk.shape[0] for chunk in vertices)
+    vertices.append(pack_camera_vertices(tube_points, color))
+    for i in range(sides):
+        j = (i + 1) % sides
+        faces.append((base + i, base + j, base + sides + i))
+        faces.append((base + j, base + sides + j, base + sides + i))
+
+
 def append_camera_geometry(
     vertices: List[np.ndarray],
-    edges: List[Tuple[int, int]],
+    faces: List[Tuple[int, int, int]],
     pose: np.ndarray,
     image_shape: Tuple[int, int],
     scale: float,
+    tube_radius: float,
     color: Tuple[int, int, int],
-    previous_center_index: Optional[int],
-    connect_trajectory: bool,
-) -> int:
+) -> np.ndarray:
     rotation, translation = pose_rotation_translation(pose)
     local = camera_local_vertices(image_shape, scale)
     world = local @ rotation.T + translation
-    base = sum(chunk.shape[0] for chunk in vertices)
-    vertices.append(pack_camera_vertices(world, color))
-    edges.extend(
-        [
-            (base, base + 1),
-            (base, base + 2),
-            (base, base + 3),
-            (base, base + 4),
-            (base + 1, base + 2),
-            (base + 2, base + 3),
-            (base + 3, base + 4),
-            (base + 4, base + 1),
-        ]
-    )
-    if connect_trajectory and previous_center_index is not None:
-        edges.append((previous_center_index, base))
-    return base
+    for i, j in (
+        (0, 1),
+        (0, 2),
+        (0, 3),
+        (0, 4),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        (4, 1),
+    ):
+        append_tube_segment(vertices, faces, world[i], world[j], tube_radius, color)
+    return world[0]
 
 
 def collect_camera_geometry(
@@ -568,33 +604,52 @@ def collect_camera_geometry(
     keys: List[Tuple[int, str]],
     pose_by_index,
     args,
-) -> Tuple[np.ndarray, np.ndarray]:
-    camera_scale = 0.3
-    vertices: List[np.ndarray] = []
-    edges: List[Tuple[int, int]] = []
-    previous_center_index: Optional[int] = None
-    selected = list(enumerate(keys))
-    for order, (key_idx, key) in selected:
+) -> Tuple[np.ndarray, List[Tuple[int, int, int]]]:
+    frame_infos = []
+    centers = []
+    for key_idx, key in keys:
         data = load_frame(h5_file, key)
         pose = resolve_pose(data, key_idx, pose_by_index, args.pose_index_mode)
         image_shape = image_shape_from_data(data)
+        _, center = pose_rotation_translation(pose)
+        frame_infos.append((pose, image_shape))
+        centers.append(center)
+
+    centers_array = np.asarray(centers, dtype=np.float64)
+    camera_scale = auto_camera_scale(centers_array)
+    frustum_radius = camera_scale * 0.035
+    trajectory_radius = camera_scale * 0.025
+    vertices: List[np.ndarray] = []
+    faces: List[Tuple[int, int, int]] = []
+    previous_center: Optional[np.ndarray] = None
+    for order, (pose, image_shape) in enumerate(frame_infos):
         color = (255, 128, 0) if order == 0 else (0, 180, 255)
-        previous_center_index = append_camera_geometry(
+        center = append_camera_geometry(
             vertices,
-            edges,
+            faces,
             pose,
             image_shape,
             camera_scale,
+            frustum_radius,
             color,
-            previous_center_index,
-            True,
         )
+        if previous_center is not None:
+            append_tube_segment(
+                vertices,
+                faces,
+                previous_center,
+                center,
+                trajectory_radius,
+                (255, 64, 64),
+            )
+        previous_center = center
     vertex_count = sum(chunk.shape[0] for chunk in vertices)
-    edge_count = len(edges)
     camera_vertices = np.concatenate(vertices) if vertices else np.empty(0, dtype=PLY_DTYPE)
-    camera_edges = pack_edges(edges)
-    print(f"Prepared {vertex_count} camera vertices and {edge_count} trajectory/frustum edges.")
-    return camera_vertices, camera_edges
+    print(
+        f"Prepared {vertex_count} camera/trajectory mesh vertices and {len(faces)} faces "
+        f"(camera scale {camera_scale:.6g})."
+    )
+    return camera_vertices, faces
 
 
 def resolve_pose(
@@ -759,28 +814,34 @@ def main():
             total_vertices += count_frame_points(data, key_idx, pose_by_index, args, K)
 
         camera_vertices = np.empty(0, dtype=PLY_DTYPE)
-        camera_edges = np.empty(0, dtype=PLY_EDGE_DTYPE)
+        camera_faces: List[Tuple[int, int, int]] = []
         if args.export_cameras:
-            camera_vertices, camera_edges = collect_camera_geometry(
+            camera_vertices, camera_faces = collect_camera_geometry(
                 h5_file,
                 keys,
                 pose_by_index,
                 args,
             )
-            if camera_edges.shape[0] > 0:
-                camera_edges = camera_edges.copy()
-                camera_edges["vertex1"] += total_vertices
-                camera_edges["vertex2"] += total_vertices
+            if camera_faces:
+                camera_faces = [
+                    (
+                        face[0] + total_vertices,
+                        face[1] + total_vertices,
+                        face[2] + total_vertices,
+                    )
+                    for face in camera_faces
+                ]
 
         output_vertex_count = total_vertices + camera_vertices.shape[0]
         print(
-            f"Writing {total_vertices} points and {camera_vertices.shape[0]} camera vertices "
+            f"Writing {total_vertices} points, {camera_vertices.shape[0]} camera vertices, "
+            f"and {len(camera_faces)} camera/trajectory faces "
             f"to {output_path}."
         )
 
         bounds = None
         with open(output_path, "wb") as fp:
-            write_ply_header(fp, output_vertex_count, camera_edges.shape[0])
+            write_ply_header(fp, output_vertex_count, len(camera_faces))
             for key_idx, _, data in iter_frame_data(h5_file, keys):
                 points_world, colors = transformed_frame_arrays(
                     data, key_idx, pose_by_index, args, K
@@ -788,7 +849,7 @@ def main():
                 bounds = update_bounds(bounds, points_world)
                 pack_vertices(points_world, colors).tofile(fp)
             camera_vertices.tofile(fp)
-            camera_edges.tofile(fp)
+            write_faces(fp, camera_faces)
 
         if bounds is None:
             print("No finite world points were exported.")
