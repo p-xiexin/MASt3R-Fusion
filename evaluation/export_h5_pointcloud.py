@@ -18,6 +18,7 @@ PLY_DTYPE = np.dtype(
         ("blue", "u1"),
     ]
 )
+PLY_EDGE_DTYPE = np.dtype([("vertex1", "<i4"), ("vertex2", "<i4")])
 
 
 def parse_args():
@@ -148,6 +149,20 @@ def parse_args():
         type=float,
         default=0.1,
         help="Slant threshold used by --match-trianglemap, matching trianglemap.glsl.",
+    )
+    parser.add_argument(
+        "--max-world-abs",
+        type=float,
+        default=0.0,
+        help=(
+            "Drop transformed world points whose absolute coordinate exceeds this value. "
+            "Use <= 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--export-cameras",
+        action="store_true",
+        help="Also export a separate PLY with camera frustums and trajectory edges.",
     )
     return parser.parse_args()
 
@@ -305,6 +320,11 @@ def pose_to_world(points: np.ndarray, pose: np.ndarray) -> np.ndarray:
     return points.astype(np.float64, copy=False) @ rotation.T + translation
 
 
+def pose_rotation_translation(pose: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    pose = normalize_pose(pose)
+    return quaternion_to_matrix(pose[3:7]), pose[:3].astype(np.float64, copy=False)
+
+
 def pose_scale(pose: np.ndarray) -> float:
     return float(normalize_pose(pose)[7])
 
@@ -441,6 +461,23 @@ def pack_vertices(points: np.ndarray, colors: np.ndarray) -> np.ndarray:
     return vertices
 
 
+def pack_camera_vertices(points: np.ndarray, color: Tuple[int, int, int]) -> np.ndarray:
+    colors = np.empty((points.shape[0], 3), dtype=np.uint8)
+    colors[:, 0] = color[0]
+    colors[:, 1] = color[1]
+    colors[:, 2] = color[2]
+    return pack_vertices(points, colors)
+
+
+def pack_edges(edge_pairs: List[Tuple[int, int]]) -> np.ndarray:
+    edges = np.empty(len(edge_pairs), dtype=PLY_EDGE_DTYPE)
+    if edge_pairs:
+        edge_array = np.asarray(edge_pairs, dtype=np.int32)
+        edges["vertex1"] = edge_array[:, 0]
+        edges["vertex2"] = edge_array[:, 1]
+    return edges
+
+
 def write_ply_header(fp, vertex_count: int) -> None:
     header = (
         "ply\n"
@@ -455,6 +492,130 @@ def write_ply_header(fp, vertex_count: int) -> None:
         "end_header\n"
     )
     fp.write(header.encode("ascii"))
+
+
+def write_camera_ply_header(fp, vertex_count: int, edge_count: int) -> None:
+    header = (
+        "ply\n"
+        "format binary_little_endian 1.0\n"
+        f"element vertex {vertex_count}\n"
+        "property float x\n"
+        "property float y\n"
+        "property float z\n"
+        "property uchar red\n"
+        "property uchar green\n"
+        "property uchar blue\n"
+        f"element edge {edge_count}\n"
+        "property int vertex1\n"
+        "property int vertex2\n"
+        "end_header\n"
+    )
+    fp.write(header.encode("ascii"))
+
+
+def camera_output_path(output_path: pathlib.Path) -> pathlib.Path:
+    return output_path.with_name(f"{output_path.stem}_cameras.ply")
+
+
+def camera_local_vertices(image_shape: Tuple[int, int], scale: float) -> np.ndarray:
+    h, w = image_shape
+    aspect = max(float(w) / max(float(h), 1.0), 1e-6)
+    half_w = scale * aspect
+    half_h = scale
+    depth = scale * 1.5
+    return np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [-half_w, -half_h, depth],
+            [half_w, -half_h, depth],
+            [half_w, half_h, depth],
+            [-half_w, half_h, depth],
+        ],
+        dtype=np.float64,
+    )
+
+
+def image_shape_from_data(data) -> Tuple[int, int]:
+    if "uimg" in data:
+        image = to_numpy(data["uimg"])
+        return int(image.shape[0]), int(image.shape[1])
+    if "img_shape" in data:
+        shape = to_numpy(data["img_shape"]).reshape(-1)
+        return int(shape[0]), int(shape[1])
+    points = to_numpy(data["X"])
+    if points.ndim >= 3:
+        return int(points.shape[-3]), int(points.shape[-2])
+    raise ValueError("Cannot infer image shape for camera frustum export.")
+
+
+def append_camera_geometry(
+    vertices: List[np.ndarray],
+    edges: List[Tuple[int, int]],
+    pose: np.ndarray,
+    image_shape: Tuple[int, int],
+    scale: float,
+    color: Tuple[int, int, int],
+    previous_center_index: Optional[int],
+    connect_trajectory: bool,
+) -> int:
+    rotation, translation = pose_rotation_translation(pose)
+    local = camera_local_vertices(image_shape, scale)
+    world = local @ rotation.T + translation
+    base = sum(chunk.shape[0] for chunk in vertices)
+    vertices.append(pack_camera_vertices(world, color))
+    edges.extend(
+        [
+            (base, base + 1),
+            (base, base + 2),
+            (base, base + 3),
+            (base, base + 4),
+            (base + 1, base + 2),
+            (base + 2, base + 3),
+            (base + 3, base + 4),
+            (base + 4, base + 1),
+        ]
+    )
+    if connect_trajectory and previous_center_index is not None:
+        edges.append((previous_center_index, base))
+    return base
+
+
+def write_camera_ply(
+    path: pathlib.Path,
+    h5_file,
+    keys: List[Tuple[int, str]],
+    pose_by_index,
+    args,
+) -> None:
+    camera_scale = 0.3
+    path.parent.mkdir(exist_ok=True, parents=True)
+    vertices: List[np.ndarray] = []
+    edges: List[Tuple[int, int]] = []
+    previous_center_index: Optional[int] = None
+    selected = list(enumerate(keys))
+    for order, (key_idx, key) in selected:
+        data = load_frame(h5_file, key)
+        pose = resolve_pose(data, key_idx, pose_by_index, args.pose_index_mode)
+        image_shape = image_shape_from_data(data)
+        color = (255, 128, 0) if order == 0 else (0, 180, 255)
+        previous_center_index = append_camera_geometry(
+            vertices,
+            edges,
+            pose,
+            image_shape,
+            camera_scale,
+            color,
+            previous_center_index,
+            True,
+        )
+    vertex_count = sum(chunk.shape[0] for chunk in vertices)
+    edge_count = len(edges)
+    print(f"Writing {vertex_count} camera vertices and {edge_count} edges to {path}.")
+    with open(path, "wb") as fp:
+        write_camera_ply_header(fp, vertex_count, edge_count)
+        if vertices:
+            np.concatenate(vertices).tofile(fp)
+        pack_edges(edges).tofile(fp)
 
 
 def resolve_pose(
@@ -473,27 +634,13 @@ def resolve_pose(
     return normalize_pose(data["T_WC"])
 
 
-def count_frame_points(data, key_idx: int, pose_by_index, args, K: Optional[np.ndarray]) -> int:
-    pose = resolve_pose(data, key_idx, pose_by_index, args.pose_index_mode)
-    points, _, conf, image_shape = frame_arrays(data, K)
-    points = points * pose_scale(pose)
-    mask = valid_mask(
-        points,
-        conf,
-        image_shape,
-        args.conf_threshold,
-        args.min_depth,
-        args.max_depth,
-        args.match_surfelmap,
-        args.match_trianglemap,
-        args.slant_threshold,
-    )
-    if args.stride > 1:
-        mask = mask[:: args.stride]
-    return int(mask.sum())
-
-
-def transformed_frame_vertices(data, key_idx: int, pose_by_index, args, K: Optional[np.ndarray]) -> np.ndarray:
+def transformed_frame_arrays(
+    data,
+    key_idx: int,
+    pose_by_index,
+    args,
+    K: Optional[np.ndarray],
+) -> Tuple[np.ndarray, np.ndarray]:
     pose = resolve_pose(data, key_idx, pose_by_index, args.pose_index_mode)
     points, colors, conf, image_shape = frame_arrays(data, K)
     # check_h5.py multiplies X by the Sim3 scale, then sets pose scale to 1.0.
@@ -516,7 +663,33 @@ def transformed_frame_vertices(data, key_idx: int, pose_by_index, args, K: Optio
     points = points[mask]
     colors = colors[mask]
     points_world = pose_to_world(points, pose)
+    world_mask = np.isfinite(points_world).all(axis=1)
+    if args.max_world_abs > 0:
+        world_mask &= np.max(np.abs(points_world), axis=1) <= args.max_world_abs
+    return points_world[world_mask], colors[world_mask]
+
+
+def count_frame_points(data, key_idx: int, pose_by_index, args, K: Optional[np.ndarray]) -> int:
+    points_world, _ = transformed_frame_arrays(data, key_idx, pose_by_index, args, K)
+    return int(points_world.shape[0])
+
+
+def transformed_frame_vertices(data, key_idx: int, pose_by_index, args, K: Optional[np.ndarray]) -> np.ndarray:
+    points_world, colors = transformed_frame_arrays(data, key_idx, pose_by_index, args, K)
     return pack_vertices(points_world, colors)
+
+
+def update_bounds(
+    bounds: Optional[Tuple[np.ndarray, np.ndarray]],
+    points: np.ndarray,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if points.shape[0] == 0:
+        return bounds
+    cur_min = points.min(axis=0)
+    cur_max = points.max(axis=0)
+    if bounds is None:
+        return cur_min, cur_max
+    return np.minimum(bounds[0], cur_min), np.maximum(bounds[1], cur_max)
 
 
 def iter_frame_data(h5_file, keys: Iterable[Tuple[int, str]]):
@@ -607,10 +780,33 @@ def main():
             total_vertices += count_frame_points(data, key_idx, pose_by_index, args, K)
         print(f"Writing {total_vertices} points to {output_path}.")
 
+        bounds = None
         with open(output_path, "wb") as fp:
             write_ply_header(fp, total_vertices)
             for key_idx, _, data in iter_frame_data(h5_file, keys):
-                transformed_frame_vertices(data, key_idx, pose_by_index, args, K).tofile(fp)
+                points_world, colors = transformed_frame_arrays(
+                    data, key_idx, pose_by_index, args, K
+                )
+                bounds = update_bounds(bounds, points_world)
+                pack_vertices(points_world, colors).tofile(fp)
+
+        if bounds is None:
+            print("No finite world points were exported.")
+        else:
+            print(
+                "World bounds: "
+                f"min=({bounds[0][0]:.6g}, {bounds[0][1]:.6g}, {bounds[0][2]:.6g}), "
+                f"max=({bounds[1][0]:.6g}, {bounds[1][1]:.6g}, {bounds[1][2]:.6g})"
+            )
+
+        if args.export_cameras:
+            write_camera_ply(
+                camera_output_path(output_path),
+                h5_file,
+                keys,
+                pose_by_index,
+                args,
+            )
 
     print("Done.")
 
