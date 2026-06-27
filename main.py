@@ -13,6 +13,7 @@ from mast3r_fusion.global_opt import FactorGraph
 from mast3r_fusion.config import load_config, config, set_global_config
 from mast3r_fusion.dataloader import Intrinsics, load_dataset
 import mast3r_fusion.evaluate as eval
+from mast3r_fusion.foxglove_debug import run_foxglove_publisher
 from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
 from mast3r_fusion.frontend_model import load_frontend_model
 from mast3r_fusion.mast3r_utils import load_retriever
@@ -165,6 +166,10 @@ if __name__ == "__main__":
     parser.add_argument("--save_h5", action="store_true")
     parser.add_argument("--frontend-model", choices=["mast3r", "pi3", "pi3x"], default=None)
     parser.add_argument("--frontend-weights", default=None)
+    parser.add_argument("--foxglove", action="store_true", help="Enable Foxglove WebSocket debug publisher.")
+    parser.add_argument("--foxglove-host", default="127.0.0.1")
+    parser.add_argument("--foxglove-port", type=int, default=8765)
+    parser.add_argument("--foxglove-hz", type=float, default=5.0)
 
 
     args = parser.parse_args()
@@ -217,6 +222,25 @@ if __name__ == "__main__":
             args=(config, states, keyframes, main2viz, viz2main),
         )
         viz.start()
+
+    if args.foxglove:
+        foxglove = mp.Process(
+            target=run_foxglove_publisher,
+            args=(
+                config,
+                states,
+                keyframes,
+                args.calib,
+                args.foxglove_host,
+                args.foxglove_port,
+                args.foxglove_hz,
+                1.5,
+                120000,
+                10,
+                70,
+            ),
+        )
+        foxglove.start()
 
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]
@@ -444,25 +468,27 @@ if __name__ == "__main__":
         i += 1
 
 
-    # finally 
-    last_pin = factor_graph.get_unique_kf_idx()[-1]
-    for iframe in range(factor_graph.last_pin,last_pin+1):
-        frame_temp = keyframes[iframe] 
-        buffer = io.BytesIO()
-        torch.save({
-            'feat': frame_temp.feat.cpu(), 
-            'pos': frame_temp.pos.cpu(),   
-            'X': frame_temp.X_canon.cpu(),
-            'C': frame_temp.C.cpu(),
-            'K': frame_temp.K.cpu(),
-            'N': frame_temp.N,
-            'uimg': (frame_temp.uimg * 255).to(torch.uint8).cpu().numpy(),
-            'img_shape': frame_temp.img_shape.cpu(),
-            'T_WC': frame_temp.T_WC.data.cpu(),
-            'id': frame_temp.frame_id,
-        }, buffer)
-        buffer.seek(0)
-        f_h5.create_dataset(f"frame_{iframe}", data=np.void(buffer.read()))
+    # finally
+    if args.save_h5:
+        last_pin = factor_graph.get_unique_kf_idx()[-1]
+        for iframe in range(factor_graph.last_pin,last_pin+1):
+            frame_temp = keyframes[iframe] 
+            buffer = io.BytesIO()
+            torch.save({
+                'feat': frame_temp.feat.cpu(), 
+                'pos': frame_temp.pos.cpu(),   
+                'X': frame_temp.X_canon.cpu(),
+                'C': frame_temp.C.cpu(),
+                'K': frame_temp.K.cpu(),
+                'N': frame_temp.N,
+                'uimg': (frame_temp.uimg * 255).to(torch.uint8).cpu().numpy(),
+                'img_shape': frame_temp.img_shape.cpu(),
+                'T_WC': frame_temp.T_WC.data.cpu(),
+                'id': frame_temp.frame_id,
+            }, buffer)
+            buffer.seek(0)
+            f_h5.create_dataset(f"frame_{iframe}", data=np.void(buffer.read()))
+        f_h5.close()
 
     factor_graph.save_graph('graph.pkl')
 
@@ -490,3 +516,5 @@ if __name__ == "__main__":
     states.set_mode(Mode.TERMINATED)
     if not args.no_viz:
         viz.join()
+    if args.foxglove:
+        foxglove.join()

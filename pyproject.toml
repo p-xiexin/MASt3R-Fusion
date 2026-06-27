@@ -13,6 +13,8 @@ dependencies = [
     "natsort",
     "pykdtree",
     "torchcodec==0.1",
+    "foxglove-websocket==0.1.4",
+    "websockets==10.4",
     "lietorch @ git+https://github.com/princeton-vl/lietorch.git",
     "plyfile",
 ]
