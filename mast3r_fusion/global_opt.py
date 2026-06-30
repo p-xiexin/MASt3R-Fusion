@@ -229,6 +229,53 @@ class FactorGraph:
         self.transform_world = False
 
         self.all_factors = []
+        self.sparse_pose_edges = []
+        self.sparse_pose_edge_keys = set()
+
+    def add_sparse_pose_edges(self, edges, noise_sigmas=None, relative_poses=None):
+        edges = list(edges)
+        if noise_sigmas is None:
+            noise_sigmas = config.get("lifecycle", {}).get(
+                "sparse_pose_noise",
+                [0.2, 0.2, 0.2, 0.05, 0.05, 0.05],
+            )
+        noise_sigmas = np.asarray(noise_sigmas, dtype=np.float64)
+        if relative_poses is None:
+            relative_poses = [None] * len(edges)
+        elif len(relative_poses) != len(edges):
+            raise ValueError(
+                "relative_poses must have the same length as sparse pose edges: "
+                f"{len(relative_poses)} != {len(edges)}"
+            )
+        for (ii, jj), relative_pose in zip(edges, relative_poses):
+            if ii == jj:
+                continue
+            key = (int(ii), int(jj))
+            if key in self.sparse_pose_edge_keys:
+                continue
+            if relative_pose is None:
+                T_i = self._frame_pose_matrix(self.frames[ii])
+                T_j = self._frame_pose_matrix(self.frames[jj])
+                T_ij = np.linalg.inv(T_i) @ T_j
+            else:
+                T_ij = np.asarray(relative_pose, dtype=np.float64)
+                if T_ij.shape != (4, 4):
+                    raise ValueError(f"Sparse pose edge must be a 4x4 matrix, got {T_ij.shape}")
+            self.sparse_pose_edges.append((int(ii), int(jj), T_ij, noise_sigmas.copy()))
+            self.sparse_pose_edge_keys.add(key)
+
+    @staticmethod
+    def _frame_pose_matrix(frame):
+        T = frame.T_WC.matrix()
+        if T.ndim == 3:
+            T = T[0]
+        T = T.detach().cpu().numpy().copy()
+        data = frame.T_WC.data.detach().cpu().numpy().reshape(-1, frame.T_WC.data.shape[-1])
+        scale = data[0, -1]
+        if np.isfinite(scale) and abs(scale) > 1e-8:
+            T[:3, :3] /= scale
+        T[3] = np.array([0, 0, 0, 1], dtype=T.dtype)
+        return T
 
 
     def save_graph(self, path):
@@ -857,6 +904,21 @@ class FactorGraph:
                 cur_graph.add(h_factor)
             for factor in prior_factors:
                 cur_graph.add(factor)
+            for edge_i, edge_j, T_ij, sigmas in self.sparse_pose_edges:
+                if edge_i < pin or edge_j < pin:
+                    continue
+                local_i = edge_i - pin
+                local_j = edge_j - pin
+                if local_i >= T_WCs.shape[0] or local_j >= T_WCs.shape[0]:
+                    continue
+                cur_graph.add(
+                    gtsam.BetweenFactorPose3(
+                        X(local_i),
+                        X(local_j),
+                        gtsam.Pose3(T_ij),
+                        gtsam.noiseModel.Diagonal.Sigmas(sigmas),
+                    )
+                )
             # print(time.time())
             # print('time4',time.time())
             

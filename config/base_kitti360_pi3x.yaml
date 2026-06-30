@@ -1,25 +1,42 @@
 inherit: config/base_kitti360.yaml
 
 dataset:
-  # Pi3X uses patch size 14. Crop/resize images to a fixed H,W target and
-  # update Intrinsics.K_frame with the same transform.
-  target_img_size: [378, 504]
+  # Pi3X uses patch size 14. Keep KITTI-360's wide aspect ratio while using
+  # 14-multiple dimensions and updating Intrinsics.K_frame with the same transform.
+  target_img_size: [224, 840]
 
 frontend_model:
   name: pi3x
   weights: checkpoints/pi3x/model.safetensors
 
+cotracker:
+  checkpoint: null
+  grid_size: 32
+  max_points: 1200
+
+lifecycle:
+  enabled: true
+  window_size: 4
+  overlap_size: 2
+  oldest_visibility_threshold: 0.4
+  min_trigger_gap: 4
+  sparse_pose_noise: [0.2, 0.2, 0.2, 0.05, 0.05, 0.05]
+
 pi3x:
+  window_size: 4
+  min_window_size: 3
   match_conf_threshold: 0.3
   # Optional Pi3X multimodal conditioning. Keep these as experiment switches:
-  # intrinsics is usually the safest prior. imu_predict enables IMU-predicted
-  # pose prior.
-  use_intrinsics_prior: false
+  # intrinsics is usually the safest prior. use_pose_prior feeds the current
+  # SLAM trajectory into PI3X lifecycle reconstruction; imu_predict is only for
+  # IMU-predicted online pose conditioning.
+  use_intrinsics_prior: true
+  use_pose_prior: true
   imu_predict: false
   pose_prior_max_dt: 5.0
 
 matching:
-  # Pi3X does not expose MASt3R descriptors; RGB fallback descriptors are weak.
+  # Pi3X matching uses geometric projection from point maps and camera poses.
   # Start without descriptor-neighborhood refinement for first server tests.
   radius: 0
 
@@ -28,8 +45,27 @@ tracking:
   Q_conf: 0.3
   min_match_frac: 0.01
 
+light_tracking:
+  enabled: true
+  pose_only: true
+  detector: xfeat
+  max_pts: 1200
+  match_top_k: 1200
+  match_min_cossim: 0.75
+  fb_err: 2.0
+  map_size: 4
+  min_pts: 40
+  min_inliers: 25
+  min_ratio: 0.2
+  min_conf: 0.2
+  pnp_err: 4.0
+  kf_gap: 5
+  kf_parallax: 20.0
+
 local_opt:
+  n_consec: 3
   Q_conf: 0.3
 
 ms_opt:
+  enable_vi_init: false
   subpixel_factor: 1

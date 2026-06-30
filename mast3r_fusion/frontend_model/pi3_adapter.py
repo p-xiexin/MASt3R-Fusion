@@ -1,5 +1,3 @@
-import torch
-
 from mast3r_fusion.frontend_model.base import (
     FeatureSpec,
     FeedForwardFrontend,
@@ -10,6 +8,7 @@ from mast3r_fusion.frontend_model.pi3x_utils import (
     encode_frame_pi3x,
     load_pi3x,
     pi3x_decode_symmetric_batch,
+    pi3x_inference_window,
     pi3x_inference_mono,
     pi3x_match_asymmetric,
     pi3x_match_symmetric,
@@ -78,17 +77,15 @@ class PI3Adapter(FeedForwardFrontend):
         )
 
     def infer_window(self, frames):
-        pointmaps = []
-        confidences = []
-        for frame in frames:
-            X, C = self.infer_single(frame)
-            pointmaps.append(X)
-            confidences.append(C)
+        pointmaps, confidences, camera_poses = pi3x_inference_window(self.model, frames)
         return WindowInferenceResult(
             frames=frames,
-            pointmaps=torch.stack(pointmaps),
-            confidences=torch.stack(confidences),
-            metadata={"source": "pi3x-pair-self-inference"},
+            pointmaps=pointmaps,
+            confidences=confidences,
+            metadata={
+                "source": "pi3x-window-inference",
+                "camera_poses": camera_poses,
+            },
         )
 
     def build_pair_constraints_from_window(self, frames, edges, **kwargs):

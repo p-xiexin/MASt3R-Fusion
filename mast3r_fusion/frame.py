@@ -141,6 +141,9 @@ class SharedStates:
         self.global_optimizer_tasks = manager.list()
         self.edges_ii = manager.list()
         self.edges_jj = manager.list()
+        self.track_prev_xy = manager.list()
+        self.track_curr_xy = manager.list()
+        self.track_ages = manager.list()
 
         self.feat_dim = getattr(feature_spec, "feat_dim", 1024)
         if feature_spec is not None:
@@ -194,6 +197,18 @@ class SharedStates:
     def queue_global_optimization(self, idx):
         with self.lock:
             self.global_optimizer_tasks.append(idx)
+
+    def set_tracking_overlay(self, prev_xy, curr_xy, ages):
+        with self.lock:
+            self.track_prev_xy[:] = [float(v) for xy in prev_xy for v in xy]
+            self.track_curr_xy[:] = [float(v) for xy in curr_xy for v in xy]
+            self.track_ages[:] = [int(v) for v in ages]
+
+    def clear_tracking_overlay(self):
+        with self.lock:
+            self.track_prev_xy[:] = []
+            self.track_curr_xy[:] = []
+            self.track_ages[:] = []
 
     def queue_reloc(self):
         with self.lock:

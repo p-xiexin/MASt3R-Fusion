@@ -1,3 +1,5 @@
+import cv2
+import numpy as np
 import torch
 from mast3r_fusion.frame import Frame
 from mast3r_fusion.geometry import (
@@ -20,6 +22,11 @@ class FrameTracker:
         self.device = device
 
         self.reset_idx_f2k()
+        self.latest_tracking_overlay = ([], [], [])
+        self._age_keyframe_id = None
+        self._source_track_ages = {}
+        self._last_frame_id = None
+        self._last_dst_track_ages = {}
         self.fp = open('tracker.log','wt')
 
     # Initialize with identity indexing of size (1,n)
@@ -65,19 +72,25 @@ class FrameTracker:
         else:
             K = None
 
-        # Get poses and point correspondneces and confidences
+        # Get valid
+        # Use canonical confidence average
         Xf, Xk, T_WCf, T_WCk, Cf, Ck, meas_k, valid_meas_k = self.get_points_poses(
             frame, keyframe, idx_f2k, img_size, use_calib, K
         )
-
-        # Get valid
-        # Use canonical confidence average
         valid_Cf = Cf > self.cfg["C_conf"]
         valid_Ck = Ck > self.cfg["C_conf"]
         valid_Q = Qk > self.cfg["Q_conf"]
+        ransac_mask = self._ransac_match_mask(keyframe, idx_f2k, valid_match_k[:, 0], K if use_calib else None)
+        valid_match_k = valid_match_k & ransac_mask[:, None]
 
         valid_opt = valid_match_k & valid_Cf & valid_Ck & valid_Q
         valid_kf = valid_match_k & valid_Q
+        self.latest_tracking_overlay = self._make_tracking_overlay(
+            keyframe,
+            frame,
+            idx_f2k,
+            valid_kf[:, 0],
+        )
 
         match_frac = valid_opt.sum() / valid_opt.numel()
         if match_frac < self.cfg["min_match_frac"]:
@@ -175,6 +188,99 @@ class FrameTracker:
             meas_k[~valid_meas_k.repeat(1, 3)] = 0.0
 
         return Xf[idx_f2k], Xk, T_WCf, T_WCk, Cf[idx_f2k], Ck, meas_k, valid_meas_k
+
+    def _make_tracking_overlay(self, keyframe, frame, idx_f2k, valid, max_tracks=1200):
+        if valid.numel() == 0 or not valid.any():
+            self._last_frame_id = int(frame.frame_id)
+            self._last_dst_track_ages = {}
+            return [], [], []
+        h, w = [int(v) for v in keyframe.uimg.shape[:2]]
+        self._prepare_track_age_cache(keyframe)
+        src_lin = torch.nonzero(valid, as_tuple=False).flatten()
+        dst_lin = idx_f2k[src_lin]
+
+        current_source_ages = {}
+        current_dst_ages = {}
+        src_ids = src_lin.detach().cpu().tolist()
+        dst_ids = dst_lin.detach().cpu().tolist()
+        for src_id, dst_id in zip(src_ids, dst_ids):
+            age = int(self._source_track_ages.get(int(src_id), 0)) + 1
+            current_source_ages[int(src_id)] = age
+            current_dst_ages[int(dst_id)] = max(age, current_dst_ages.get(int(dst_id), 0))
+        self._source_track_ages = current_source_ages
+        self._last_frame_id = int(frame.frame_id)
+        self._last_dst_track_ages = current_dst_ages
+
+        if src_lin.numel() > max_tracks:
+            step = max(1, src_lin.numel() // max_tracks)
+            src_lin = src_lin[::step][:max_tracks]
+            dst_lin = dst_lin[::step][:max_tracks]
+        src_x = (src_lin % w).detach().cpu().numpy()
+        src_y = (src_lin // w).detach().cpu().numpy()
+        dst_x = (dst_lin % w).detach().cpu().numpy()
+        dst_y = (dst_lin // w).detach().cpu().numpy()
+        prev_xy = list(zip(src_x.tolist(), src_y.tolist()))
+        curr_xy = list(zip(dst_x.tolist(), dst_y.tolist()))
+        ages = [current_source_ages.get(int(src_id), 1) for src_id in src_lin.detach().cpu().tolist()]
+        return prev_xy, curr_xy, ages
+
+    def _prepare_track_age_cache(self, keyframe):
+        keyframe_id = int(keyframe.frame_id)
+        if self._age_keyframe_id == keyframe_id:
+            return
+        if self._last_frame_id == keyframe_id:
+            self._source_track_ages = dict(self._last_dst_track_ages)
+        else:
+            self._source_track_ages = {}
+        self._age_keyframe_id = keyframe_id
+
+    def _ransac_match_mask(self, keyframe, idx_f2k, valid, K=None):
+        if not self.cfg.get("ransac_filter", False):
+            return torch.ones_like(valid, dtype=torch.bool)
+        src_lin = torch.nonzero(valid, as_tuple=False).flatten()
+        min_matches = int(self.cfg.get("ransac_min_matches", 30))
+        if src_lin.numel() < min_matches:
+            return torch.zeros_like(valid, dtype=torch.bool)
+
+        h, w = [int(v) for v in keyframe.uimg.shape[:2]]
+        dst_lin = idx_f2k[src_lin]
+        src = torch.stack((src_lin % w, src_lin // w), dim=1).detach().cpu().numpy().astype(np.float32)
+        dst = torch.stack((dst_lin % w, dst_lin // w), dim=1).detach().cpu().numpy().astype(np.float32)
+        threshold = float(self.cfg.get("ransac_reproj_thresh", 2.0))
+        confidence = float(self.cfg.get("ransac_confidence", 0.999))
+
+        try:
+            if K is not None:
+                K_np = K.detach().cpu().numpy().astype(np.float64)
+                _, inliers = cv2.findEssentialMat(
+                    src,
+                    dst,
+                    K_np,
+                    method=cv2.RANSAC,
+                    prob=confidence,
+                    threshold=threshold,
+                )
+            else:
+                _, inliers = cv2.findFundamentalMat(
+                    src,
+                    dst,
+                    method=cv2.FM_RANSAC,
+                    ransacReprojThreshold=threshold,
+                    confidence=confidence,
+                )
+        except cv2.error:
+            return torch.zeros_like(valid, dtype=torch.bool)
+
+        if inliers is None:
+            return torch.zeros_like(valid, dtype=torch.bool)
+        inliers = inliers.reshape(-1).astype(bool)
+        min_inliers = int(self.cfg.get("ransac_min_inliers", min_matches))
+        if int(inliers.sum()) < min_inliers:
+            return torch.zeros_like(valid, dtype=torch.bool)
+        mask = torch.zeros_like(valid, dtype=torch.bool)
+        inliers = torch.as_tensor(inliers, device=src_lin.device, dtype=torch.bool)
+        mask[src_lin[inliers]] = True
+        return mask
 
     def solve(self, sqrt_info, r, J):
         whitened_r = sqrt_info * r

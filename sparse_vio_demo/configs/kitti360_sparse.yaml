@@ -1,0 +1,77 @@
+dataset:
+  image_dir: data/KITTI-360/2013_05_28_drive_0000_sync/image_00/data_rgb
+  stamp_path: data/KITTI-360/2013_05_28_drive_0000_sync/camstamp.txt
+  calib: config/intrinsics_kitti360.yaml
+  start: 0
+  end: -1
+  subsample: 1
+
+imu:
+  use_imu: true
+  path: data/KITTI-360/2013_05_28_drive_0000_sync/imu.txt
+  dt: -0.04
+  gyro_unit: deg
+
+frontend:
+  type: vins # vins or xfeat
+  max_features: 400
+  min_distance: 20
+  keyframe_gap: 5
+  keyframe_parallax: 20.0
+  fb_thresh: 0.5
+  reject_with_f: false
+  f_ransac_thresh: 1.5
+  xfeat_top_k: 1200
+  xfeat_min_cossim: 0.82
+  xfeat_refill_ratio: 0.95
+  xfeat_geo_ransac_thresh: 1.0
+  xfeat_min_geo_inliers: 60
+  xfeat_strong_geo_inliers: 90
+  xfeat_min_geo_ratio: 0.40
+
+backend:
+  window_size: 8
+  min_triangulation_parallax: 8.0
+  min_track_observations: 3
+  max_ba_iters: 5
+  max_ba_points: 160
+  robust_reprojection: false
+  vi_init_min_keyframes: 8
+  vi_init_min_points: 50
+  vi_init_min_baseline: 0.05
+  accel_noise_sigma: 0.08
+  gyro_noise_sigma: 0.004
+  accel_bias_rw_sigma: 0.0004
+  gyro_bias_rw_sigma: 0.00002
+  marginal_pose_sigma: 0.03
+  marginal_velocity_sigma: 0.3
+  marginal_bias_sigma: 0.001
+  marginal_point_sigma: 0.2
+  final_global_ba: false
+  max_global_ba_points: 1600
+  max_global_ba_iters: 8
+  min_pnp_inliers: 30
+  min_pnp_inlier_ratio: 0.2
+  max_pnp_reproj_rmse: 3.5
+  max_init_rotation_deg: 12.0
+  max_init_translation_factor: 4.0
+  max_init_translation_abs: 8.0
+  vo_init_translation: 0.25
+  vo_max_translation: 0.6
+  vo_pose_prior_rot_sigma: 0.03
+  vo_pose_prior_trans_sigma: 0.05
+  odom_prior_rot_sigma: 0.05
+  odom_prior_trans_sigma: 0.03
+
+viz:
+  out_dir: sparse_vio_demo/output/kitti360
+  result_tum: sparse_vio_demo/output/kitti360/estimate.tum
+  trajectory_frame: body
+  write_video: true
+  foxglove:
+    enabled: false
+    host: 127.0.0.1
+    port: 8765
+    jpeg_quality: 85
+    publish_every: 1
+    max_points: 3000

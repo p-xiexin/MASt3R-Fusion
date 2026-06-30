@@ -141,9 +141,10 @@ python main.py ... --no-viz --foxglove
 ```
 
 It listens on `127.0.0.1:8765` by default and publishes `/current_pose`, `/trajectory`,
-`/keyframe_points`, `/current_image`, and `/graph_edges`. From a local machine, forward
+`/live_trajectory`, `/current_points`, `/keyframe_points`, `/current_image`,
+`/current_camera_calibration`, and `/graph_edges`. From a local machine, forward
 the port with `ssh -L 8765:127.0.0.1:8765 user@server`, then connect Foxglove to
-`ws://127.0.0.1:8765`. Reduce `--foxglove-hz` if the SSH tunnel becomes saturated.
+`ws://127.0.0.1:8765`.
 
 ---
 

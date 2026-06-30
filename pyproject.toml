@@ -17,6 +17,7 @@ dependencies = [
     "websockets==10.4",
     "lietorch @ git+https://github.com/princeton-vl/lietorch.git",
     "plyfile",
+    "cotracker @ git+https://github.com/facebookresearch/co-tracker.git",
 ]
 
 [tool.setuptools.packages.find]

@@ -15,7 +15,16 @@ DEFAULT_PI3X_WEIGHTS = "checkpoints/pi3x/model.safetensors"
 
 def _prior_enabled():
     cfg = config.get("pi3x", {})
-    return bool(cfg.get("use_intrinsics_prior", False) or cfg.get("imu_predict", False))
+    return bool(
+        cfg.get("use_intrinsics_prior", False)
+        or cfg.get("use_pose_prior", False)
+        or cfg.get("imu_predict", False)
+    )
+
+
+def _pose_prior_enabled():
+    cfg = config.get("pi3x", {})
+    return bool(cfg.get("use_pose_prior", False) or cfg.get("imu_predict", False))
 
 
 def _patch_pi3x_rope_contiguous(model):
@@ -153,6 +162,7 @@ def _stack_frame_intrinsics(frames, images):
     pi3x_cfg = config.get("pi3x", {})
     if not (
         pi3x_cfg.get("use_intrinsics_prior", False)
+        or pi3x_cfg.get("use_pose_prior", False)
         or pi3x_cfg.get("imu_predict", False)
     ):
         return None
@@ -170,7 +180,7 @@ def _stack_frame_intrinsics(frames, images):
 
 
 def _stack_frame_poses(frames, images):
-    if not config.get("pi3x", {}).get("imu_predict", False):
+    if not _pose_prior_enabled():
         return None
     if frames is None:
         raise ValueError("PI3X pose prior requires pair frames.")
@@ -395,6 +405,47 @@ def pi3x_inference_mono(model, frame):
     Xii, _ = einops.rearrange(X, "b h w c -> b (h w) c")
     Cii, _ = einops.rearrange(C, "b h w -> b (h w) 1")
     return Xii, Cii
+
+
+@torch.inference_mode()
+def pi3x_inference_window(model, frames):
+    if len(frames) < 2:
+        raise ValueError("PI3X window inference requires at least two frames.")
+    for frame in frames:
+        encode_frame_pi3x(model, frame)
+    images = torch.cat([_frame_image(frame) for frame in frames], dim=0)
+    cached_feat = torch.stack([frame.feat[0] for frame in frames], dim=0).unsqueeze(0)
+    output = _call_pi3x(
+        model,
+        images.unsqueeze(0),
+        frames=list(frames),
+        cached_feat=cached_feat,
+    )
+    local_points = _pick_output(output, ("local_points", "points_local", "pts3d"))
+    confidences = _pick_output(output, ("conf", "confidence", "confidences"))
+    poses = output.get("camera_poses")
+    if poses is None:
+        poses = output.get("poses")
+    if poses is None:
+        poses = output.get("extrinsics")
+    if poses is None:
+        raise KeyError("PI3X window inference did not return camera poses.")
+
+    if local_points.ndim == 4:
+        local_points = local_points.unsqueeze(0)
+    if confidences.ndim == 4:
+        confidences = confidences.unsqueeze(0)
+    if confidences.shape[-1] != 1:
+        confidences = confidences.unsqueeze(-1)
+
+    h, w = images.shape[-2:]
+    pointmaps = _resize_map(local_points[0], h, w).reshape(len(frames), h * w, 3)
+    confidences = _resize_map(confidences[0], h, w)[..., 0]
+    confidences = torch.sigmoid(confidences).reshape(len(frames), h * w, 1)
+    poses = torch.as_tensor(poses, device=pointmaps.device, dtype=pointmaps.dtype)
+    if poses.ndim == 3:
+        poses = poses.unsqueeze(0)
+    return pointmaps.contiguous(), confidences.contiguous(), poses[0].contiguous()
 
 
 def _downsample(X, C, D, Q):

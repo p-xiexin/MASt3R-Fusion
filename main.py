@@ -16,6 +16,7 @@ import mast3r_fusion.evaluate as eval
 from mast3r_fusion.foxglove_debug import run_foxglove_publisher
 from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
 from mast3r_fusion.frontend_model import load_frontend_model
+from mast3r_fusion.lifecycle import CoTrackerLifecycleManager, maybe_apply_pi3x_lifecycle_event
 from mast3r_fusion.mast3r_utils import load_retriever
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
 from mast3r_fusion.tracker import FrameTracker
@@ -164,8 +165,9 @@ if __name__ == "__main__":
     parser.add_argument("--start_from", type =  int, default=0)
     parser.add_argument("--end_at", type =  int, default=-1)
     parser.add_argument("--save_h5", action="store_true")
-    parser.add_argument("--frontend-model", choices=["mast3r", "pi3", "pi3x"], default=None)
+    parser.add_argument("--frontend-model", choices=["mast3r", "pi3", "pi3x", "cotracker"], default=None)
     parser.add_argument("--frontend-weights", default=None)
+    parser.add_argument("--cotracker-checkpoint", default=None)
     parser.add_argument("--foxglove", action="store_true", help="Enable Foxglove WebSocket debug publisher.")
     parser.add_argument("--foxglove-host", default="127.0.0.1")
     parser.add_argument("--foxglove-port", type=int, default=8765)
@@ -174,6 +176,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     load_config(args.config)
+    if args.cotracker_checkpoint is not None:
+        config.setdefault("cotracker", {})["checkpoint"] = args.cotracker_checkpoint
 
 
     if args.save_h5:
@@ -182,6 +186,7 @@ if __name__ == "__main__":
     manager = mp.Manager()
     main2viz = new_queue(manager, args.no_viz)
     viz2main = new_queue(manager, args.no_viz)
+    foxglove_events = new_queue(manager, not args.foxglove)
 
     dataset = load_dataset(args.dataset,args.stamp_path)
     dataset.subsample(config["dataset"]["subsample"],args.start_from,args.end_at)
@@ -234,10 +239,11 @@ if __name__ == "__main__":
                 args.foxglove_host,
                 args.foxglove_port,
                 args.foxglove_hz,
-                1.5,
+                config.get("tracking", {}).get("Q_conf", 1.5),
                 120000,
                 10,
                 70,
+                foxglove_events,
             ),
         )
         foxglove.start()
@@ -267,6 +273,9 @@ if __name__ == "__main__":
             recon_file.unlink()
 
     tracker = FrameTracker(model, keyframes, device)
+    lifecycle_manager = CoTrackerLifecycleManager(
+        enabled=getattr(model, "name", "mast3r") == "cotracker"
+    )
     last_msg = WindowMsg()
 
     factor_graph = FactorGraph(model, keyframes, K, device, args)
@@ -348,9 +357,16 @@ if __name__ == "__main__":
             X_init, C_init = model.infer_single(frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
+            lifecycle_manager.observe_keyframe(
+                frame,
+                tracker_model=getattr(model, "cotracker", None),
+                keyframe_idx=len(keyframes) - 1 + keyframes.rollup_sum.value,
+            )
             states.queue_global_optimization(len(keyframes) - 1 + keyframes.rollup_sum.value)
             states.set_mode(Mode.TRACKING)
+            states.clear_tracking_overlay()
             states.set_frame(frame)
+            foxglove_events.put("frame")
             i += 1
             continue
 
@@ -358,11 +374,15 @@ if __name__ == "__main__":
             add_new_kf, match_info, try_reloc = tracker.track(frame)
             if try_reloc:
                 states.set_mode(Mode.RELOC)
+            states.set_tracking_overlay(*tracker.latest_tracking_overlay)
             states.set_frame(frame)
+            foxglove_events.put("frame")
         elif mode == Mode.RELOC:
             X, C = model.infer_single(frame)
             frame.update_pointmap(X, C)
+            states.clear_tracking_overlay()
             states.set_frame(frame)
+            foxglove_events.put("frame")
             states.queue_reloc()
         else:
             raise Exception("Invalid mode")
@@ -382,11 +402,32 @@ if __name__ == "__main__":
                     add_new_kf = False
                     tracker.idx_f2k = tracker.idx_f2k_backup
     
+        publish_pointcloud_after_backend = False
         if add_new_kf:
             keyframes.append(frame)
+            lifecycle_event = lifecycle_manager.observe_keyframe(
+                frame,
+                tracker_model=getattr(model, "cotracker", None),
+                keyframe_idx=len(keyframes) - 1 + keyframes.rollup_sum.value,
+            )
+            if lifecycle_event.trigger_pi3x:
+                lifecycle_applied = maybe_apply_pi3x_lifecycle_event(
+                    model,
+                    factor_graph,
+                    keyframes,
+                    lifecycle_manager.active_window_from_keyframes(keyframes),
+                    lifecycle_event,
+                    global_start=lifecycle_manager.active_window_start(keyframes),
+                )
+                if lifecycle_applied:
+                    lifecycle_manager.mark_submitted()
+                    publish_pointcloud_after_backend = True
             states.queue_global_optimization(len(keyframes) - 1 + keyframes.rollup_sum.value)
         print('[INFO] backend',time.time())
         run_backend(states, keyframes)
+        if publish_pointcloud_after_backend:
+            print("[foxglove] publish keyframe_points after lifecycle window refresh")
+            foxglove_events.put("pointcloud")
         
         print(factor_graph.frames_to_save)
         if args.save_h5:
@@ -514,6 +555,7 @@ if __name__ == "__main__":
 
     print("done")
     states.set_mode(Mode.TERMINATED)
+    foxglove_events.put("terminate")
     if not args.no_viz:
         viz.join()
     if args.foxglove:

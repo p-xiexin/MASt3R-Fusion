@@ -14,4 +14,6 @@ checkpoints/*
 
 .vscode/
 **/__pycache__/
+temp/
+data/
 

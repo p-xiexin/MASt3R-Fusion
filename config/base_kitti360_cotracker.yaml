@@ -1,0 +1,24 @@
+inherit: config/base_kitti360_pi3x.yaml
+
+frontend_model:
+  name: cotracker
+  weights: checkpoints/pi3x/model.safetensors
+
+cotracker:
+  checkpoint: null
+  grid_size: 32
+  max_points: 1200
+
+tracking:
+  # CoTracker is sparse, so valid matches are measured against all image pixels.
+  min_match_frac: 0.001
+  match_frac_thresh: 0.003
+  ransac_filter: true
+  ransac_reproj_thresh: 2.0
+  ransac_confidence: 0.999
+  ransac_min_matches: 30
+  ransac_min_inliers: 20
+  old_track_age_threshold: 5
+
+local_opt:
+  min_match_frac: 0.001

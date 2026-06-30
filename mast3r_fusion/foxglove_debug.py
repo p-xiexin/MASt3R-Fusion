@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import queue
 import time
 
 import cv2
@@ -332,7 +333,10 @@ def _camera_points(frame):
     else:
         points = frame.X_canon.detach().reshape(-1, 3)
 
-    conf = frame.get_average_conf()
+    if getattr(frame, "N", 0) > 0:
+        conf = frame.get_average_conf()
+    else:
+        conf = frame.C
     conf = conf.detach().reshape(-1) if conf is not None else frame.C.detach().reshape(-1)
     colors = frame.uimg.detach().cpu().numpy().reshape(-1, 3)
     return points.cpu().numpy(), conf.cpu().numpy(), colors
@@ -411,11 +415,69 @@ def _point_cloud_msg(timestamp_ns, points, colors):
     }
 
 
-def _image_msg(timestamp_ns, frame, jpeg_quality):
-    image = np.clip(frame.uimg.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+def _tracking_overlay_from_states(states):
+    with states.lock:
+        prev = list(states.track_prev_xy)
+        curr = list(states.track_curr_xy)
+        ages = list(states.track_ages)
+    n = min(len(prev), len(curr)) // 2
+    n = min(n, len(ages))
+    if n <= 0:
+        return None
+    prev_xy = np.asarray(prev[: 2 * n], dtype=np.float32).reshape(n, 2)
+    curr_xy = np.asarray(curr[: 2 * n], dtype=np.float32).reshape(n, 2)
+    ages = np.asarray(ages[:n], dtype=np.int32)
+    return prev_xy, curr_xy, ages
+
+
+def _age_heatmap_colors(ages):
+    ages = np.asarray(ages, dtype=np.float32)
+    if ages.size == 0:
+        return np.zeros((0, 3), dtype=np.uint8)
+    max_age = max(1.0, float(np.percentile(ages, 95)))
+    norm = np.clip(ages / max_age, 0.0, 1.0)
+    values = np.rint(norm * 255.0).astype(np.uint8).reshape(-1, 1)
+    return cv2.applyColorMap(values, cv2.COLORMAP_TURBO).reshape(-1, 3)
+
+
+def _draw_tracking_overlay(image_rgb, overlay, old_age_threshold):
+    image = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+    if overlay is None:
+        return image
+    prev_xy, curr_xy, ages = overlay
+    h, w = image.shape[:2]
+    drawn = 0
+    drawn_ages = []
+    colors = _age_heatmap_colors(ages)
+    for p0, p1, age, color in zip(prev_xy, curr_xy, ages, colors):
+        p0 = np.rint(p0).astype(int)
+        p1 = np.rint(p1).astype(int)
+        if not (0 <= p1[0] < w and 0 <= p1[1] < h):
+            continue
+        color = tuple(int(c) for c in color)
+        cv2.circle(image, tuple(p1), 2, color, -1, cv2.LINE_AA)
+        if 0 <= p0[0] < w and 0 <= p0[1] < h:
+            cv2.line(image, tuple(p0), tuple(p1), color, 1, cv2.LINE_AA)
+        drawn += 1
+        drawn_ages.append(int(age))
+    if drawn:
+        drawn_ages = np.asarray(drawn_ages, dtype=np.int32)
+        old_count = int((drawn_ages >= old_age_threshold).sum())
+        old_ratio = old_count / max(1, drawn)
+        age_med = int(np.median(drawn_ages))
+        text = f"tracks={drawn} old>={old_age_threshold}:{old_ratio:.0%} age_med={age_med}"
+        text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
+        cv2.rectangle(image, (8, 8), (24 + text_size[0], 40), (0, 0, 0), -1)
+        cv2.putText(image, text, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+    return image
+
+
+def _image_msg(timestamp_ns, frame, jpeg_quality, tracking_overlay=None, old_age_threshold=5):
+    image_rgb = np.clip(frame.uimg.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
+    image_bgr = _draw_tracking_overlay(image_rgb, tracking_overlay, old_age_threshold)
     ok, encoded = cv2.imencode(
         ".jpg",
-        cv2.cvtColor(image, cv2.COLOR_RGB2BGR),
+        image_bgr,
         [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
     )
     if not ok:
@@ -459,7 +521,7 @@ async def _send_json(server, channels, name, timestamp_ns, msg):
     await server.send_message(channels[name], timestamp_ns, json.dumps(msg, separators=(",", ":")).encode("utf8"))
 
 
-async def _publish_snapshot(server, channels, states, keyframes, options):
+async def _publish_snapshot(server, channels, states, keyframes, options, publish_points=False):
     timestamp_ns = time.time_ns()
     if states.get_mode() != Mode.INIT:
         try:
@@ -493,7 +555,14 @@ async def _publish_snapshot(server, channels, states, keyframes, options):
                     "pose": current_pose,
                 },
             )
-            image = _image_msg(timestamp_ns, current_frame, options["jpeg_quality"])
+            tracking_overlay = _tracking_overlay_from_states(states)
+            image = _image_msg(
+                timestamp_ns,
+                current_frame,
+                options["jpeg_quality"],
+                tracking_overlay,
+                options["old_track_age_threshold"],
+            )
             if image is not None:
                 await _send_json(server, channels, "current_image", timestamp_ns, image)
         except Exception as exc:
@@ -510,24 +579,31 @@ async def _publish_snapshot(server, channels, states, keyframes, options):
             {"timestamp": _time_msg(timestamp_ns), "frame_id": "world", "poses": poses},
         )
 
-        points_accum = []
-        colors_accum = []
-        per_kf_limit = max(1, options["max_points"] // min(len(frames), options["max_keyframes"]))
-        for frame in frames[-options["max_keyframes"] :]:
-            result = _world_points(frame, options["conf_threshold"], per_kf_limit)
-            if result is None:
-                continue
-            points, colors = result
-            points_accum.append(points)
-            colors_accum.append(colors)
-        if points_accum:
-            points = np.concatenate(points_accum, axis=0)
-            colors = np.concatenate(colors_accum, axis=0)
-            if points.shape[0] > options["max_points"]:
-                stride = int(np.ceil(points.shape[0] / options["max_points"]))
-                points = points[::stride]
-                colors = colors[::stride]
-            await _send_json(server, channels, "keyframe_points", timestamp_ns, _point_cloud_msg(timestamp_ns, points, colors))
+        if publish_points:
+            points_accum = []
+            colors_accum = []
+            per_kf_limit = max(1, options["max_points"] // min(len(frames), options["max_keyframes"]))
+            for frame in frames[-options["max_keyframes"] :]:
+                result = _world_points(frame, options["conf_threshold"], per_kf_limit)
+                if result is None:
+                    continue
+                points, colors = result
+                points_accum.append(points)
+                colors_accum.append(colors)
+            if points_accum:
+                points = np.concatenate(points_accum, axis=0)
+                colors = np.concatenate(colors_accum, axis=0)
+                if points.shape[0] > options["max_points"]:
+                    stride = int(np.ceil(points.shape[0] / options["max_points"]))
+                    points = points[::stride]
+                    colors = colors[::stride]
+                await _send_json(server, channels, "keyframe_points", timestamp_ns, _point_cloud_msg(timestamp_ns, points, colors))
+                print(
+                    "[foxglove] published keyframe_points "
+                    f"points={points.shape[0]} frames={len(frames[-options['max_keyframes']:])}"
+                )
+            else:
+                print("[foxglove] keyframe_points skipped: no valid points")
 
     await _publish_graph_edges(server, channels, states, keyframes, timestamp_ns)
 
@@ -594,7 +670,7 @@ async def _publish_graph_edges(server, channels, states, keyframes, timestamp_ns
         print(f"[foxglove] graph edge publish skipped: {exc}")
 
 
-async def _run_server(cfg, states, keyframes, host, port, publish_hz, options):
+async def _run_server(cfg, states, keyframes, host, port, publish_hz, options, event_queue):
     set_global_config(cfg)
     logger = logging.getLogger("MASt3R-Fusion Foxglove")
     logger.setLevel(logging.INFO)
@@ -611,11 +687,32 @@ async def _run_server(cfg, states, keyframes, host, port, publish_hz, options):
         await _wait_opened(server)
         channels = await _add_channels(server)
         print(f"[foxglove] listening on ws://{host}:{port}")
-        interval = 1.0 / max(float(publish_hz), 0.1)
         while states.get_mode() != Mode.TERMINATED:
-            start = time.time()
-            await _publish_snapshot(server, channels, states, keyframes, options)
-            await asyncio.sleep(max(0.0, interval - (time.time() - start)))
+            event = await asyncio.to_thread(event_queue.get)
+            terminate, publish_points = _coalesce_events(event_queue, event)
+            if terminate:
+                break
+            await _publish_snapshot(
+                server,
+                channels,
+                states,
+                keyframes,
+                options,
+                publish_points=publish_points,
+            )
+
+
+def _coalesce_events(event_queue, first_event):
+    terminate = first_event == "terminate"
+    publish_points = first_event == "pointcloud"
+    while True:
+        try:
+            event = event_queue.get_nowait()
+        except queue.Empty:
+            break
+        terminate = terminate or event == "terminate"
+        publish_points = publish_points or event == "pointcloud"
+    return terminate, publish_points
 
 
 async def _wait_opened(server, timeout=5.0):
@@ -645,6 +742,7 @@ def run_foxglove_publisher(
     max_points=20000,
     max_keyframes=8,
     jpeg_quality=70,
+    event_queue=None,
 ):
     Tic = np.eye(4, dtype=np.float64)
     if calib_path:
@@ -659,8 +757,11 @@ def run_foxglove_publisher(
         "max_keyframes": int(max_keyframes),
         "jpeg_quality": int(jpeg_quality),
         "Tic": Tic,
+        "old_track_age_threshold": int(config.get("tracking", {}).get("old_track_age_threshold", 5)),
     }
+    if event_queue is None:
+        raise ValueError("run_foxglove_publisher requires an event_queue for event-driven publishing.")
     try:
-        asyncio.run(_run_server(cfg, states, keyframes, host, int(port), publish_hz, options))
+        asyncio.run(_run_server(cfg, states, keyframes, host, int(port), publish_hz, options, event_queue))
     finally:
         print("[foxglove] stopped")
