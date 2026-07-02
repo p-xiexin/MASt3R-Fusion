@@ -93,17 +93,34 @@ def get_backend_edges(idx, keyframes):
     return kf_idx, frame_idx
 
 
-def finish_backend_update(states, keyframes, skip_marginalization=False):
+def finish_backend_update(
+    states,
+    keyframes,
+    skip_marginalization=False,
+    window_start=None,
+    window_end=None,
+    marginalize_to=None,
+):
     with states.lock:
         states.edges_ii[:] = factor_graph.ii.cpu().tolist()
         states.edges_jj[:] = factor_graph.jj.cpu().tolist()
 
-    factor_graph.solve_GN_calib(config["use_calib"], skip_marginalization=skip_marginalization)
+    factor_graph.solve_GN_calib(
+        config["use_calib"],
+        skip_marginalization=skip_marginalization,
+        window_start=window_start,
+        window_end=window_end,
+    )
 
     # the fisrt time that VI init is finished
     # transform current states
     if factor_graph.init_vi_signal:
-        factor_graph.solve_GN_calib(config["use_calib"], skip_marginalization=skip_marginalization)
+        factor_graph.solve_GN_calib(
+            config["use_calib"],
+            skip_marginalization=skip_marginalization,
+            window_start=window_start,
+            window_end=window_end,
+        )
         factor_graph.init_vi_signal = False
         states.T_WC[:] = factor_graph.frames.last_keyframe().T_WC[:].data
 
@@ -124,6 +141,11 @@ def finish_backend_update(states, keyframes, skip_marginalization=False):
                                                                                  bb[3],bb[4],bb[5],
                                                                                  frame_id))
             factor_graph.fp.flush()
+
+    if marginalize_to is not None:
+        print('[INFO] post optim marg', time.time(), marginalize_to)
+        factor_graph.marginalize_to(marginalize_to)
+        print('[INFO] post optim marg.', time.time())
 
 
 def run_backend_indices(states, keyframes, indices):
@@ -270,6 +292,8 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
         keyframes[window_indices[local_idx]] = frame
 
     matches = [constraints[edge] for edge in local_edges]
+    window_start = min(all_kf_idx + all_frame_idx)
+    window_end = max(all_kf_idx + all_frame_idx)
     print('[INFO] add pi3x window factor', time.time())
     add_precomputed_factor_matches(
         factor_graph,
@@ -279,7 +303,14 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
         config["local_opt"]["min_match_frac"],
     )
     print('[INFO] add pi3x window factor.', time.time())
-    finish_backend_update(states, keyframes, skip_marginalization=True)
+    finish_backend_update(
+        states,
+        keyframes,
+        skip_marginalization=True,
+        window_start=window_start,
+        window_end=window_end,
+        marginalize_to=max(window_end - factor_graph.window_num, 0),
+    )
     return True
 
 
