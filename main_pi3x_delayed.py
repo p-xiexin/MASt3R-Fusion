@@ -728,7 +728,11 @@ if __name__ == "__main__":
         if len(keyframes) > 30:
             if pi3x_delayed_matching and pending_delayed_kf_idx:
                 flush_delayed_backend(states, keyframes, pending_delayed_kf_idx)
-            keyframes.roll_up(15)
+            rollup = 15
+            if pi3x_delayed_matching:
+                rollup = min(rollup, max(factor_graph.last_pin - keyframes.rollup_sum.value, 0))
+            if rollup > 0:
+                keyframes.roll_up(rollup)
 
         # log time
         if i % 30 == 0:

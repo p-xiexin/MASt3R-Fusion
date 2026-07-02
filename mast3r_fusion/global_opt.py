@@ -124,6 +124,18 @@ def getPosesRel(indice,pose_data,wTcs,ss,enable_ms):
             lll.data[iii,:] = LLL.data[:]
     return lll.data.to(device = 'cuda',dtype=torch.float32)
 
+def assert_valid_pose_state(T, scale, context):
+    T = np.asarray(T)
+    if T.shape != (4, 4) or not np.all(np.isfinite(T)) or not np.isfinite(scale) or abs(scale) <= 1e-8:
+        msg = f"[ERROR] invalid pose state in {context}: scale={scale}, T={T}"
+        print(msg)
+        raise ValueError(msg)
+    det = np.linalg.det(T[0:3, 0:3])
+    if not np.isfinite(det) or abs(det) <= 1e-8:
+        msg = f"[ERROR] invalid rotation matrix in {context}: det={det}, R={T[0:3, 0:3]}"
+        print(msg)
+        raise ValueError(msg)
+
 class FactorGraph:
     def __init__(self, model, frames: SharedKeyframes, K=None, device="cuda", args = None):
         self.model = model
@@ -511,10 +523,29 @@ class FactorGraph:
 
     def ensure_state_storage_until(self, max_idx):
         while len(self.bs) <= max_idx:
+            if len(self.bs) < self.frames.rollup_sum.value:
+                msg = (
+                    f"[ERROR] ensure_state_storage_until cannot initialize rolled keyframe: "
+                    f"next_idx={len(self.bs)}, max_idx={max_idx}, "
+                    f"rollup_sum={self.frames.rollup_sum.value}, last_pin={self.last_pin}"
+                )
+                print(msg)
+                raise IndexError(msg)
             frame = self.frames[len(self.bs)]
             T_WC64 = lietorch.Sim3(frame.T_WC.data.to(torch.float64))
             T_WC = T_WC64.matrix().cpu().numpy()[0]
             scale = T_WC64.data.reshape(-1, T_WC64.data.shape[-1])[0, -1].item()
+            quat = T_WC64.data.reshape(-1, T_WC64.data.shape[-1])[0, 3:7]
+            quat_norm = torch.linalg.norm(quat).item()
+            if (not np.isfinite(scale)) or abs(scale) <= 1e-8 or (not np.isfinite(quat_norm)) or quat_norm <= 1e-8:
+                msg = (
+                    f"[ERROR] ensure_state_storage_until invalid Sim3: "
+                    f"idx={len(self.bs)}, frame_id={frame.frame_id}, "
+                    f"scale={scale}, quat_norm={quat_norm}, "
+                    f"rollup_sum={self.frames.rollup_sum.value}, last_pin={self.last_pin}"
+                )
+                print(msg)
+                raise ValueError(msg)
             T_WC[0:3, 0:3] /= scale
             self.bs.append(gtsam.imuBias.ConstantBias(np.array([.0,.0,.0]),np.array([.0,.0,.0])))
             self.vs.append(np.array([.0,.0,.0]))
@@ -775,10 +806,13 @@ class FactorGraph:
         for iii in range(T_WCs.shape[0]):
             self.Tic = result.atPose3(C(0)).matrix()
             abs_idx = pin + iii
+            next_wTc = result.atPose3(X(iii)).matrix()
+            next_scale = result.atDouble(S(iii))
+            assert_valid_pose_state(next_wTc, next_scale, f"solve_imu_prior_window idx={abs_idx}, pin={pin}, window_end={window_end}")
             self.bs[abs_idx] = result.atConstantBias(B(iii))
             self.vs[abs_idx] = result.atVector(V(iii))
-            self.ss[abs_idx] = result.atDouble(S(iii))
-            self.wTcs[abs_idx] = result.atPose3(X(iii)).matrix()
+            self.ss[abs_idx] = next_scale
+            self.wTcs[abs_idx] = next_wTc
 
         pose_data = T_WCs.data[:, 0, :]
         pose_data_new = getPoses(np.arange(pin,pin+pose_data.shape[0]),pose_data,self.wTcs,self.ss)
@@ -1002,8 +1036,11 @@ class FactorGraph:
                     self.Tic = cur_result.atPose3(C(0)).matrix()
                     self.bs[iii+pin] = cur_result.atConstantBias(B(iii))
                     self.vs[iii+pin] = cur_result.atVector(V(iii))
-                self.ss[iii+pin] = cur_result.atDouble(S(iii))
-                self.wTcs[iii+pin] = cur_result.atPose3(X(iii)).matrix()
+                next_scale = cur_result.atDouble(S(iii))
+                next_wTc = cur_result.atPose3(X(iii)).matrix()
+                assert_valid_pose_state(next_wTc, next_scale, f"solve_GN_calib idx={iii+pin}, pin={pin}, iter={i}")
+                self.ss[iii+pin] = next_scale
+                self.wTcs[iii+pin] = next_wTc
                 # print(self.bs[iii],self.vs[iii])
             self.cur_graph = cur_graph
             self.cur_result = cur_result
