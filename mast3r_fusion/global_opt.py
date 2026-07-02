@@ -523,15 +523,16 @@ class FactorGraph:
 
     def ensure_state_storage_until(self, max_idx):
         while len(self.bs) <= max_idx:
-            if len(self.bs) < self.frames.rollup_sum.value:
+            idx = len(self.bs)
+            if idx < self.frames.rollup_sum.value:
                 msg = (
                     f"[ERROR] ensure_state_storage_until cannot initialize rolled keyframe: "
-                    f"next_idx={len(self.bs)}, max_idx={max_idx}, "
+                    f"next_idx={idx}, max_idx={max_idx}, "
                     f"rollup_sum={self.frames.rollup_sum.value}, last_pin={self.last_pin}"
                 )
                 print(msg)
                 raise IndexError(msg)
-            frame = self.frames[len(self.bs)]
+            frame = self.frames[idx]
             T_WC64 = lietorch.Sim3(frame.T_WC.data.to(torch.float64))
             T_WC = T_WC64.matrix().cpu().numpy()[0]
             scale = T_WC64.data.reshape(-1, T_WC64.data.shape[-1])[0, -1].item()
@@ -547,8 +548,27 @@ class FactorGraph:
                 print(msg)
                 raise ValueError(msg)
             T_WC[0:3, 0:3] /= scale
-            self.bs.append(gtsam.imuBias.ConstantBias(np.array([.0,.0,.0]),np.array([.0,.0,.0])))
-            self.vs.append(np.array([.0,.0,.0]))
+            if self.enable_ms and idx > 0 and len(self.bs) > 0:
+                new_preintegration = gtsam.PreintegratedCombinedMeasurements(self.params, self.bs[idx - 1])
+                dd = self.imu_pool.get_records(self.poses_stamps[self.frames[idx - 1].frame_id],
+                                               self.poses_stamps[self.frames[idx].frame_id])
+                is_bad = False
+                for t0, t1, ddd in dd:
+                    if t1 - t0 > 0.1: is_bad = True; print(t0,t1-t0,'!!!!!!!!!!!!!!!!!!!!!!!!')
+                if is_bad:
+                    new_preintegration = gtsam.PreintegratedCombinedMeasurements(self.params_loose, self.bs[idx - 1])
+                for t0, t1, ddd in dd:
+                    new_preintegration.integrateMeasurement(ddd[3:6], ddd[0:3]/180*math.pi, t1-t0)
+                pred_state = new_preintegration.predict(
+                    gtsam.NavState(gtsam.Pose3(self.wTcs[idx - 1] @ np.linalg.inv(self.Tic)), self.vs[idx - 1]),
+                    self.bs[idx - 1],
+                )
+                T_WC = pred_state.pose().matrix() @ self.Tic
+                self.bs.append(self.bs[idx - 1])
+                self.vs.append(pred_state.velocity())
+            else:
+                self.bs.append(gtsam.imuBias.ConstantBias(np.array([.0,.0,.0]),np.array([.0,.0,.0])))
+                self.vs.append(np.array([.0,.0,.0]))
             self.wTcs.append(T_WC)
             self.ss.append(scale)
 
@@ -737,80 +757,11 @@ class FactorGraph:
         if window_end is None:
             window_end = self.frames.n_size.value - 1 + self.frames.rollup_sum.value
         window_end = int(window_end)
-        pin = self.last_pin if self.marg_factor is not None else max(window_end - self.window_num, 0)
-        if pin > window_end:
-            return False
-
-        opt_kf_idx = torch.arange(pin, window_end + 1, device=self.device, dtype=torch.long)
-        if opt_kf_idx.numel() == 0:
-            return False
-
-        Xs, T_WCs, Cs = self.get_poses_points(opt_kf_idx)
         self.ensure_state_storage_until(window_end)
-
-        fix_noise = 1e-6
-        params = gtsam.LevenbergMarquardtParams()
-        params.setMaxIterations(2)
-        initials = gtsam.Values()
-        graph = gtsam.NonlinearFactorGraph()
-
-        for iii in range(T_WCs.shape[0]):
-            abs_idx = pin + iii
-            initials.insert(X(iii), gtsam.Pose3(self.wTcs[abs_idx]))
-            initials.insert(C(iii), gtsam.Pose3(self.Tic))
-            initials.insert(Z(iii), gtsam.Pose3(self.wTcs[abs_idx] @ np.linalg.inv(self.Tic)))
-            initials.insert(B(iii), self.bs[abs_idx])
-            initials.insert(V(iii), self.vs[abs_idx])
-
-            if iii == 0:
-                graph.add(gtsam.PriorFactorPose3(X(iii), gtsam.Pose3(self.wTcs[abs_idx]), gtsam.noiseModel.Diagonal.Sigmas(self.regularization_noise)))
-
-            if abs_idx == 0:
-                graph.add(gtsam.PriorFactorConstantBias(B(iii), gtsam.imuBias.ConstantBias(np.array([.0,.0,.0]),np.array([.0,.0,.0])), gtsam.noiseModel.Diagonal.Sigmas(self.init_bias_noise)))
-
-            if iii > 0:
-                new_preintegration = gtsam.PreintegratedCombinedMeasurements(self.params, self.bs[abs_idx - 1])
-                dd = self.imu_pool.get_records(self.poses_stamps[self.frames[abs_idx - 1].frame_id],
-                                               self.poses_stamps[self.frames[abs_idx].frame_id])
-                is_bad = False
-                for t0, t1, ddd in dd:
-                    if t1 - t0 > 0.1: is_bad = True; print(t0,t1-t0,'!!!!!!!!!!!!!!!!!!!!!!!!')
-                if is_bad:
-                    new_preintegration = gtsam.PreintegratedCombinedMeasurements(self.params_loose, self.bs[abs_idx - 1])
-                for t0, t1, ddd in dd:
-                    new_preintegration.integrateMeasurement(ddd[3:6], ddd[0:3]/180*math.pi, t1-t0)
-                graph.add(gtsam.gtsam.CombinedImuFactor(
-                    Z(iii-1), V(iii-1), Z(iii), V(iii), B(iii-1), B(iii),
-                    new_preintegration,
-                ))
-
-            graph.add(gtsam_unstable.ExPoseConstraintFactor(Z(iii), X(iii), C(iii), gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-4,1e-4,1e-4,1e-4,1e-4,1e-4]))))
-            if self.enable_excalib:
-                if abs_idx == 0:
-                    graph.add(gtsam.PriorFactorPose3(C(iii), gtsam.Pose3(self.Tic), gtsam.noiseModel.Diagonal.Sigmas(np.array([1,1,1,1,1,1])*0.1)))
-                if iii > 0:
-                    graph.add(gtsam.BetweenFactorPose3(C(iii), C(iii-1), gtsam.Pose3(np.eye(4,4)), gtsam.noiseModel.Diagonal.Sigmas(np.array([1,1,1,1,1,1])*fix_noise)))
-            else:
-                graph.add(gtsam.PriorFactorPose3(C(iii), gtsam.Pose3(self.Tic), gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-4,1e-4,1e-4,1e-4,1e-4,1e-4]))))
-
-            if iii == 0 and pin == 0:
-                graph.add(gtsam.PriorFactorPose3(Z(iii), gtsam.Pose3(), gtsam.noiseModel.Diagonal.Sigmas(np.array([1,1,1e-6,1e-6,1e-6,1e-6]))))
-
-        optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initials, params)
-        result = optimizer.optimize()
-
-        for iii in range(T_WCs.shape[0]):
-            self.Tic = result.atPose3(C(0)).matrix()
-            abs_idx = pin + iii
-            next_wTc = result.atPose3(X(iii)).matrix()
-            next_scale = self.ss[abs_idx]
-            assert_valid_pose_state(next_wTc, next_scale, f"solve_imu_prior_window idx={abs_idx}, pin={pin}, window_end={window_end}")
-            self.bs[abs_idx] = result.atConstantBias(B(iii))
-            self.vs[abs_idx] = result.atVector(V(iii))
-            self.wTcs[abs_idx] = next_wTc
-
+        opt_kf_idx = torch.arange(window_end, window_end + 1, device=self.device, dtype=torch.long)
+        Xs, T_WCs, Cs = self.get_poses_points(opt_kf_idx)
         pose_data = T_WCs.data[:, 0, :]
-        pose_data_new = getPoses(np.arange(pin,pin+pose_data.shape[0]),pose_data,self.wTcs,self.ss)
+        pose_data_new = getPoses(np.arange(window_end,window_end+pose_data.shape[0]),pose_data,self.wTcs,self.ss)
         pose_data[:,:] = pose_data_new[:,:]
         self.frames.update_T_WCs(T_WCs, opt_kf_idx)
         return True
@@ -843,7 +794,7 @@ class FactorGraph:
         if explicit_window:
             window_start = unique_kf_idx[0].item() if window_start is None else int(window_start)
             window_end = unique_kf_idx[-1].item() if window_end is None else int(window_end)
-            if self.marg_factor is not None and window_start > self.last_pin:
+            if window_start > self.last_pin:
                 window_start = self.last_pin
             pin = window_start
             unique_kf_idx = torch.arange(window_start, window_end + 1, device=unique_kf_idx.device, dtype=unique_kf_idx.dtype)
