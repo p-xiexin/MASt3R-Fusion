@@ -93,17 +93,17 @@ def get_backend_edges(idx, keyframes):
     return kf_idx, frame_idx
 
 
-def finish_backend_update(states, keyframes):
+def finish_backend_update(states, keyframes, skip_marginalization=False):
     with states.lock:
         states.edges_ii[:] = factor_graph.ii.cpu().tolist()
         states.edges_jj[:] = factor_graph.jj.cpu().tolist()
 
-    factor_graph.solve_GN_calib(config["use_calib"])
+    factor_graph.solve_GN_calib(config["use_calib"], skip_marginalization=skip_marginalization)
 
     # the fisrt time that VI init is finished
     # transform current states
     if factor_graph.init_vi_signal:
-        factor_graph.solve_GN_calib(config["use_calib"])
+        factor_graph.solve_GN_calib(config["use_calib"], skip_marginalization=skip_marginalization)
         factor_graph.init_vi_signal = False
         states.T_WC[:] = factor_graph.frames.last_keyframe().T_WC[:].data
 
@@ -279,7 +279,7 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
         config["local_opt"]["min_match_frac"],
     )
     print('[INFO] add pi3x window factor.', time.time())
-    finish_backend_update(states, keyframes)
+    finish_backend_update(states, keyframes, skip_marginalization=True)
     return True
 
 

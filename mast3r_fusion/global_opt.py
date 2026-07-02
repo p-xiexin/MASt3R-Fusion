@@ -523,7 +523,7 @@ class FactorGraph:
         dT = np.linalg.inv(self.wTcs[kf_idx] @ np.linalg.inv(self.Tic)) @ wTi_pred
         return dT, wTi_pred @ self.Tic, self.poses_stamps[frame_id] - self.poses_stamps[self.frames[kf_idx].frame_id]
 
-    def solve_GN_calib(self,use_calib_this_file = False):
+    def solve_GN_calib(self,use_calib_this_file = False, skip_marginalization = False):
         print("solve_GN_calib!!!!")
         
         fix_noise = 1e-6
@@ -551,7 +551,7 @@ class FactorGraph:
 
         pin = max(unique_kf_idx[-1].item()-self.window_num,0)
         print('[INFO] marg',time.time())
-        if pin > self.last_pin:
+        if (not skip_marginalization) and pin > self.last_pin:
             print('Marginalization!!!',pin,self.last_pin)
             # Marginalization
             marg_graph = gtsam.NonlinearFactorGraph()
