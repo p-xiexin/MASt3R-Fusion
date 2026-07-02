@@ -729,15 +729,19 @@ class FactorGraph:
             window_end = unique_kf_idx[-1].item() if window_end is None else int(window_end)
             pin = window_start
             unique_kf_idx = torch.arange(window_start, window_end + 1, device=unique_kf_idx.device, dtype=unique_kf_idx.dtype)
+            opt_kf_idx = unique_kf_idx
         else:
             pin = max(unique_kf_idx[-1].item()-self.window_num,0)
+            opt_kf_idx = unique_kf_idx[pin:]
         print('[INFO] marg',time.time())
         if (not explicit_window) and (not skip_marginalization) and pin > self.last_pin:
             self.marginalize_to(pin)
         print('[INFO] marg.',time.time())
 
         # pin = 0
-        Xs, T_WCs, Cs = self.get_poses_points(unique_kf_idx[pin:])
+        if opt_kf_idx.numel() == 0:
+            return
+        Xs, T_WCs, Cs = self.get_poses_points(opt_kf_idx)
 
         img_size = self.frames.last_keyframe().img.shape[-2:]
 
@@ -918,7 +922,7 @@ class FactorGraph:
         print(keys2str(initials.keys()))
 
         # Update the keyframe T_WC
-        self.frames.update_T_WCs(T_WCs, unique_kf_idx[pin:])
+        self.frames.update_T_WCs(T_WCs, opt_kf_idx)
 
         if T_WCs.shape[0] == 7:
             self.solve_VI_init()
