@@ -372,6 +372,88 @@ def _pair_output_to_maps(output, images):
     return Xii, Xji, Xjj, Xij, confidences[0], confidences[1], Dii, Djj, T_w_ci, T_w_cj
 
 
+def _window_output_to_maps(output, images):
+    local_points = _pick_output(output, ("local_points", "points_local", "pts3d"))
+    confidences = _pick_output(output, ("conf", "confidence", "confidences"))
+    poses = output.get("camera_poses")
+    if poses is None:
+        poses = output.get("poses")
+    if poses is None:
+        poses = output.get("extrinsics")
+
+    if local_points.ndim == 4:
+        local_points = local_points.unsqueeze(0)
+    if confidences.ndim == 4:
+        confidences = confidences.unsqueeze(0)
+    if confidences.shape[-1] != 1:
+        confidences = confidences.unsqueeze(-1)
+
+    h, w = images.shape[-2:]
+    local_points = _resize_map(local_points[0], h, w)
+    confidences = _resize_map(confidences[0], h, w)[..., 0]
+    confidences = torch.sigmoid(confidences)
+    X, C, _, _ = _downsample(local_points, confidences, local_points, confidences)
+
+    if poses is None:
+        raise KeyError("PI3X window matching requires camera poses.")
+    poses = torch.as_tensor(poses, device=X.device, dtype=X.dtype)
+    if poses.ndim == 3:
+        poses = poses.unsqueeze(0)
+    poses = poses[0]
+
+    return X, C, poses
+
+
+@torch.inference_mode()
+def pi3x_inference_window(model, frames):
+    if len(frames) == 0:
+        raise ValueError("PI3X window inference requires at least one frame.")
+    for frame in frames:
+        encode_frame_pi3x(model, frame)
+    images = torch.cat([_frame_image(frame) for frame in frames], dim=0).unsqueeze(0)
+    cached_feat = torch.stack([frame.feat[0] for frame in frames], dim=0).unsqueeze(0)
+    output = _call_pi3x(model, images, frames=frames, cached_feat=cached_feat)
+    return _window_output_to_maps(output, images)
+
+
+@torch.inference_mode()
+def pi3x_match_window_edges(model, frames, edges, subpixel_factor=1):
+    if subpixel_factor != 1:
+        raise ValueError("PI3X window matching currently supports subpixel_factor=1 only.")
+    X, C, poses = pi3x_inference_window(model, frames)
+    h, w = X.shape[1:3]
+    X_flat = X.reshape(X.shape[0], h * w, 3)
+    C_flat = C.reshape(C.shape[0], h * w, 1)
+
+    conf_threshold = _match_conf_threshold()
+    constraints = {}
+    for edge_i, edge_j in edges:
+        Xii = X[edge_i : edge_i + 1]
+        Xjj = X[edge_j : edge_j + 1]
+        Cii = C[edge_i : edge_i + 1]
+        Cjj = C[edge_j : edge_j + 1]
+        pose_i = poses[edge_i : edge_i + 1]
+        pose_j = poses[edge_j : edge_j + 1]
+        idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
+            Xjj, Xii, pose_j, pose_i, Cjj, Cii, conf_threshold=conf_threshold
+        )
+        idx_j2i, valid_match_i, pair_conf_j2i = pi3_matching.match(
+            Xii, Xjj, pose_i, pose_j, Cii, Cjj, conf_threshold=conf_threshold
+        )
+        constraints[(edge_i, edge_j)] = (
+            idx_i2j,
+            idx_j2i,
+            valid_match_j,
+            valid_match_i,
+            C_flat[edge_i : edge_i + 1],
+            C_flat[edge_j : edge_j + 1],
+            pair_conf_i2j,
+            pair_conf_j2i,
+        )
+
+    return X_flat, C_flat, poses, constraints
+
+
 @torch.inference_mode()
 def pi3x_inference_pair(model, frame_i, frame_j):
     encode_frame_pi3x(model, frame_i)

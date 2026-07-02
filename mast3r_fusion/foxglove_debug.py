@@ -306,6 +306,24 @@ def _frame_matrix(frame):
     return frame.T_WC.matrix()[0].detach().cpu().numpy().astype(np.float32)
 
 
+def _sim3_pose_data(frame):
+    return frame.T_WC.data.detach().cpu().numpy()[0].astype(np.float64)
+
+
+def _pose_scale_from_sim3_data(data):
+    arr = np.asarray(data, dtype=np.float64).reshape(-1)
+    return float(arr[7]) if arr.shape[0] > 7 else 1.0
+
+
+def _points_to_world_from_sim3_data(points, data):
+    arr = np.asarray(data, dtype=np.float64).reshape(-1)
+    translation = arr[:3]
+    rotation = Rotation.from_quat(arr[3:7]).as_matrix()
+    scale = _pose_scale_from_sim3_data(arr)
+    points_scaled = points.astype(np.float64, copy=False) * scale
+    return points_scaled @ rotation.T + translation
+
+
 def _translation_from_sim3_data(data):
     matrix = lietorch.Sim3(data.reshape(1, -1)).matrix().detach().cpu().numpy()
     return R_FOXGLOVE_FROM_SLAM @ matrix[0, :3, 3]
@@ -354,8 +372,7 @@ def _world_points(frame, conf_threshold, max_points):
         points = points[::stride]
         colors = colors[::stride]
 
-    points_h = np.concatenate([points.astype(np.float32), np.ones((points.shape[0], 1), dtype=np.float32)], axis=1)
-    points_w = (_frame_matrix(frame) @ points_h.T).T[:, :3]
+    points_w = _points_to_world_from_sim3_data(points, _sim3_pose_data(frame))
     points_w = points_w @ R_FOXGLOVE_FROM_SLAM.T
     colors_u8 = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
     return points_w.astype(np.float32), colors_u8

@@ -11,6 +11,8 @@ from mast3r_fusion.frontend_model.pi3x_utils import (
     load_pi3x,
     pi3x_decode_symmetric_batch,
     pi3x_inference_mono,
+    pi3x_inference_window,
+    pi3x_match_window_edges,
     pi3x_match_asymmetric,
     pi3x_match_symmetric,
 )
@@ -78,24 +80,20 @@ class PI3Adapter(FeedForwardFrontend):
         )
 
     def infer_window(self, frames):
-        pointmaps = []
-        confidences = []
-        for frame in frames:
-            X, C = self.infer_single(frame)
-            pointmaps.append(X)
-            confidences.append(C)
+        pointmaps, confidences, poses = pi3x_inference_window(self.model, frames)
         return WindowInferenceResult(
             frames=frames,
-            pointmaps=torch.stack(pointmaps),
-            confidences=torch.stack(confidences),
-            metadata={"source": "pi3x-pair-self-inference"},
+            pointmaps=pointmaps,
+            confidences=confidences,
+            metadata={"source": "pi3x-window-inference", "poses": poses},
         )
 
     def build_pair_constraints_from_window(self, frames, edges, **kwargs):
-        # PI3X is currently used through pair inference. No separate window-level
-        # constraint graph is exposed here.
-        raise NotImplementedError(
-            "PI3Adapter does not expose native window-level pair constraints yet."
+        return pi3x_match_window_edges(
+            self.model,
+            frames,
+            list(edges),
+            kwargs.get("subpixel_factor", 1),
         )
 
     def match_symmetric_batch(

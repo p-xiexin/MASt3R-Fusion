@@ -149,6 +149,140 @@ def run_backend_indices(states, keyframes, indices):
     return True
 
 
+def add_precomputed_factor_matches(factor_graph, ii, jj, matches, min_match_frac):
+    if not ii:
+        return False
+
+    (
+        idx_i2j,
+        idx_j2i,
+        valid_match_j,
+        valid_match_i,
+        Qii,
+        Qjj,
+        Qji,
+        Qij,
+    ) = [torch.cat(values, dim=0) for values in zip(*matches)]
+
+    batch_inds = torch.arange(idx_i2j.shape[0], device=idx_i2j.device)[
+        :, None
+    ].repeat(1, idx_i2j.shape[1])
+
+    w = factor_graph.frames[ii[0]].img_true_shape[0, 1].item()
+    idx_i2j_orig = idx_i2j.clone()
+    idx_i2j_orig = (idx_i2j_orig // (factor_graph.subpixel_factor * w)) // factor_graph.subpixel_factor * w + (
+        idx_i2j_orig % (factor_graph.subpixel_factor * w)
+    ) // factor_graph.subpixel_factor
+    idx_j2i_orig = idx_j2i.clone()
+    idx_j2i_orig = (idx_j2i_orig // (factor_graph.subpixel_factor * w)) // factor_graph.subpixel_factor * w + (
+        idx_j2i_orig % (factor_graph.subpixel_factor * w)
+    ) // factor_graph.subpixel_factor
+
+    Qj = torch.sqrt(Qii[batch_inds, idx_i2j_orig] * Qji)
+    Qi = torch.sqrt(Qjj[batch_inds, idx_j2i_orig] * Qij)
+
+    valid_Qj = Qj > factor_graph.cfg["Q_conf"]
+    valid_Qi = Qi > factor_graph.cfg["Q_conf"]
+    valid_j = valid_match_j & valid_Qj
+    valid_i = valid_match_i & valid_Qi
+    nj = valid_j.shape[1] * valid_j.shape[2]
+    ni = valid_i.shape[1] * valid_i.shape[2]
+    match_frac_j = valid_j.sum(dim=(1, 2)) / nj
+    match_frac_i = valid_i.sum(dim=(1, 2)) / ni
+
+    ii_tensor = torch.as_tensor(ii, device=factor_graph.device)
+    jj_tensor = torch.as_tensor(jj, device=factor_graph.device)
+    invalid_edges = torch.minimum(match_frac_j, match_frac_i) < min_match_frac
+    invalid_edges_orig = invalid_edges.clone()
+    consecutive_edges = ii_tensor == (jj_tensor - 1)
+    invalid_edges = (~consecutive_edges) & invalid_edges
+
+    valid_edges = ~invalid_edges
+    ii_tensor = ii_tensor[valid_edges]
+    jj_tensor = jj_tensor[valid_edges]
+    idx_i2j = idx_i2j[valid_edges]
+    idx_j2i = idx_j2i[valid_edges]
+    valid_match_j = valid_match_j[valid_edges]
+    valid_match_i = valid_match_i[valid_edges]
+    Qj[invalid_edges_orig, :] *= 0.0001
+    Qi[invalid_edges_orig, :] *= 0.0001
+    Qj = Qj[valid_edges]
+    Qi = Qi[valid_edges]
+
+    factor_graph.ii = torch.cat([factor_graph.ii, ii_tensor])
+    factor_graph.jj = torch.cat([factor_graph.jj, jj_tensor])
+    factor_graph.idx_ii2jj = torch.cat([factor_graph.idx_ii2jj, idx_i2j])
+    factor_graph.idx_jj2ii = torch.cat([factor_graph.idx_jj2ii, idx_j2i])
+    factor_graph.valid_match_j = torch.cat([factor_graph.valid_match_j, valid_match_j])
+    factor_graph.valid_match_i = torch.cat([factor_graph.valid_match_i, valid_match_i])
+    factor_graph.Q_ii2jj = torch.cat([factor_graph.Q_ii2jj, Qj])
+    factor_graph.Q_jj2ii = torch.cat([factor_graph.Q_jj2ii, Qi])
+
+    retain_mask = torch.logical_not(
+        torch.logical_and(
+            factor_graph.ii < torch.max(factor_graph.ii) - 20,
+            factor_graph.jj < torch.max(factor_graph.jj) - factor_graph.retain_num,
+        )
+    )
+    factor_graph.ii = factor_graph.ii[retain_mask]
+    factor_graph.jj = factor_graph.jj[retain_mask]
+    factor_graph.idx_ii2jj = factor_graph.idx_ii2jj[retain_mask]
+    factor_graph.idx_jj2ii = factor_graph.idx_jj2ii[retain_mask]
+    factor_graph.valid_match_j = factor_graph.valid_match_j[retain_mask]
+    factor_graph.valid_match_i = factor_graph.valid_match_i[retain_mask]
+    factor_graph.Q_ii2jj = factor_graph.Q_ii2jj[retain_mask]
+    factor_graph.Q_jj2ii = factor_graph.Q_jj2ii[retain_mask]
+
+    return valid_edges.sum() > 0
+
+
+def run_pi3x_window_backend_indices(states, keyframes, indices):
+    mode = states.get_mode()
+    if mode == Mode.INIT or states.is_paused() or not indices:
+        return False
+
+    all_kf_idx = []
+    all_frame_idx = []
+    for idx in indices:
+        kf_idx, frame_idx = get_backend_edges(idx, keyframes)
+        all_kf_idx += kf_idx
+        all_frame_idx += frame_idx
+    if not all_kf_idx:
+        finish_backend_update(states, keyframes)
+        return True
+
+    window_indices = sorted(set(all_kf_idx + all_frame_idx))
+    window_index_to_local = {idx: local for local, idx in enumerate(window_indices)}
+    window_frames = [keyframes[idx] for idx in window_indices]
+    local_edges = [
+        (window_index_to_local[ii], window_index_to_local[jj])
+        for ii, jj in zip(all_kf_idx, all_frame_idx)
+    ]
+
+    print('[INFO] pi3x window inference', time.time(), window_indices)
+    Xs, Cs, poses, constraints = factor_graph.model.build_pair_constraints_from_window(
+        window_frames,
+        local_edges,
+        subpixel_factor=factor_graph.subpixel_factor,
+    )
+    for local_idx, frame in enumerate(window_frames):
+        frame.update_pointmap(Xs[local_idx : local_idx + 1], Cs[local_idx : local_idx + 1])
+        keyframes[window_indices[local_idx]] = frame
+
+    matches = [constraints[edge] for edge in local_edges]
+    print('[INFO] add pi3x window factor', time.time())
+    add_precomputed_factor_matches(
+        factor_graph,
+        all_kf_idx,
+        all_frame_idx,
+        matches,
+        config["local_opt"]["min_match_frac"],
+    )
+    print('[INFO] add pi3x window factor.', time.time())
+    finish_backend_update(states, keyframes)
+    return True
+
+
 def run_backend(states, keyframes):
     idx = -1
     with states.lock:
@@ -168,7 +302,7 @@ def run_backend(states, keyframes):
 def flush_delayed_backend(states, keyframes, pending_kf_idx):
     if not pending_kf_idx:
         return
-    run_backend_indices(states, keyframes, pending_kf_idx)
+    run_pi3x_window_backend_indices(states, keyframes, pending_kf_idx)
     pending_kf_idx.clear()
 
 
@@ -180,6 +314,16 @@ def set_frame_pose_only(states, frame):
         states.img_shape[:] = frame.img_shape
         states.img_true_shape[:] = frame.img_true_shape
         states.T_WC[:] = frame.T_WC.data
+
+
+def initialize_delayed_keyframe_placeholders(states, frame):
+    frame.X_canon = torch.zeros_like(states.X)
+    frame.C = torch.zeros_like(states.C)
+    frame.feat = torch.zeros_like(states.feat)
+    frame.pos = torch.zeros_like(states.pos)
+    frame.N = 0
+    frame.N_updates = 0
+
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
@@ -417,8 +561,7 @@ if __name__ == "__main__":
                 try_reloc = False
                 match_info = []
                 if add_new_kf:
-                    X, C = model.infer_single(frame)
-                    frame.update_pointmap(X, C)
+                    initialize_delayed_keyframe_placeholders(states, frame)
                     keyframes.append(frame)
                     pending_delayed_kf_idx.append(len(keyframes) - 1 + keyframes.rollup_sum.value)
                     states.set_frame(frame)
