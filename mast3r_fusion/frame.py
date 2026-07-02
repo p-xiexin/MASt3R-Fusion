@@ -294,22 +294,31 @@ class SharedKeyframes:
 
     def __setitem__(self, idx, value: Frame) -> None:
         with self.lock:
-            self.n_size.value = max(idx + 1, self.n_size.value)
+            storage_idx = idx - self.rollup_sum.value
+            if storage_idx < 0:
+                msg = (
+                    f"[ERROR] SharedKeyframes set invalid idx={idx}, "
+                    f"storage_idx={storage_idx}, rollup_sum={self.rollup_sum.value}, "
+                    f"n_size={self.n_size.value}"
+                )
+                print(msg)
+                raise IndexError(msg)
+            self.n_size.value = max(storage_idx + 1, self.n_size.value)
 
             # set the attributes
-            self.dataset_idx[idx] = value.frame_id
-            self.img[idx] = value.img
-            self.uimg[idx] = value.uimg
-            self.img_shape[idx] = value.img_shape
-            self.img_true_shape[idx] = value.img_true_shape
-            self.T_WC[idx] = value.T_WC.data
-            self.X[idx] = value.X_canon
-            self.C[idx] = value.C
-            self.feat[idx] = value.feat
-            self.pos[idx] = value.pos
-            self.N[idx] = value.N
-            self.N_updates[idx] = value.N_updates
-            self.is_dirty[idx] = True
+            self.dataset_idx[storage_idx] = value.frame_id
+            self.img[storage_idx] = value.img
+            self.uimg[storage_idx] = value.uimg
+            self.img_shape[storage_idx] = value.img_shape
+            self.img_true_shape[storage_idx] = value.img_true_shape
+            self.T_WC[storage_idx] = value.T_WC.data
+            self.X[storage_idx] = value.X_canon
+            self.C[storage_idx] = value.C
+            self.feat[storage_idx] = value.feat
+            self.pos[storage_idx] = value.pos
+            self.N[storage_idx] = value.N
+            self.N_updates[storage_idx] = value.N_updates
+            self.is_dirty[storage_idx] = True
             return idx
 
     def __len__(self):
@@ -318,7 +327,7 @@ class SharedKeyframes:
 
     def append(self, value: Frame):
         with self.lock:
-            self[self.n_size.value] = value
+            self[self.n_size.value + self.rollup_sum.value] = value
 
     def pop_last(self):
         with self.lock:

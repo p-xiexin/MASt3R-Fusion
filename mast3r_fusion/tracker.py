@@ -121,7 +121,7 @@ class FrameTracker:
         Xkk = T_CkCf.act(Xkf)
         keyframe.update_pointmap(Xkk, Ckf)
         # write back the fitered pointmap
-        self.keyframes[len(self.keyframes) - 1] = keyframe
+        self.keyframes[len(self.keyframes) - 1 + self.keyframes.rollup_sum.value] = keyframe
 
         # Keyframe selection
         n_valid = valid_kf.sum()
