@@ -295,7 +295,7 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
     window_start = min(all_kf_idx + all_frame_idx)
     window_end = max(all_kf_idx + all_frame_idx)
     print('[INFO] add pi3x window factor', time.time())
-    add_precomputed_factor_matches(
+    added_edges = add_precomputed_factor_matches(
         factor_graph,
         all_kf_idx,
         all_frame_idx,
@@ -303,6 +303,8 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
         config["local_opt"]["min_match_frac"],
     )
     print('[INFO] add pi3x window factor.', time.time())
+    if not added_edges:
+        raise RuntimeError(f"PI3X delayed window produced no valid backend edges: {window_indices}")
     finish_backend_update(
         states,
         keyframes,
@@ -328,6 +330,20 @@ def run_backend(states, keyframes):
     with states.lock:
         if len(states.global_optimizer_tasks) > 0:
             idx = states.global_optimizer_tasks.pop(0)
+
+
+def run_delayed_imu_backend(states, keyframes, idx):
+    mode = states.get_mode()
+    if mode == Mode.INIT or states.is_paused():
+        return False
+
+    print('[INFO] delayed imu backend', time.time(), idx)
+    optimized = factor_graph.solve_imu_prior_window(window_end=idx)
+    if optimized:
+        latest_frame = keyframes[idx]
+        states.T_WC[:] = latest_frame.T_WC[:].data
+    print('[INFO] delayed imu backend.', time.time(), optimized)
+    return optimized
 
 
 def flush_delayed_backend(states, keyframes, pending_kf_idx):
@@ -594,8 +610,10 @@ if __name__ == "__main__":
                 if add_new_kf:
                     initialize_delayed_keyframe_placeholders(states, frame)
                     keyframes.append(frame)
-                    pending_delayed_kf_idx.append(len(keyframes) - 1 + keyframes.rollup_sum.value)
+                    delayed_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
+                    pending_delayed_kf_idx.append(delayed_kf_idx)
                     states.set_frame(frame)
+                    run_delayed_imu_backend(states, keyframes, delayed_kf_idx)
                     if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
                         flush_delayed_backend(states, keyframes, pending_delayed_kf_idx)
                 else:

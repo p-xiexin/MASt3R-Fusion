@@ -699,6 +699,93 @@ class FactorGraph:
         self.last_pin = new_pin
         del aligncore
 
+    def solve_imu_prior_window(self, window_end=None):
+        if not self.enable_ms:
+            return True
+
+        if window_end is None:
+            window_end = self.frames.n_size.value - 1 + self.frames.rollup_sum.value
+        window_end = int(window_end)
+        pin = self.last_pin if self.marg_factor is not None else max(window_end - self.window_num, 0)
+        if pin > window_end:
+            return False
+
+        opt_kf_idx = torch.arange(pin, window_end + 1, device=self.device, dtype=torch.long)
+        if opt_kf_idx.numel() == 0:
+            return False
+
+        Xs, T_WCs, Cs = self.get_poses_points(opt_kf_idx)
+        self.ensure_state_storage_until(window_end)
+
+        fix_noise = 1e-6
+        params = gtsam.LevenbergMarquardtParams()
+        params.setMaxIterations(2)
+        initials = gtsam.Values()
+        graph = gtsam.NonlinearFactorGraph()
+
+        for iii in range(T_WCs.shape[0]):
+            abs_idx = pin + iii
+            initials.insert(X(iii), gtsam.Pose3(self.wTcs[abs_idx]))
+            initials.insert(S(iii), self.ss[abs_idx])
+            initials.insert(C(iii), gtsam.Pose3(self.Tic))
+            initials.insert(Z(iii), gtsam.Pose3(self.wTcs[abs_idx] @ np.linalg.inv(self.Tic)))
+            initials.insert(B(iii), self.bs[abs_idx])
+            initials.insert(V(iii), self.vs[abs_idx])
+
+            if iii == 0 and self.marg_factor is not None and pin == self.last_pin:
+                graph.add(self.marg_factor)
+            elif iii == 0:
+                graph.add(gtsam.PriorFactorPose3(X(iii), gtsam.Pose3(self.wTcs[abs_idx]), gtsam.noiseModel.Diagonal.Sigmas(self.regularization_noise)))
+                graph.add(gtsam.PriorFactorDouble(S(iii), self.ss[abs_idx], gtsam.noiseModel.Diagonal.Sigmas([1.0])))
+
+            if abs_idx == 0:
+                graph.add(gtsam.PriorFactorConstantBias(B(iii), gtsam.imuBias.ConstantBias(np.array([.0,.0,.0]),np.array([.0,.0,.0])), gtsam.noiseModel.Diagonal.Sigmas(self.init_bias_noise)))
+
+            if iii > 0:
+                new_preintegration = gtsam.PreintegratedCombinedMeasurements(self.params, self.bs[abs_idx - 1])
+                dd = self.imu_pool.get_records(self.poses_stamps[self.frames[abs_idx - 1].frame_id],
+                                               self.poses_stamps[self.frames[abs_idx].frame_id])
+                is_bad = False
+                for t0, t1, ddd in dd:
+                    if t1 - t0 > 0.1: is_bad = True; print(t0,t1-t0,'!!!!!!!!!!!!!!!!!!!!!!!!')
+                if is_bad:
+                    new_preintegration = gtsam.PreintegratedCombinedMeasurements(self.params_loose, self.bs[abs_idx - 1])
+                for t0, t1, ddd in dd:
+                    new_preintegration.integrateMeasurement(ddd[3:6], ddd[0:3]/180*math.pi, t1-t0)
+                graph.add(gtsam.gtsam.CombinedImuFactor(
+                    Z(iii-1), V(iii-1), Z(iii), V(iii), B(iii-1), B(iii),
+                    new_preintegration,
+                ))
+
+            graph.add(gtsam_unstable.ExPoseConstraintFactor(Z(iii), X(iii), C(iii), gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-4,1e-4,1e-4,1e-4,1e-4,1e-4]))))
+            if self.enable_excalib:
+                if abs_idx == 0:
+                    graph.add(gtsam.PriorFactorPose3(C(iii), gtsam.Pose3(self.Tic), gtsam.noiseModel.Diagonal.Sigmas(np.array([1,1,1,1,1,1])*0.1)))
+                if iii > 0:
+                    graph.add(gtsam.BetweenFactorPose3(C(iii), C(iii-1), gtsam.Pose3(np.eye(4,4)), gtsam.noiseModel.Diagonal.Sigmas(np.array([1,1,1,1,1,1])*fix_noise)))
+            else:
+                graph.add(gtsam.PriorFactorPose3(C(iii), gtsam.Pose3(self.Tic), gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-4,1e-4,1e-4,1e-4,1e-4,1e-4]))))
+
+            if iii == 0 and pin == 0:
+                graph.add(gtsam.PriorFactorPose3(Z(iii), gtsam.Pose3(), gtsam.noiseModel.Diagonal.Sigmas(np.array([1,1,1e-6,1e-6,1e-6,1e-6]))))
+
+        optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initials, params)
+        result = optimizer.optimize()
+
+        for iii in range(T_WCs.shape[0]):
+            self.Tic = result.atPose3(C(0)).matrix()
+            abs_idx = pin + iii
+            self.bs[abs_idx] = result.atConstantBias(B(iii))
+            self.vs[abs_idx] = result.atVector(V(iii))
+            self.ss[abs_idx] = result.atDouble(S(iii))
+            self.wTcs[abs_idx] = result.atPose3(X(iii)).matrix()
+
+        pose_data = T_WCs.data[:, 0, :]
+        pose_data_new = getPoses(np.arange(pin,pin+pose_data.shape[0]),pose_data,self.wTcs,self.ss)
+        pose_data[:,:] = pose_data_new[:,:]
+        self.frames.update_T_WCs(T_WCs, opt_kf_idx)
+        return True
+
     def solve_GN_calib(self,use_calib_this_file = False, skip_marginalization = False, window_start = None, window_end = None):
         print("solve_GN_calib!!!!")
 
@@ -722,11 +809,13 @@ class FactorGraph:
         unique_kf_idx = self.get_unique_kf_idx()
         n_unique_kf = unique_kf_idx.numel()
         if n_unique_kf <= pin:
-            return
+            return False
 
         if explicit_window:
             window_start = unique_kf_idx[0].item() if window_start is None else int(window_start)
             window_end = unique_kf_idx[-1].item() if window_end is None else int(window_end)
+            if self.marg_factor is not None and window_start > self.last_pin:
+                window_start = self.last_pin
             pin = window_start
             unique_kf_idx = torch.arange(window_start, window_end + 1, device=unique_kf_idx.device, dtype=unique_kf_idx.dtype)
             opt_kf_idx = unique_kf_idx
@@ -740,7 +829,7 @@ class FactorGraph:
 
         # pin = 0
         if opt_kf_idx.numel() == 0:
-            return
+            return False
         Xs, T_WCs, Cs = self.get_poses_points(opt_kf_idx)
 
         img_size = self.frames.last_keyframe().img.shape[-2:]
@@ -760,7 +849,10 @@ class FactorGraph:
         valid_match = valid_match[mask]
         Q_ii2jj = Q_ii2jj[mask]
         pose_data = T_WCs.data[:, 0, :]
-        assert((torch.max(ii)-torch.min(ii)).item() == pose_data.shape[0]-1)
+        if ii.numel() == 0:
+            return False
+        assert(torch.min(ii).item() >= pin and torch.min(jj).item() >= pin)
+        assert(torch.max(ii).item() < pin + pose_data.shape[0] and torch.max(jj).item() < pin + pose_data.shape[0])
 
         H = torch.zeros([(pose_data.shape[0])*7,(pose_data.shape[0])*7],dtype=torch.float64,device='cpu')
         v = torch.zeros([(pose_data.shape[0])*7],dtype=torch.float64,device='cpu')
@@ -840,17 +932,17 @@ class FactorGraph:
                     # The prior factors are constructed at the first iteration (i==0)
                     if i == 0:
                         if iii == 0 and pin>0 :
-                            if explicit_window or self.marg_factor is None:
+                            if self.marg_factor is not None and pin == self.last_pin:
+                                prior_factors.append(self.marg_factor)
+                            else:
                                 prior_factors.append(gtsam.PriorFactorPose3(X(iii),gtsam.Pose3(self.wTcs[iii+pin]), gtsam.noiseModel.Diagonal.Sigmas(self.regularization_noise)))
                                 prior_factors.append(gtsam.PriorFactorDouble(S(iii),self.ss[iii+pin], gtsam.noiseModel.Diagonal.Sigmas([1.0])))
-                            else:
-                                prior_factors.append(self.marg_factor)
 
                         # print('z',time.time())
                         if iii > 0:
                             new_preintegration =  gtsam.PreintegratedCombinedMeasurements(self.params,self.bs[iii-1+pin])
-                            dd = self.imu_pool.get_records(self.poses_stamps[self.frames[iii-1+torch.min(ii).item()].frame_id],
-                                                           self.poses_stamps[self.frames[iii+torch.min(ii).item()].frame_id])
+                            dd = self.imu_pool.get_records(self.poses_stamps[self.frames[iii-1+pin].frame_id],
+                                                           self.poses_stamps[self.frames[iii+pin].frame_id])
                             is_bad = False
                             for t0, t1, ddd in dd:
                                 if t1 - t0 > 0.1: is_bad = True;print(t0,t1-t0,'!!!!!!!!!!!!!!!!!!!!!!!!')
@@ -926,6 +1018,8 @@ class FactorGraph:
 
         if T_WCs.shape[0] == 7:
             self.solve_VI_init()
+
+        return True
 
 
 
