@@ -757,17 +757,13 @@ class FactorGraph:
         for iii in range(T_WCs.shape[0]):
             abs_idx = pin + iii
             initials.insert(X(iii), gtsam.Pose3(self.wTcs[abs_idx]))
-            initials.insert(S(iii), self.ss[abs_idx])
             initials.insert(C(iii), gtsam.Pose3(self.Tic))
             initials.insert(Z(iii), gtsam.Pose3(self.wTcs[abs_idx] @ np.linalg.inv(self.Tic)))
             initials.insert(B(iii), self.bs[abs_idx])
             initials.insert(V(iii), self.vs[abs_idx])
 
-            if iii == 0 and self.marg_factor is not None and pin == self.last_pin:
-                graph.add(self.marg_factor)
-            elif iii == 0:
+            if iii == 0:
                 graph.add(gtsam.PriorFactorPose3(X(iii), gtsam.Pose3(self.wTcs[abs_idx]), gtsam.noiseModel.Diagonal.Sigmas(self.regularization_noise)))
-                graph.add(gtsam.PriorFactorDouble(S(iii), self.ss[abs_idx], gtsam.noiseModel.Diagonal.Sigmas([1.0])))
 
             if abs_idx == 0:
                 graph.add(gtsam.PriorFactorConstantBias(B(iii), gtsam.imuBias.ConstantBias(np.array([.0,.0,.0]),np.array([.0,.0,.0])), gtsam.noiseModel.Diagonal.Sigmas(self.init_bias_noise)))
@@ -807,11 +803,10 @@ class FactorGraph:
             self.Tic = result.atPose3(C(0)).matrix()
             abs_idx = pin + iii
             next_wTc = result.atPose3(X(iii)).matrix()
-            next_scale = result.atDouble(S(iii))
+            next_scale = self.ss[abs_idx]
             assert_valid_pose_state(next_wTc, next_scale, f"solve_imu_prior_window idx={abs_idx}, pin={pin}, window_end={window_end}")
             self.bs[abs_idx] = result.atConstantBias(B(iii))
             self.vs[abs_idx] = result.atVector(V(iii))
-            self.ss[abs_idx] = next_scale
             self.wTcs[abs_idx] = next_wTc
 
         pose_data = T_WCs.data[:, 0, :]
