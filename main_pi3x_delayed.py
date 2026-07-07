@@ -8,7 +8,7 @@ import lietorch
 import torch
 import tqdm
 import yaml
-from mast3r_fusion.global_opt import FactorGraph
+from mast3r_fusion.pi3x_global_opt import FactorGraph
 
 from mast3r_fusion.config import load_config, config, set_global_config
 from mast3r_fusion.dataloader import Intrinsics, load_dataset
