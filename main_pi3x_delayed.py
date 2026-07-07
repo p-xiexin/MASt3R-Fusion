@@ -19,9 +19,9 @@ from mast3r_fusion.config import load_config, config, set_global_config
 from mast3r_fusion.dataloader import Intrinsics, load_dataset
 import mast3r_fusion.evaluate as eval
 from mast3r_fusion.foxglove_debug import run_foxglove_publisher
-from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
+from mast3r_fusion.frame import Frame, Mode, SharedKeyframes, SharedStates, create_frame
 from mast3r_fusion.frontend_model import load_frontend_model
-from mast3r_fusion.mast3r_utils import load_retriever
+from mast3r_fusion.mast3r_utils import _crop_resize, load_retriever
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
 from mast3r_fusion.tracker import FrameTracker
 from mast3r_fusion.visualization import WindowMsg, run_visualization
@@ -56,6 +56,23 @@ def matrix_to_sim3(T, device='cpu'):
     TSim3[0].data[6] = q[3]
     TSim3[0].data[7] = 1.0
     return TSim3
+
+
+def create_delayed_frame(i, img, T_WC, dataset, device="cuda:0"):
+    target_img_size = config.get("dataset", {}).get("target_img_size")
+    if target_img_size is None:
+        return create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+
+    resized = _crop_resize(img, target_img_size)
+    rgb = resized["img"].to(device=device)
+    img_shape = torch.tensor(resized["true_shape"], device=device)
+    img_true_shape = img_shape.clone()
+    uimg = torch.from_numpy(resized["unnormalized_img"].copy()) / 255.0
+    downsample = config["dataset"]["img_downsample"]
+    if downsample > 1:
+        uimg = uimg[::downsample, ::downsample]
+        img_shape = img_shape // downsample
+    return Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC)
 
 
 def get_backend_edges(idx, keyframes):
@@ -585,7 +602,7 @@ if __name__ == "__main__":
             dT, wTc_pred, pred_dt = factor_graph.predict_pose(i)
             if pred_dt <= pi3x_cfg.get("pose_prior_max_dt", 5.0):
                 T_WC = matrix_to_sim3(wTc_pred)
-        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+        frame = create_delayed_frame(i, img, T_WC, dataset, device=device)
         if use_calib:
             frame.K = K
 
