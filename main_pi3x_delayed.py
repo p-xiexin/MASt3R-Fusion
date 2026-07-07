@@ -9,7 +9,11 @@ import torch
 import tqdm
 import yaml
 from mast3r_fusion.pi3x_delayed import Pi3XDelayedFactorGraph
-from mast3r_fusion.pi3x_delayed.keyframes import limited_roll_up, set_keyframe_global
+from mast3r_fusion.pi3x_delayed.keyframes import (
+    configure_feature_storage,
+    limited_roll_up,
+    set_keyframe_global,
+)
 
 from mast3r_fusion.config import load_config, config, set_global_config
 from mast3r_fusion.dataloader import Intrinsics, load_dataset
@@ -443,8 +447,10 @@ if __name__ == "__main__":
     model.share_memory()
     feature_spec = model.get_feature_spec() if hasattr(model, "get_feature_spec") else None
 
-    keyframes = SharedKeyframes(manager, h, w, feature_spec=feature_spec)
-    states = SharedStates(manager, h, w, feature_spec=feature_spec)
+    keyframes = SharedKeyframes(manager, h, w)
+    states = SharedStates(manager, h, w)
+    configure_feature_storage(keyframes, h, w, feature_spec)
+    configure_feature_storage(states, h, w, feature_spec)
 
     if not args.no_viz:
         viz = mp.Process(

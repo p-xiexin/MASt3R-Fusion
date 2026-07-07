@@ -1,6 +1,35 @@
 import torch
 
 
+def configure_feature_storage(shared, h, w, feature_spec):
+    if feature_spec is None:
+        return
+
+    feat_dim = int(getattr(feature_spec, "feat_dim", 1024))
+    patch_size = int(getattr(feature_spec, "patch_size", 16))
+    if hasattr(feature_spec, "num_patches"):
+        num_patches = int(feature_spec.num_patches(h, w))
+    else:
+        num_patches = h * w // (patch_size * patch_size)
+
+    shared.feat_dim = feat_dim
+    shared.num_patches = num_patches
+
+    if hasattr(shared, "buffer"):
+        feat_shape = (shared.buffer, 1, num_patches, feat_dim)
+        pos_shape = (shared.buffer, 1, num_patches, 2)
+    else:
+        feat_shape = (1, num_patches, feat_dim)
+        pos_shape = (1, num_patches, 2)
+
+    shared.feat = torch.zeros(
+        feat_shape, device=shared.device, dtype=shared.dtype
+    ).share_memory_()
+    shared.pos = torch.zeros(
+        pos_shape, device=shared.device, dtype=torch.long
+    ).share_memory_()
+
+
 def set_keyframe_global(keyframes, idx, frame):
     with keyframes.lock:
         storage_idx = idx - keyframes.rollup_sum.value
