@@ -9,7 +9,6 @@ from mast3r_fusion.geometry import (
 )
 from mast3r_fusion.nonlinear_optimizer import check_convergence, huber
 from mast3r_fusion.config import config
-from mast3r_fusion.mast3r_utils import mast3r_match_asymmetric
 import lietorch
 import time
 
@@ -34,10 +33,19 @@ class FrameTracker:
     def track(self, frame: Frame):
         keyframe = self.keyframes.last_keyframe()
 
-
-        idx_f2k, valid_match_k, Xff, Cff, Qff, Xkf, Ckf, Qkf = mast3r_match_asymmetric(
-            self.model, frame, keyframe, idx_i2j_init=self.idx_f2k
+        match = self.model.match_pair(
+            frame,
+            keyframe,
+            init=self.idx_f2k,
         )
+        idx_f2k = match.idx_i2j
+        valid_match_k = match.valid_match_j
+        Xff = match.Xii
+        Cff = match.Cii
+        Qff = match.Qii
+        Xkf = match.Xji
+        Ckf = match.Cji
+        Qkf = match.Qji
         # Save idx for next
         self.idx_f2k = idx_f2k.clone()
 
@@ -113,7 +121,7 @@ class FrameTracker:
         Xkk = T_CkCf.act(Xkf)
         keyframe.update_pointmap(Xkk, Ckf)
         # write back the fitered pointmap
-        self.keyframes[len(self.keyframes) - 1] = keyframe
+        self.keyframes[len(self.keyframes) - 1 + self.keyframes.rollup_sum.value] = keyframe
 
         # Keyframe selection
         n_valid = valid_kf.sum()

@@ -8,20 +8,15 @@ import lietorch
 import torch
 import tqdm
 import yaml
-from mast3r_fusion.pi3x_delayed import Pi3XDelayedFactorGraph
-from mast3r_fusion.pi3x_delayed.keyframes import (
-    configure_feature_storage,
-    limited_roll_up,
-    set_keyframe_global,
-)
+from mast3r_fusion.global_opt import FactorGraph
 
 from mast3r_fusion.config import load_config, config, set_global_config
 from mast3r_fusion.dataloader import Intrinsics, load_dataset
 import mast3r_fusion.evaluate as eval
 from mast3r_fusion.foxglove_debug import run_foxglove_publisher
-from mast3r_fusion.frame import Frame, Mode, SharedKeyframes, SharedStates, create_frame
+from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
 from mast3r_fusion.frontend_model import load_frontend_model
-from mast3r_fusion.mast3r_utils import _crop_resize, load_retriever
+from mast3r_fusion.mast3r_utils import load_retriever
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
 from mast3r_fusion.tracker import FrameTracker
 from mast3r_fusion.visualization import WindowMsg, run_visualization
@@ -56,23 +51,6 @@ def matrix_to_sim3(T, device='cpu'):
     TSim3[0].data[6] = q[3]
     TSim3[0].data[7] = 1.0
     return TSim3
-
-
-def create_delayed_frame(i, img, T_WC, dataset, device="cuda:0"):
-    target_img_size = config.get("dataset", {}).get("target_img_size")
-    if target_img_size is None:
-        return create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
-
-    resized = _crop_resize(img, target_img_size)
-    rgb = resized["img"].to(device=device)
-    img_shape = torch.tensor(resized["true_shape"], device=device)
-    img_true_shape = img_shape.clone()
-    uimg = torch.from_numpy(resized["unnormalized_img"].copy()) / 255.0
-    downsample = config["dataset"]["img_downsample"]
-    if downsample > 1:
-        uimg = uimg[::downsample, ::downsample]
-        img_shape = img_shape // downsample
-    return Frame(i, rgb, img_shape, img_true_shape, uimg, T_WC)
 
 
 def get_backend_edges(idx, keyframes):
@@ -311,7 +289,7 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
     )
     for local_idx, frame in enumerate(window_frames):
         frame.update_pointmap(Xs[local_idx : local_idx + 1], Cs[local_idx : local_idx + 1])
-        set_keyframe_global(keyframes, window_indices[local_idx], frame)
+        keyframes[window_indices[local_idx]] = frame
 
     matches = [constraints[edge] for edge in local_edges]
     window_start = min(all_kf_idx + all_frame_idx)
@@ -464,10 +442,8 @@ if __name__ == "__main__":
     model.share_memory()
     feature_spec = model.get_feature_spec() if hasattr(model, "get_feature_spec") else None
 
-    keyframes = SharedKeyframes(manager, h, w)
-    states = SharedStates(manager, h, w)
-    configure_feature_storage(keyframes, h, w, feature_spec)
-    configure_feature_storage(states, h, w, feature_spec)
+    keyframes = SharedKeyframes(manager, h, w, feature_spec=feature_spec)
+    states = SharedStates(manager, h, w, feature_spec=feature_spec)
 
     if not args.no_viz:
         viz = mp.Process(
@@ -522,7 +498,7 @@ if __name__ == "__main__":
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
 
-    factor_graph = Pi3XDelayedFactorGraph(model, keyframes, K, device, args)
+    factor_graph = FactorGraph(model, keyframes, K, device, args)
     factor_graph.poses_stamps = dataset.timestamps
     pi3x_cfg = config.get("pi3x", {})
     pi3x_delayed_matching = (
@@ -602,7 +578,7 @@ if __name__ == "__main__":
             dT, wTc_pred, pred_dt = factor_graph.predict_pose(i)
             if pred_dt <= pi3x_cfg.get("pose_prior_max_dt", 5.0):
                 T_WC = matrix_to_sim3(wTc_pred)
-        frame = create_delayed_frame(i, img, T_WC, dataset, device=device)
+        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
         if use_calib:
             frame.K = K
 
@@ -752,10 +728,11 @@ if __name__ == "__main__":
         if len(keyframes) > 30:
             if pi3x_delayed_matching and pending_delayed_kf_idx:
                 flush_delayed_backend(states, keyframes, pending_delayed_kf_idx)
+            rollup = 15
             if pi3x_delayed_matching:
-                limited_roll_up(keyframes, 15, factor_graph.last_pin)
-            else:
-                keyframes.roll_up(15)
+                rollup = min(rollup, max(factor_graph.last_pin - keyframes.rollup_sum.value, 0))
+            if rollup > 0:
+                keyframes.roll_up(rollup)
 
         # log time
         if i % 30 == 0:

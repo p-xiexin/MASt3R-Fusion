@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Optional
 import lietorch
 import torch
-from mast3r_fusion.mast3r_utils import resize_img
+from mast3r_fusion.mast3r_utils import _crop_resize, resize_img
 from mast3r_fusion.config import config
 
 
@@ -111,11 +111,15 @@ class Frame:
 
 
 def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
-    img = resize_img(img, img_size)
+    target_img_size = config.get("dataset", {}).get("target_img_size")
+    if target_img_size is not None:
+        img = _crop_resize(img, target_img_size)
+    else:
+        img = resize_img(img, img_size)
     rgb = img["img"].to(device=device)
     img_shape = torch.tensor(img["true_shape"], device=device)
     img_true_shape = img_shape.clone()
-    uimg = torch.from_numpy(img["unnormalized_img"]) / 255.0
+    uimg = torch.from_numpy(img["unnormalized_img"].copy()) / 255.0
     downsample = config["dataset"]["img_downsample"]
     if downsample > 1:
         uimg = uimg[::downsample, ::downsample]
@@ -125,7 +129,7 @@ def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
 
 
 class SharedStates:
-    def __init__(self, manager, h, w, dtype=torch.float32, device="cuda"):
+    def __init__(self, manager, h, w, dtype=torch.float32, device="cuda", feature_spec=None):
         self.h, self.w = h, w
         self.dtype = dtype
         self.device = device
@@ -138,8 +142,11 @@ class SharedStates:
         self.edges_ii = manager.list()
         self.edges_jj = manager.list()
 
-        self.feat_dim = 1024
-        self.num_patches = h * w // (16 * 16)
+        self.feat_dim = getattr(feature_spec, "feat_dim", 1024)
+        if feature_spec is not None:
+            self.num_patches = feature_spec.num_patches(h, w)
+        else:
+            self.num_patches = h * w // (16 * 16)
 
         # fmt:off
         # shared state for the current frame (used for reloc/visualization)
@@ -220,7 +227,7 @@ class SharedStates:
 
 import cv2
 class SharedKeyframes:
-    def __init__(self, manager, h, w, buffer=64, dtype=torch.float32, device="cuda"):
+    def __init__(self, manager, h, w, buffer=64, dtype=torch.float32, device="cuda", feature_spec=None):
         self.lock = manager.RLock()
         self.n_size = manager.Value("i", 0)
         self.rollup_sum = manager.Value("i", 0)
@@ -230,8 +237,11 @@ class SharedKeyframes:
         self.dtype = dtype
         self.device = device
 
-        self.feat_dim = 1024
-        self.num_patches = h * w // (16 * 16)
+        self.feat_dim = getattr(feature_spec, "feat_dim", 1024)
+        if feature_spec is not None:
+            self.num_patches = feature_spec.num_patches(h, w)
+        else:
+            self.num_patches = h * w // (16 * 16)
 
         # fmt:off
         self.dataset_idx = torch.zeros(buffer, device=device, dtype=torch.int).share_memory_()
@@ -254,43 +264,61 @@ class SharedKeyframes:
     def __getitem__(self, idx) -> Frame:
         with self.lock:
             # print('get:',idx,self.rollup_sum.value)
+            storage_idx = idx - self.rollup_sum.value
+            if storage_idx < 0 or storage_idx >= self.n_size.value:
+                msg = (
+                    f"[ERROR] SharedKeyframes get invalid idx={idx}, "
+                    f"storage_idx={storage_idx}, rollup_sum={self.rollup_sum.value}, "
+                    f"n_size={self.n_size.value}"
+                )
+                print(msg)
+                raise IndexError(msg)
             # put all of the data into a frame
             kf = Frame(
-                int(self.dataset_idx[idx-self.rollup_sum.value]),
-                self.img[idx-self.rollup_sum.value],
-                self.img_shape[idx-self.rollup_sum.value],
-                self.img_true_shape[idx-self.rollup_sum.value],
-                self.uimg[idx-self.rollup_sum.value],
-                lietorch.Sim3(self.T_WC[idx-self.rollup_sum.value]),
+                int(self.dataset_idx[storage_idx]),
+                self.img[storage_idx],
+                self.img_shape[storage_idx],
+                self.img_true_shape[storage_idx],
+                self.uimg[storage_idx],
+                lietorch.Sim3(self.T_WC[storage_idx]),
             )
-            kf.X_canon = self.X[idx-self.rollup_sum.value]
-            kf.C = self.C[idx-self.rollup_sum.value]
-            kf.feat = self.feat[idx-self.rollup_sum.value]
-            kf.pos = self.pos[idx-self.rollup_sum.value]
-            kf.N = int(self.N[idx-self.rollup_sum.value])
-            kf.N_updates = int(self.N_updates[idx-self.rollup_sum.value])
+            kf.X_canon = self.X[storage_idx]
+            kf.C = self.C[storage_idx]
+            kf.feat = self.feat[storage_idx]
+            kf.pos = self.pos[storage_idx]
+            kf.N = int(self.N[storage_idx])
+            kf.N_updates = int(self.N_updates[storage_idx])
             if config["use_calib"]:
                 kf.K = self.K
             return kf
 
     def __setitem__(self, idx, value: Frame) -> None:
         with self.lock:
-            self.n_size.value = max(idx + 1, self.n_size.value)
+            storage_idx = idx - self.rollup_sum.value
+            if storage_idx < 0:
+                msg = (
+                    f"[ERROR] SharedKeyframes set invalid idx={idx}, "
+                    f"storage_idx={storage_idx}, rollup_sum={self.rollup_sum.value}, "
+                    f"n_size={self.n_size.value}"
+                )
+                print(msg)
+                raise IndexError(msg)
+            self.n_size.value = max(storage_idx + 1, self.n_size.value)
 
             # set the attributes
-            self.dataset_idx[idx] = value.frame_id
-            self.img[idx] = value.img
-            self.uimg[idx] = value.uimg
-            self.img_shape[idx] = value.img_shape
-            self.img_true_shape[idx] = value.img_true_shape
-            self.T_WC[idx] = value.T_WC.data
-            self.X[idx] = value.X_canon
-            self.C[idx] = value.C
-            self.feat[idx] = value.feat
-            self.pos[idx] = value.pos
-            self.N[idx] = value.N
-            self.N_updates[idx] = value.N_updates
-            self.is_dirty[idx] = True
+            self.dataset_idx[storage_idx] = value.frame_id
+            self.img[storage_idx] = value.img
+            self.uimg[storage_idx] = value.uimg
+            self.img_shape[storage_idx] = value.img_shape
+            self.img_true_shape[storage_idx] = value.img_true_shape
+            self.T_WC[storage_idx] = value.T_WC.data
+            self.X[storage_idx] = value.X_canon
+            self.C[storage_idx] = value.C
+            self.feat[storage_idx] = value.feat
+            self.pos[storage_idx] = value.pos
+            self.N[storage_idx] = value.N
+            self.N_updates[storage_idx] = value.N_updates
+            self.is_dirty[storage_idx] = True
             return idx
 
     def __len__(self):
@@ -299,7 +327,7 @@ class SharedKeyframes:
 
     def append(self, value: Frame):
         with self.lock:
-            self[self.n_size.value] = value
+            self[self.n_size.value + self.rollup_sum.value] = value
 
     def pop_last(self):
         with self.lock:
@@ -313,7 +341,28 @@ class SharedKeyframes:
 
     def update_T_WCs(self, T_WCs, idx) -> None:
         with self.lock:
-            self.T_WC[idx - self.rollup_sum.value] = T_WCs.data
+            storage_idx = idx - self.rollup_sum.value
+            if torch.any(storage_idx < 0) or torch.any(storage_idx >= self.n_size.value):
+                msg = (
+                    f"[ERROR] SharedKeyframes update_T_WCs invalid idx={idx}, "
+                    f"storage_idx={storage_idx}, rollup_sum={self.rollup_sum.value}, "
+                    f"n_size={self.n_size.value}"
+                )
+                print(msg)
+                raise IndexError(msg)
+            sim3_data = T_WCs.data
+            quat_norm = torch.linalg.norm(sim3_data[..., 3:7], dim=-1)
+            scale = sim3_data[..., 7]
+            if torch.any(~torch.isfinite(sim3_data)) or torch.any(quat_norm <= 1e-8) or torch.any(~torch.isfinite(scale)) or torch.any(torch.abs(scale) <= 1e-8):
+                msg = (
+                    f"[ERROR] SharedKeyframes update_T_WCs invalid Sim3 idx={idx}, "
+                    f"quat_norm={quat_norm.detach().cpu().tolist()}, "
+                    f"scale={scale.detach().cpu().tolist()}, "
+                    f"rollup_sum={self.rollup_sum.value}, n_size={self.n_size.value}"
+                )
+                print(msg)
+                raise ValueError(msg)
+            self.T_WC[storage_idx] = sim3_data
 
     def get_dirty_idx(self):
         with self.lock:
