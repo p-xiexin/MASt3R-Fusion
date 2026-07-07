@@ -13,21 +13,14 @@ imu:
   gyro_unit: deg
 
 frontend:
-  type: vins # vins or xfeat
+  type: vins
   max_features: 400
   min_distance: 20
   keyframe_gap: 5
   keyframe_parallax: 20.0
   fb_thresh: 0.5
-  reject_with_f: false
+  reject_with_f: true
   f_ransac_thresh: 1.5
-  xfeat_top_k: 1200
-  xfeat_min_cossim: 0.82
-  xfeat_refill_ratio: 0.95
-  xfeat_geo_ransac_thresh: 1.0
-  xfeat_min_geo_inliers: 60
-  xfeat_strong_geo_inliers: 90
-  xfeat_min_geo_ratio: 0.40
 
 backend:
   window_size: 8
@@ -39,10 +32,14 @@ backend:
   vi_init_min_keyframes: 8
   vi_init_min_points: 50
   vi_init_min_baseline: 0.05
-  accel_noise_sigma: 0.08
-  gyro_noise_sigma: 0.004
-  accel_bias_rw_sigma: 0.0004
-  gyro_bias_rw_sigma: 0.00002
+  vi_init_disable_scale: true
+  vi_init_min_scale: 0.05
+  vi_init_max_scale: 20.0
+  vi_init_max_gyro_bias: 0.2
+  accel_noise_sigma: 0.00001962
+  gyro_noise_sigma: 0.00001028445124575
+  accel_bias_rw_sigma: 0.00004905
+  gyro_bias_rw_sigma: 0.00000036361026075
   marginal_pose_sigma: 0.03
   marginal_velocity_sigma: 0.3
   marginal_bias_sigma: 0.001
@@ -62,6 +59,18 @@ backend:
   vo_pose_prior_trans_sigma: 0.05
   odom_prior_rot_sigma: 0.05
   odom_prior_trans_sigma: 0.03
+  vio_imu_mode: predict_align
+  gyro_factor_rot_sigma: 0.01
+  gyro_factor_trans_sigma: 1000000.0
+  vio_visual_pose_prior_rot_sigma: 0.02
+  vio_visual_pose_prior_trans_sigma: 0.05
+  vio_max_pose_update_trans: 0.25
+  vio_max_pose_update_rot_deg: 5.0
+  vio_use_imu_rotation: false
+  fix_vo_poses: true
+  fixed_pose_sigma: 0.000001
+  max_landmark_depth: 80.0
+  max_landmark_reproj_error: 4.0
 
 viz:
   out_dir: sparse_vio_demo/output/kitti360

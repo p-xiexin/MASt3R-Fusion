@@ -331,18 +331,10 @@ class FoxglovePublisher:
             f"F={dbg.get('f_kept', 0):.0f}/{dbg.get('f_before', 0):.0f} "
             f"PnP={dbg.get('pnp_inliers', 0):.0f} rmse={dbg.get('pnp_rmse', 0):.1f}"
         )
-        text3 = (
-            f"XFeat det={dbg.get('xfeat_detected', 0):.0f} "
-            f"match={dbg.get('xfeat_raw_matches', 0):.0f} "
-            f"geo={dbg.get('xfeat_geo_inliers', 0):.0f}/{dbg.get('xfeat_geo_ratio', 0):.2f} "
-            f"tracked={dbg.get('xfeat_tracked', 0):.0f} spawn={dbg.get('xfeat_spawned', 0):.0f}"
-        )
         cv2.rectangle(image, (8, 8), (720, 40), (0, 0, 0), -1)
         cv2.putText(image, text, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.rectangle(image, (8, 42), (880, 72), (0, 0, 0), -1)
         cv2.putText(image, text2, (16, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.rectangle(image, (8, 74), (880, 104), (0, 0, 0), -1)
-        cv2.putText(image, text3, (16, 96), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
         return image
 
     def _body_camera_pose(self):

@@ -6,7 +6,6 @@ MASt3R/PI3X fusion runtime.
 ## Kept Scope
 
 - `vins` frontend: VINS-style feature lifecycle with KLT tracking.
-- `xfeat` frontend: XFeat feature spawning plus the same KLT tracking path.
 - `SparseBackend`: GTSAM sparse landmark backend with optional IMU factors.
 - Foxglove debug overlay for tracking image, trajectory, body/camera TF, and
   sparse landmarks.
@@ -28,7 +27,6 @@ Foxglove quick runs:
 
 ```bash
 sparse_vio_demo/run_vins_foxglove.sh
-sparse_vio_demo/run_xfeat_foxglove.sh
 ```
 
 The Foxglove server binds to `0.0.0.0:8765` by default in the quick/eval

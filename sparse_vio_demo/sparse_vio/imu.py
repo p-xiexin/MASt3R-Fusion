@@ -5,6 +5,7 @@ import math
 from dataclasses import dataclass
 from typing import List
 
+import cv2
 import numpy as np
 
 
@@ -32,13 +33,19 @@ class ImuBuffer:
 
     def records(self, t0: float, t1: float) -> List[ImuRecord]:
         out = []
-        cur_t = float(t0)
-        while cur_t < t1 - 1e-9:
-            idx = bisect.bisect(self.time, cur_t + 1e-3)
-            if idx >= len(self.time):
-                break
-            next_t = min(float(self.time[idx]), float(t1))
-            if next_t > cur_t:
-                out.append(ImuRecord(cur_t, next_t, self.gyro[idx].copy(), self.accel[idx].copy()))
-            cur_t = next_t
+        start = max(0, bisect.bisect_right(self.time, float(t0)) - 1)
+        stop = min(len(self.time) - 1, bisect.bisect_left(self.time, float(t1)) + 1)
+        for idx in range(start, stop):
+            seg_t0 = max(float(t0), float(self.time[idx]))
+            seg_t1 = min(float(t1), float(self.time[idx + 1]))
+            if seg_t1 > seg_t0:
+                out.append(ImuRecord(seg_t0, seg_t1, self.gyro[idx].copy(), self.accel[idx].copy()))
         return out
+
+    def delta_rotation(self, t0: float, t1: float) -> np.ndarray:
+        R = np.eye(3, dtype=np.float64)
+        for rec in self.records(t0, t1):
+            omega_dt = rec.gyro * (rec.t1 - rec.t0)
+            dR, _ = cv2.Rodrigues(omega_dt.reshape(3, 1))
+            R = R @ dR
+        return R

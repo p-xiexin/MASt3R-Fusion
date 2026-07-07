@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 from sparse_vio_demo.sparse_vio.backend import SparseBackend
 from sparse_vio_demo.sparse_vio.backend.sparse_ba import BackendConfig
 from sparse_vio_demo.sparse_vio.dataset import ImageDataset, load_camera
-from sparse_vio_demo.sparse_vio.frontend import VinsFrontend, XFeatFrontend
+from sparse_vio_demo.sparse_vio.frontend import VinsFrontend
 from sparse_vio_demo.sparse_vio.frontend.vins_frontend import VinsFrontendConfig
 from sparse_vio_demo.sparse_vio.imu import ImuBuffer
 from sparse_vio_demo.sparse_vio.trajectory import save_tum_trajectory
@@ -26,7 +26,7 @@ def load_cfg(path):
         return yaml.safe_load(f)
 
 
-def make_frontend(name, camera, cfg):
+def make_frontend(camera, cfg):
     vins_cfg = VinsFrontendConfig(
         max_features=int(cfg.get("max_features", 250)),
         min_distance=int(cfg.get("min_distance", 30)),
@@ -36,27 +36,13 @@ def make_frontend(name, camera, cfg):
         f_ransac_thresh=float(cfg.get("f_ransac_thresh", 1.0)),
         reject_with_f=bool(cfg.get("reject_with_f", False)),
     )
-    if name == "vins":
-        return VinsFrontend(camera, vins_cfg)
-    if name == "xfeat":
-        return XFeatFrontend(
-            camera,
-            vins_cfg,
-            top_k=int(cfg.get("xfeat_top_k", 300)),
-            min_cossim=float(cfg.get("xfeat_min_cossim", 0.75)),
-            refill_ratio=float(cfg.get("xfeat_refill_ratio", 0.9)),
-            geo_ransac_thresh=float(cfg.get("xfeat_geo_ransac_thresh", 1.0)),
-            min_geo_inliers=int(cfg.get("xfeat_min_geo_inliers", 60)),
-            strong_geo_inliers=int(cfg.get("xfeat_strong_geo_inliers", 90)),
-            min_geo_ratio=float(cfg.get("xfeat_min_geo_ratio", 0.45)),
-        )
-    raise ValueError(f"Unknown frontend: {name}")
+    return VinsFrontend(camera, vins_cfg)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="sparse_vio_demo/configs/kitti360_sparse.yaml")
-    parser.add_argument("--frontend", choices=["vins", "xfeat"], default=None)
+    parser.add_argument("--frontend", choices=["vins"], default="vins")
     parser.add_argument("--no-video", action="store_true")
     parser.add_argument("--foxglove", action="store_true")
     parser.add_argument("--foxglove-host", default=None)
@@ -85,7 +71,7 @@ def main():
         end=int(ds_cfg.get("end", -1) if args.end is None else args.end),
         subsample=int(ds_cfg.get("subsample", 1) if args.subsample is None else args.subsample),
     )
-    frontend_name = args.frontend or fe_cfg.get("type", "vins")
+    frontend_name = "vins"
     imu_cfg = cfg.get("imu", {})
     use_imu = bool(imu_cfg.get("use_imu", True) if args.use_imu is None else args.use_imu)
     imu_path = args.imu_path if args.imu_path is not None else imu_cfg.get("path")
@@ -96,8 +82,8 @@ def main():
             dt=float(args.imu_dt if args.imu_dt is not None else imu_cfg.get("dt", 0.0)),
             gyro_unit=imu_cfg.get("gyro_unit", "deg"),
         )
-    frontend = make_frontend(frontend_name, camera, fe_cfg)
-    default_keyframe_only = frontend_name == "xfeat"
+    frontend = make_frontend(camera, fe_cfg)
+    default_keyframe_only = False
     default_use_odom_prior = True
     backend = SparseBackend(
         camera,
@@ -110,6 +96,10 @@ def main():
             vi_init_min_keyframes=int(be_cfg.get("vi_init_min_keyframes", 8)),
             vi_init_min_points=int(be_cfg.get("vi_init_min_points", 50)),
             vi_init_min_baseline=float(be_cfg.get("vi_init_min_baseline", 0.05)),
+            vi_init_disable_scale=bool(be_cfg.get("vi_init_disable_scale", True)),
+            vi_init_min_scale=float(be_cfg.get("vi_init_min_scale", 0.05)),
+            vi_init_max_scale=float(be_cfg.get("vi_init_max_scale", 20.0)),
+            vi_init_max_gyro_bias=float(be_cfg.get("vi_init_max_gyro_bias", 0.2)),
             accel_noise_sigma=float(be_cfg.get("accel_noise_sigma", 0.08)),
             gyro_noise_sigma=float(be_cfg.get("gyro_noise_sigma", 0.004)),
             accel_bias_rw_sigma=float(be_cfg.get("accel_bias_rw_sigma", 0.0004)),
@@ -136,6 +126,18 @@ def main():
             vo_pose_prior_trans_sigma=float(be_cfg.get("vo_pose_prior_trans_sigma", 0.05)),
             odom_prior_rot_sigma=float(be_cfg.get("odom_prior_rot_sigma", 0.05)),
             odom_prior_trans_sigma=float(be_cfg.get("odom_prior_trans_sigma", 0.2)),
+            vio_imu_mode=str(be_cfg.get("vio_imu_mode", "gyro")),
+            gyro_factor_rot_sigma=float(be_cfg.get("gyro_factor_rot_sigma", 0.01)),
+            gyro_factor_trans_sigma=float(be_cfg.get("gyro_factor_trans_sigma", 1.0e6)),
+            vio_visual_pose_prior_rot_sigma=float(be_cfg.get("vio_visual_pose_prior_rot_sigma", 0.02)),
+            vio_visual_pose_prior_trans_sigma=float(be_cfg.get("vio_visual_pose_prior_trans_sigma", 0.05)),
+            vio_max_pose_update_trans=float(be_cfg.get("vio_max_pose_update_trans", 0.25)),
+            vio_max_pose_update_rot_deg=float(be_cfg.get("vio_max_pose_update_rot_deg", 5.0)),
+            vio_use_imu_rotation=bool(be_cfg.get("vio_use_imu_rotation", True)),
+            fix_vo_poses=bool(be_cfg.get("fix_vo_poses", True)),
+            fixed_pose_sigma=float(be_cfg.get("fixed_pose_sigma", 1e-6)),
+            max_landmark_depth=float(be_cfg.get("max_landmark_depth", 80.0)),
+            max_landmark_reproj_error=float(be_cfg.get("max_landmark_reproj_error", 4.0)),
         ),
         imu=imu,
     )
@@ -159,29 +161,24 @@ def main():
         foxglove.start()
 
     timestamps = {}
+    prev_packet = None
     for packet in dataset:
         timestamps[packet.idx] = packet.timestamp
-        result = frontend.process(packet)
+        gyro_R = None
+        if imu is not None and prev_packet is not None:
+            gyro_R = imu.delta_rotation(prev_packet.timestamp, packet.timestamp)
+        result = frontend.process(packet, gyro_R=gyro_R)
+        prev_packet = packet
         state = backend.push(result)
         visualizer.draw(result, state)
         if foxglove is not None:
             foxglove.publish(result, state)
         if packet.idx % 20 == 0:
-            dbg = result.debug
-            xfeat_stats = ""
-            if "xfeat_raw_matches" in dbg:
-                xfeat_stats = (
-                    f" match={dbg.get('xfeat_raw_matches', 0):.0f}"
-                    f" geo={dbg.get('xfeat_geo_inliers', 0):.0f}/{dbg.get('xfeat_geo_ratio', 0):.2f}"
-                    f" tracked={dbg.get('xfeat_tracked', 0):.0f}"
-                    f" spawn={dbg.get('xfeat_spawned', 0):.0f}"
-                )
             print(
                 f"[sparse_vio] frame={packet.idx} frontend={frontend_name} "
                 f"use_imu={int(use_imu)} "
                 f"tracks={len(result.tracks)} kf={int(result.new_keyframe)} "
                 f"poses={len(state.poses)} points={len(state.points)}"
-                f"{xfeat_stats}"
             )
     if hasattr(backend, "finalize"):
         backend.finalize()

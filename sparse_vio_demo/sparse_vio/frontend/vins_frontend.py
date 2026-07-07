@@ -35,6 +35,7 @@ class VinsFrontend:
         self.next_track_id = 0
         self.last_keyframe_id = 0
         self.debug = {}
+        self._focal = float((self.camera.K[0, 0] + self.camera.K[1, 1]) * 0.5)
 
     def process(self, packet: FramePacket, gyro_R: Optional[np.ndarray] = None) -> FrontendResult:
         gray = self._gray(packet.image)
@@ -73,7 +74,7 @@ class VinsFrontend:
             self.prev_gray,
             gray,
             prev_pts.reshape(-1, 1, 2),
-            None if init is None else init.reshape(-1, 1, 2).astype(np.float32),
+            None if init is None else np.ascontiguousarray(init.reshape(-1, 1, 2), dtype=np.float32),
             winSize=(self.cfg.lk_win, self.cfg.lk_win),
             maxLevel=self.cfg.lk_levels,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
@@ -121,7 +122,9 @@ class VinsFrontend:
             cur.append(obs[-1].xy)
         prev = np.asarray(prev, dtype=np.float32)
         cur = np.asarray(cur, dtype=np.float32)
-        _, mask = cv2.findFundamentalMat(prev, cur, cv2.FM_RANSAC, self.cfg.f_ransac_thresh, 0.99)
+        prev_norm = self._undistort_points(prev)
+        cur_norm = self._undistort_points(cur)
+        _, mask = cv2.findFundamentalMat(prev_norm, cur_norm, cv2.FM_RANSAC, self.cfg.f_ransac_thresh / self._focal, 0.99)
         if mask is None:
             return
         kept = mask.reshape(-1).astype(bool)
@@ -191,7 +194,9 @@ class VinsFrontend:
             cur = track.observations[-1]
             prev = track.observations[-2]
             if cur.frame_id == frame_id and prev.frame_id == self.prev_frame_id:
-                parallax.append(np.linalg.norm(cur.xy - prev.xy))
+                cur_norm = self._undistort_points(cur.xy.reshape(1, 2))[0]
+                prev_norm = self._undistort_points(prev.xy.reshape(1, 2))[0]
+                parallax.append(np.linalg.norm(cur_norm - prev_norm) * self._focal)
 
         self.debug["last_track_num"] = float(last_track_num)
         self.debug["long_track_num"] = float(long_track_num)
@@ -222,6 +227,15 @@ class VinsFrontend:
             & (pts[:, 1] >= 0)
             & (pts[:, 1] < self.camera.height)
         )
+
+    def _undistort_points(self, pts):
+        pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+        if self.camera.distortion is None:
+            K_inv = np.linalg.inv(self.camera.K)
+            homog = np.c_[pts, np.ones(len(pts), dtype=np.float64)]
+            rays = (K_inv @ homog.T).T
+            return rays[:, :2] / rays[:, 2:3]
+        return cv2.undistortPoints(pts.reshape(-1, 1, 2), self.camera.K, self.camera.distortion).reshape(-1, 2)
 
     def _result(self, packet, new_keyframe):
         tracks = {}

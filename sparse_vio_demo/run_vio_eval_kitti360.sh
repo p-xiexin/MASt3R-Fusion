@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 CONFIG="${CONFIG:-sparse_vio_demo/configs/kitti360_sparse.yaml}"
-FRONTEND="${FRONTEND:-vins}"
+FRONTEND="vins"
 OUT_DIR="${OUT_DIR:-sparse_vio_demo/output/kitti360_eval}"
 EST="${EST:-$OUT_DIR/estimate.tum}"
 RUN_MANIFEST="${RUN_MANIFEST:-$OUT_DIR/sparse_slam_run_manifest.json}"
