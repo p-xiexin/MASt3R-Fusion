@@ -12,7 +12,6 @@ from mast3r_fusion.foxglove_debug import run_foxglove_publisher
 from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
 from mast3r_fusion.frontend_model import load_frontend_model
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
-from mast3r_fusion.tracker import FrameTracker
 from mast3r_fusion.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
 import numpy as np
@@ -102,29 +101,6 @@ def finish_backend_update(
         print('[INFO] post optim marg', time.time(), marginalize_to)
         factor_graph.marginalize_to(marginalize_to)
         print('[INFO] post optim marg.', time.time())
-
-
-def run_backend_indices(states, keyframes, indices):
-    mode = states.get_mode()
-    if mode == Mode.INIT or states.is_paused() or not indices:
-        return False
-
-    all_kf_idx = []
-    all_frame_idx = []
-    for idx in indices:
-        kf_idx, frame_idx = get_backend_edges(idx)
-        all_kf_idx += kf_idx
-        all_frame_idx += frame_idx
-
-    print('[INFO] add factor',time.time())
-    if all_kf_idx:
-        factor_graph.add_factors(
-            all_kf_idx, all_frame_idx, config["local_opt"]["min_match_frac"]
-        )
-    print('[INFO] add factor.',time.time())
-
-    finish_backend_update(states, keyframes)
-    return True
 
 
 def add_precomputed_factor_matches(factor_graph, ii, jj, matches, min_match_frac):
@@ -219,14 +195,16 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
     if mode == Mode.INIT or states.is_paused() or not indices:
         return False
 
+    pending_indices = list(indices)
     all_kf_idx = []
     all_frame_idx = []
-    for idx in indices:
+    for idx in pending_indices:
         kf_idx, frame_idx = get_backend_edges(idx)
         all_kf_idx += kf_idx
         all_frame_idx += frame_idx
     if not all_kf_idx:
         finish_backend_update(states, keyframes)
+        indices.clear()
         return True
 
     window_indices = sorted(set(all_kf_idx + all_frame_idx))
@@ -269,23 +247,8 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
         window_end=window_end,
         marginalize_to=max(window_end - factor_graph.window_num, 0),
     )
+    indices.clear()
     return True
-
-
-def run_backend(states, keyframes):
-    idx = -1
-    with states.lock:
-        if len(states.global_optimizer_tasks) > 0:
-            idx = states.global_optimizer_tasks[0]
-    if idx == -1:
-        return
-    did_run = run_backend_indices(states, keyframes, [idx])
-    if not did_run:
-        return
-
-    with states.lock:
-        if len(states.global_optimizer_tasks) > 0:
-            idx = states.global_optimizer_tasks.pop(0)
 
 
 def run_delayed_imu_backend(states, keyframes, idx):
@@ -300,23 +263,6 @@ def run_delayed_imu_backend(states, keyframes, idx):
         states.T_WC[:] = latest_frame.T_WC[:].data
     print('[INFO] delayed imu backend.', time.time(), optimized)
     return optimized
-
-
-def flush_delayed_backend(states, keyframes, pending_kf_idx):
-    if not pending_kf_idx:
-        return
-    run_pi3x_window_backend_indices(states, keyframes, pending_kf_idx)
-    pending_kf_idx.clear()
-
-
-def set_frame_pose_only(states, frame):
-    with states.lock:
-        states.dataset_idx[:] = frame.frame_id
-        states.img[:] = frame.img
-        states.uimg[:] = frame.uimg
-        states.img_shape[:] = frame.img_shape
-        states.img_true_shape[:] = frame.img_true_shape
-        states.T_WC[:] = frame.T_WC.data
 
 
 def initialize_delayed_keyframe_placeholders(states, frame):
@@ -439,16 +385,13 @@ if __name__ == "__main__":
         )
         keyframes.set_intrinsics(K)
 
-    tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
 
     factor_graph = FactorGraph(model, keyframes, K, device, args)
     factor_graph.poses_stamps = dataset.timestamps
     pi3x_cfg = config.get("pi3x", {})
-    pi3x_delayed_matching = (
-        pi3x_cfg.get("delayed_matching", False)
-        and pi3x_cfg.get("imu_predict", False)
-    )
+    if not pi3x_cfg.get("delayed_matching", False):
+        raise ValueError("main_pi3x_delayed.py requires pi3x.delayed_matching=true.")
     delayed_batch_keyframes = max(1, int(pi3x_cfg.get("delayed_batch_keyframes", 5)))
     delayed_keyframe_stride = max(1, int(pi3x_cfg.get("delayed_keyframe_stride", 2)))
     pending_delayed_kf_idx = []
@@ -472,6 +415,8 @@ if __name__ == "__main__":
             states.unpause()
 
         if i == len(dataset):
+            if pending_delayed_kf_idx:
+                run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
             states.set_mode(Mode.TERMINATED)
             break
 
@@ -518,74 +463,29 @@ if __name__ == "__main__":
             X_init, C_init = model.infer_single(frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
-            states.queue_global_optimization(len(keyframes) - 1 + keyframes.rollup_sum.value)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame)
             i += 1
             continue
 
-        add_new_kf = False
-        delayed_frame = False
         if mode == Mode.TRACKING:
-            delayed_frame = (
-                pi3x_delayed_matching
-                and factor_graph.enable_ms
-                and pred_dt <= pi3x_cfg.get("pose_prior_max_dt", 5.0)
-            )
-            if delayed_frame:
-                last_kf = keyframes.last_keyframe()
-                last_kf_frame_id = last_kf.frame_id if last_kf is not None else -delayed_keyframe_stride
-                add_new_kf = frame.frame_id - last_kf_frame_id >= delayed_keyframe_stride
-                try_reloc = False
-                match_info = []
-                if add_new_kf:
-                    initialize_delayed_keyframe_placeholders(states, frame)
-                    keyframes.append(frame)
-                    delayed_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
-                    pending_delayed_kf_idx.append(delayed_kf_idx)
-                    states.set_frame(frame)
-                    run_delayed_imu_backend(states, keyframes, delayed_kf_idx)
-                    if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
-                        flush_delayed_backend(states, keyframes, pending_delayed_kf_idx)
-                else:
-                    set_frame_pose_only(states, frame)
-            else:
-                add_new_kf, match_info, try_reloc = tracker.track(frame)
-                if try_reloc:
-                    states.set_mode(Mode.RELOC)
+            last_kf = keyframes.last_keyframe()
+            last_kf_frame_id = last_kf.frame_id if last_kf is not None else -delayed_keyframe_stride
+            add_new_kf = frame.frame_id - last_kf_frame_id >= delayed_keyframe_stride
+            if add_new_kf:
+                initialize_delayed_keyframe_placeholders(states, frame)
+                keyframes.append(frame)
+                delayed_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
+                pending_delayed_kf_idx.append(delayed_kf_idx)
                 states.set_frame(frame)
-        elif mode == Mode.RELOC:
-            X, C = model.infer_single(frame)
-            frame.update_pointmap(X, C)
-            states.set_frame(frame)
-            states.queue_reloc()
+                run_delayed_imu_backend(states, keyframes, delayed_kf_idx)
+                if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
+                    run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
         else:
             raise Exception("Invalid mode")
-        
-        # using IMU prediction to adjust keyframe selectiion
-        if (not delayed_frame) and factor_graph.enable_ms and frame.frame_id>100:
-            dd_old = keyframes.last_keyframe().T_WC.data.cpu().numpy()[0]
-            dd_new = states.T_WC[0].data.cpu().numpy()
-            dT, wTc_pred, pred_dt = factor_graph.predict_pose(frame.frame_id)
-            if pred_dt > 5.0: # if prediction is too long, just use visual tracking
-                pass #do nothing
-            else:
-                if (not add_new_kf) and  np.linalg.norm(Rotation.from_matrix(dT[0:3,0:3]).as_rotvec())>30.0/57.3:
-                    add_new_kf = True
-                    tracker.reset_idx_f2k()
-                if add_new_kf and (np.linalg.norm(dT[0:3,3]) < 1.0 and np.linalg.norm(Rotation.from_matrix(dT[0:3,0:3]).as_rotvec())<5.0/57.3):
-                    add_new_kf = False
-                    tracker.idx_f2k = tracker.idx_f2k_backup
-    
-        if add_new_kf and not delayed_frame:
-            keyframes.append(frame)
-            states.queue_global_optimization(len(keyframes) - 1 + keyframes.rollup_sum.value)
+
         print('[INFO] backend',time.time())
-        if not delayed_frame:
-            run_backend(states, keyframes)
-        if pi3x_delayed_matching and pending_delayed_kf_idx and len(keyframes) > 30:
-            flush_delayed_backend(states, keyframes, pending_delayed_kf_idx)
-        
+
         print(factor_graph.frames_to_save)
         if args.save_h5:
             for iframe in factor_graph.frames_to_save:
@@ -610,7 +510,7 @@ if __name__ == "__main__":
 
 
         # write results
-        dd = states.T_WC[0].data.cpu().numpy() # visual tracking
+        dd = states.T_WC[0].data.cpu().numpy()
         frame_id = frame.frame_id
         try:
             bb = factor_graph.bs[-1].vector()
@@ -635,7 +535,10 @@ if __name__ == "__main__":
         if add_new_kf:
             dd = keyframes.last_keyframe().T_WC.data.cpu().numpy()[0]
             frame_id = keyframes.last_keyframe().frame_id
-            bb = factor_graph.bs[-1].vector()
+            try:
+                bb = factor_graph.bs[-1].vector()
+            except:
+                bb = np.zeros(6)
             factor_graph.fp.writelines('%.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %.10f %d 1\n' % (factor_graph.poses_stamps[frame_id],
                                                                                  dd[0].item(),
                                                                                  dd[1].item(),
@@ -657,11 +560,10 @@ if __name__ == "__main__":
         # notice that we main very few frames to save GPU memory usage
         # generally 8 GB is enough
         if len(keyframes) > 30:
-            if pi3x_delayed_matching and pending_delayed_kf_idx:
-                flush_delayed_backend(states, keyframes, pending_delayed_kf_idx)
+            if pending_delayed_kf_idx:
+                run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
             rollup = 15
-            if pi3x_delayed_matching:
-                rollup = min(rollup, max(factor_graph.last_pin - keyframes.rollup_sum.value, 0))
+            rollup = min(rollup, max(factor_graph.last_pin - keyframes.rollup_sum.value, 0))
             if rollup > 0:
                 keyframes.roll_up(rollup)
 
@@ -671,10 +573,6 @@ if __name__ == "__main__":
             print(f"FPS: {FPS}")
         i += 1
 
-
-    # finally
-    if pi3x_delayed_matching and pending_delayed_kf_idx:
-        flush_delayed_backend(states, keyframes, pending_delayed_kf_idx)
 
     if args.save_h5:
         last_pin = factor_graph.get_unique_kf_idx()[-1]
