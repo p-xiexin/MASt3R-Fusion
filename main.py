@@ -15,8 +15,11 @@ from mast3r_fusion.dataloader import Intrinsics, load_dataset
 import mast3r_fusion.evaluate as eval
 from mast3r_fusion.foxglove_debug import run_foxglove_publisher
 from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
-from mast3r_fusion.frontend_model import load_frontend_model
-from mast3r_fusion.mast3r_utils import load_retriever
+from mast3r_fusion.mast3r_utils import (
+    load_mast3r,
+    load_retriever,
+    mast3r_inference_mono,
+)
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
 from mast3r_fusion.tracker import FrameTracker
 from mast3r_fusion.visualization import WindowMsg, run_visualization
@@ -39,20 +42,6 @@ def find_valid_numbers(a, b):
     return result
 
 
-def matrix_to_sim3(T, device='cpu'):
-    TSim3 = lietorch.Sim3.Identity(1, device=device)
-    q = Rotation.from_matrix(T[0:3, 0:3]).as_quat()
-    TSim3[0].data[0] = T[0, 3]
-    TSim3[0].data[1] = T[1, 3]
-    TSim3[0].data[2] = T[2, 3]
-    TSim3[0].data[3] = q[0]
-    TSim3[0].data[4] = q[1]
-    TSim3[0].data[5] = q[2]
-    TSim3[0].data[6] = q[3]
-    TSim3[0].data[7] = 1.0
-    return TSim3
-
-
 def run_backend(states, keyframes):
     mode = states.get_mode()
     if mode == Mode.INIT or states.is_paused():
@@ -72,15 +61,12 @@ def run_backend(states, keyframes):
     frame = keyframes[idx]
 
     # find local(!) co-visible frames
-    if retrieval_database is not None:
-        retrieval_inds = retrieval_database.update(
-            frame,
-            add_after_query=True,
-            k=config["retrieval"]["k"],
-            min_thresh=config["retrieval"]["min_thresh"],
-        )
-    else:
-        retrieval_inds = []
+    retrieval_inds = retrieval_database.update(
+        frame,
+        add_after_query=True,
+        k=config["retrieval"]["k"],
+        min_thresh=config["retrieval"]["min_thresh"],
+    )
 
     retrieval_inds_selected = []
     retrieval_inds = find_valid_numbers(idx,retrieval_inds)
@@ -164,8 +150,6 @@ if __name__ == "__main__":
     parser.add_argument("--start_from", type =  int, default=0)
     parser.add_argument("--end_at", type =  int, default=-1)
     parser.add_argument("--save_h5", action="store_true")
-    parser.add_argument("--frontend-model", choices=["mast3r", "pi3", "pi3x"], default=None)
-    parser.add_argument("--frontend-weights", default=None)
     parser.add_argument("--foxglove", action="store_true", help="Enable Foxglove WebSocket debug publisher.")
     parser.add_argument("--foxglove-host", default="127.0.0.1")
     parser.add_argument("--foxglove-port", type=int, default=8765)
@@ -199,22 +183,11 @@ if __name__ == "__main__":
             intrinsics["calibration"],
             False, intrinsics.get("model","pinhole"), intrinsics.get("scale",1), intrinsics.get("height_new",None)
         )
-    if (
-        config.get("dataset", {}).get("target_img_size") is None
-        and not (intrinsics.get("height_new",None) is None)
-    ):
+    if not (intrinsics.get("height_new",None) is None):
         h = intrinsics.get("height_new",None) * w // intrinsics["width"]
 
-    model = load_frontend_model(
-        name=args.frontend_model,
-        path=args.frontend_weights,
-        device=device,
-    )
-    model.share_memory()
-    feature_spec = model.get_feature_spec() if hasattr(model, "get_feature_spec") else None
-
-    keyframes = SharedKeyframes(manager, h, w, feature_spec=feature_spec)
-    states = SharedStates(manager, h, w, feature_spec=feature_spec)
+    keyframes = SharedKeyframes(manager, h, w)
+    states = SharedStates(manager, h, w)
 
     if not args.no_viz:
         viz = mp.Process(
@@ -241,6 +214,9 @@ if __name__ == "__main__":
             ),
         )
         foxglove.start()
+
+    model = load_mast3r(device=device)
+    model.share_memory()
 
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]
@@ -272,10 +248,7 @@ if __name__ == "__main__":
     factor_graph = FactorGraph(model, keyframes, K, device, args)
     factor_graph.poses_stamps = dataset.timestamps
     
-    if getattr(model, "name", "mast3r") == "mast3r":
-        retrieval_database = load_retriever(model)
-    else:
-        retrieval_database = None
+    retrieval_database = load_retriever(model)
 
     i = 0
     fps_timer = time.time()
@@ -328,24 +301,11 @@ if __name__ == "__main__":
             if i == 0
             else states.get_frame().T_WC
         )
-        pi3x_cfg = config.get("pi3x", {})
-        use_imu_pose_prior = (
-            getattr(model, "name", "mast3r") == "pi3x"
-            and pi3x_cfg.get("imu_predict", False)
-            and factor_graph.enable_ms
-            and i > 100
-        )
-        if use_imu_pose_prior:
-            dT, wTc_pred, pred_dt = factor_graph.predict_pose(i)
-            if pred_dt <= pi3x_cfg.get("pose_prior_max_dt", 5.0):
-                T_WC = matrix_to_sim3(wTc_pred)
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
-        if use_calib:
-            frame.K = K
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
-            X_init, C_init = model.infer_single(frame)
+            X_init, C_init = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1 + keyframes.rollup_sum.value)
@@ -360,7 +320,7 @@ if __name__ == "__main__":
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
         elif mode == Mode.RELOC:
-            X, C = model.infer_single(frame)
+            X, C = mast3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()
@@ -468,27 +428,25 @@ if __name__ == "__main__":
         i += 1
 
 
-    # finally
-    if args.save_h5:
-        last_pin = factor_graph.get_unique_kf_idx()[-1]
-        for iframe in range(factor_graph.last_pin,last_pin+1):
-            frame_temp = keyframes[iframe] 
-            buffer = io.BytesIO()
-            torch.save({
-                'feat': frame_temp.feat.cpu(), 
-                'pos': frame_temp.pos.cpu(),   
-                'X': frame_temp.X_canon.cpu(),
-                'C': frame_temp.C.cpu(),
-                'K': frame_temp.K.cpu(),
-                'N': frame_temp.N,
-                'uimg': (frame_temp.uimg * 255).to(torch.uint8).cpu().numpy(),
-                'img_shape': frame_temp.img_shape.cpu(),
-                'T_WC': frame_temp.T_WC.data.cpu(),
-                'id': frame_temp.frame_id,
-            }, buffer)
-            buffer.seek(0)
-            f_h5.create_dataset(f"frame_{iframe}", data=np.void(buffer.read()))
-        f_h5.close()
+    # finally 
+    last_pin = factor_graph.get_unique_kf_idx()[-1]
+    for iframe in range(factor_graph.last_pin,last_pin+1):
+        frame_temp = keyframes[iframe] 
+        buffer = io.BytesIO()
+        torch.save({
+            'feat': frame_temp.feat.cpu(), 
+            'pos': frame_temp.pos.cpu(),   
+            'X': frame_temp.X_canon.cpu(),
+            'C': frame_temp.C.cpu(),
+            'K': frame_temp.K.cpu(),
+            'N': frame_temp.N,
+            'uimg': (frame_temp.uimg * 255).to(torch.uint8).cpu().numpy(),
+            'img_shape': frame_temp.img_shape.cpu(),
+            'T_WC': frame_temp.T_WC.data.cpu(),
+            'id': frame_temp.frame_id,
+        }, buffer)
+        buffer.seek(0)
+        f_h5.create_dataset(f"frame_{iframe}", data=np.void(buffer.read()))
 
     factor_graph.save_graph('graph.pkl')
 

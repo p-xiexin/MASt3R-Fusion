@@ -8,7 +8,8 @@ import lietorch
 import torch
 import tqdm
 import yaml
-from mast3r_fusion.global_opt import FactorGraph
+from mast3r_fusion.pi3x_delayed import Pi3XDelayedFactorGraph
+from mast3r_fusion.pi3x_delayed.keyframes import limited_roll_up, set_keyframe_global
 
 from mast3r_fusion.config import load_config, config, set_global_config
 from mast3r_fusion.dataloader import Intrinsics, load_dataset
@@ -289,7 +290,7 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
     )
     for local_idx, frame in enumerate(window_frames):
         frame.update_pointmap(Xs[local_idx : local_idx + 1], Cs[local_idx : local_idx + 1])
-        keyframes[window_indices[local_idx]] = frame
+        set_keyframe_global(keyframes, window_indices[local_idx], frame)
 
     matches = [constraints[edge] for edge in local_edges]
     window_start = min(all_kf_idx + all_frame_idx)
@@ -498,7 +499,7 @@ if __name__ == "__main__":
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
 
-    factor_graph = FactorGraph(model, keyframes, K, device, args)
+    factor_graph = Pi3XDelayedFactorGraph(model, keyframes, K, device, args)
     factor_graph.poses_stamps = dataset.timestamps
     pi3x_cfg = config.get("pi3x", {})
     pi3x_delayed_matching = (
@@ -728,11 +729,10 @@ if __name__ == "__main__":
         if len(keyframes) > 30:
             if pi3x_delayed_matching and pending_delayed_kf_idx:
                 flush_delayed_backend(states, keyframes, pending_delayed_kf_idx)
-            rollup = 15
             if pi3x_delayed_matching:
-                rollup = min(rollup, max(factor_graph.last_pin - keyframes.rollup_sum.value, 0))
-            if rollup > 0:
-                keyframes.roll_up(rollup)
+                limited_roll_up(keyframes, 15, factor_graph.last_pin)
+            else:
+                keyframes.roll_up(15)
 
         # log time
         if i % 30 == 0:
