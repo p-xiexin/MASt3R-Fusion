@@ -1,22 +1,16 @@
 import argparse
-import datetime
-import pathlib
 import sys
 import time
-import cv2
 import lietorch
 import torch
-import tqdm
 import yaml
 from mast3r_fusion.pi3x_global_opt import FactorGraph
 
-from mast3r_fusion.config import load_config, config, set_global_config
+from mast3r_fusion.config import load_config, config
 from mast3r_fusion.dataloader import Intrinsics, load_dataset
-import mast3r_fusion.evaluate as eval
 from mast3r_fusion.foxglove_debug import run_foxglove_publisher
 from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
 from mast3r_fusion.frontend_model import load_frontend_model
-from mast3r_fusion.mast3r_utils import load_retriever
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
 from mast3r_fusion.tracker import FrameTracker
 from mast3r_fusion.visualization import WindowMsg, run_visualization
@@ -24,20 +18,8 @@ import torch.multiprocessing as mp
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-import pickle
 import io
 import h5py
-
-def find_valid_numbers(a, b):
-    result = []
-    for i, c in enumerate(b):
-        if abs(c - a) <= 1:
-            continue 
-        close_indices = [j for j, d in enumerate(b) if abs(d - c) <= 20]
-        if i == min(close_indices) or c == a - 2 :
-            result.append(c)
-    return result
-
 
 def matrix_to_sim3(T, device='cpu'):
     TSim3 = lietorch.Sim3.Identity(1, device=device)
@@ -53,42 +35,16 @@ def matrix_to_sim3(T, device='cpu'):
     return TSim3
 
 
-def get_backend_edges(idx, keyframes):
-    # Graph Construction
+def get_backend_edges(idx):
+    """Return local backend edges for the PI3X delayed keyframe.
+
+    Delayed PI3X windows are built from consecutive keyframes and then
+    converted into pairwise factors after one multi-frame inference pass.
+    """
     kf_idx = []
-    # k to previous consecutive keyframes
     n_consec = 1
     for j in range(min(n_consec, idx)):
         kf_idx.append(idx - 1 - j)
-    frame = keyframes[idx]
-
-    # find local(!) co-visible frames
-    if retrieval_database is not None:
-        retrieval_inds = retrieval_database.update(
-            frame,
-            add_after_query=True,
-            k=config["retrieval"]["k"],
-            min_thresh=config["retrieval"]["min_thresh"],
-        )
-    else:
-        retrieval_inds = []
-
-    retrieval_inds_selected = []
-    retrieval_inds = find_valid_numbers(idx,retrieval_inds)
-
-    for kkk in retrieval_inds:
-        if np.fabs(idx - kkk) < 20:
-            retrieval_inds_selected.append(kkk)
-    kf_idx += retrieval_inds_selected
-
-    lc_inds = set(retrieval_inds)
-    lc_inds.discard(idx - 1)
-    if len(lc_inds) > 0:
-        print("Database retrieval", idx, ": ", lc_inds)
-
-    kf_idx = set(kf_idx)  # Remove duplicates by using set
-    kf_idx.discard(idx)  # Remove current kf idx if included
-    kf_idx = list(kf_idx)  # convert to list
     frame_idx = [idx] * len(kf_idx)
     return kf_idx, frame_idx
 
@@ -156,7 +112,7 @@ def run_backend_indices(states, keyframes, indices):
     all_kf_idx = []
     all_frame_idx = []
     for idx in indices:
-        kf_idx, frame_idx = get_backend_edges(idx, keyframes)
+        kf_idx, frame_idx = get_backend_edges(idx)
         all_kf_idx += kf_idx
         all_frame_idx += frame_idx
 
@@ -266,7 +222,7 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
     all_kf_idx = []
     all_frame_idx = []
     for idx in indices:
-        kf_idx, frame_idx = get_backend_edges(idx, keyframes)
+        kf_idx, frame_idx = get_backend_edges(idx)
         all_kf_idx += kf_idx
         all_frame_idx += frame_idx
     if not all_kf_idx:
@@ -377,13 +333,10 @@ if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.set_grad_enabled(False)
     device = "cuda:0"
-    save_frames = False
-    datetime_now = str(datetime.datetime.now()).replace(" ", "_")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk")
     parser.add_argument("--config", default="config/base.yaml")
-    parser.add_argument("--save-as", default="default")
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--calib", default="config/intrinsics_zyx.yaml")
     parser.add_argument("--imu_path", default="")
@@ -393,7 +346,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_from", type =  int, default=0)
     parser.add_argument("--end_at", type =  int, default=-1)
     parser.add_argument("--save_h5", action="store_true")
-    parser.add_argument("--frontend-model", choices=["mast3r", "pi3", "pi3x"], default=None)
+    parser.add_argument("--frontend-model", choices=["pi3x"], default=None)
     parser.add_argument("--frontend-weights", default=None)
     parser.add_argument("--foxglove", action="store_true", help="Enable Foxglove WebSocket debug publisher.")
     parser.add_argument("--foxglove-host", default="127.0.0.1")
@@ -439,8 +392,10 @@ if __name__ == "__main__":
         path=args.frontend_weights,
         device=device,
     )
+    if model.name != "pi3x":
+        raise ValueError("main_pi3x_delayed.py only supports the PI3X frontend.")
     model.share_memory()
-    feature_spec = model.get_feature_spec() if hasattr(model, "get_feature_spec") else None
+    feature_spec = model.get_feature_spec()
 
     keyframes = SharedKeyframes(manager, h, w, feature_spec=feature_spec)
     states = SharedStates(manager, h, w, feature_spec=feature_spec)
@@ -484,17 +439,6 @@ if __name__ == "__main__":
         )
         keyframes.set_intrinsics(K)
 
-    # remove the trajectory from the previous run
-    if dataset.save_results:
-        save_dir, seq_name = eval.prepare_savedir(args, dataset)
-        traj_file = save_dir / f"{seq_name}.txt"
-        recon_file = save_dir / f"{seq_name}.ply"\
-
-        if traj_file.exists():
-            traj_file.unlink()
-        if recon_file.exists():
-            recon_file.unlink()
-
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
 
@@ -502,23 +446,14 @@ if __name__ == "__main__":
     factor_graph.poses_stamps = dataset.timestamps
     pi3x_cfg = config.get("pi3x", {})
     pi3x_delayed_matching = (
-        getattr(model, "name", "mast3r") == "pi3x"
-        and pi3x_cfg.get("delayed_matching", False)
+        pi3x_cfg.get("delayed_matching", False)
         and pi3x_cfg.get("imu_predict", False)
     )
     delayed_batch_keyframes = max(1, int(pi3x_cfg.get("delayed_batch_keyframes", 5)))
     delayed_keyframe_stride = max(1, int(pi3x_cfg.get("delayed_keyframe_stride", 2)))
     pending_delayed_kf_idx = []
-    
-    if getattr(model, "name", "mast3r") == "mast3r":
-        retrieval_database = load_retriever(model)
-    else:
-        retrieval_database = None
-
     i = 0
     fps_timer = time.time()
-
-    frames = []
 
     while True:
         mode = states.get_mode()
@@ -540,11 +475,8 @@ if __name__ == "__main__":
             states.set_mode(Mode.TERMINATED)
             break
 
-        timestamp, img = dataset[i]
+        _, img = dataset[i]
         # time.sleep(0.2)
-        if save_frames:
-            frames.append(img)
-
 
         TSim3 = lietorch.Sim3.Identity(1, device='cpu')
         Tic0 = np.array([1, 0,  0, 0,
@@ -569,8 +501,7 @@ if __name__ == "__main__":
         wTc_pred = None
         pred_dt = float("inf")
         use_imu_pose_prior = (
-            getattr(model, "name", "mast3r") == "pi3x"
-            and pi3x_cfg.get("imu_predict", False)
+            pi3x_cfg.get("imu_predict", False)
             and factor_graph.enable_ms
             and i > 100
         )
@@ -767,26 +698,6 @@ if __name__ == "__main__":
         f_h5.close()
 
     factor_graph.save_graph('graph.pkl')
-
-    # if dataset.save_results:
-    #     save_dir, seq_name = eval.prepare_savedir(args, dataset)
-    #     eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
-    #     eval.save_reconstruction(
-    #         save_dir,
-    #         f"{seq_name}.ply",
-    #         keyframes,
-    #         last_msg.C_conf_threshold,
-    #     )
-    #     eval.save_keyframes(
-    #         save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
-    #     )
-    # if save_frames:
-    #     savedir = pathlib.Path(f"logs/frames/{datetime_now}")
-    #     savedir.mkdir(exist_ok=True, parents=True)
-    #     for i, frame in tqdm.tqdm(enumerate(frames), total=len(frames)):
-    #         frame = (frame * 255).clip(0, 255)
-    #         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    #         cv2.imwrite(f"{savedir}/{i}.png", frame)
 
     print("done")
     states.set_mode(Mode.TERMINATED)

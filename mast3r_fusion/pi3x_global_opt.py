@@ -125,6 +125,14 @@ def getPosesRel(indice,pose_data,wTcs,ss,enable_ms):
     return lll.data.to(device = 'cuda',dtype=torch.float32)
 
 def assert_valid_pose_state(T, scale, context):
+    """Validate a pose/scale pair before it is reused by delayed PI3X updates.
+
+    PI3X delayed matching can leave several keyframes driven only by propagated
+    IMU state until the next multi-frame inference window is flushed.  A bad
+    propagated scale, zero quaternion, or NaN rotation would later poison both
+    GTSAM marginalization and Foxglove visualization, so fail at the write/read
+    boundary with enough context to identify the offending stage.
+    """
     T = np.asarray(T)
     if T.shape != (4, 4) or not np.all(np.isfinite(T)) or not np.isfinite(scale) or abs(scale) <= 1e-8:
         msg = f"[ERROR] invalid pose state in {context}: scale={scale}, T={T}"
@@ -522,6 +530,19 @@ class FactorGraph:
         return Xs, T_WCs, Cs
 
     def ensure_state_storage_until(self, max_idx):
+        """Extend the internal VI state buffers up to a global keyframe index.
+
+        The original MASt3R backend optimizes visual factors frequently, so its
+        pose, scale, velocity, bias, and preintegration buffers advance with the
+        normal backend cadence.  PI3X delayed mode intentionally waits for a
+        batch of keyframes before running multi-frame inference, which means the
+        visual factor graph can lag behind the latest keyframe.
+
+        This method fills that gap using the current frame pose and, when
+        visual-inertial mode is active, IMU preintegration from the previous
+        stored keyframe.  It preserves global keyframe indexing and refuses to
+        initialize frames that have already been rolled out of SharedKeyframes.
+        """
         while len(self.bs) <= max_idx:
             idx = len(self.bs)
             if idx < self.frames.rollup_sum.value:
@@ -587,6 +608,14 @@ class FactorGraph:
         return dT, wTi_pred @ self.Tic, self.poses_stamps[frame_id] - self.poses_stamps[self.frames[kf_idx].frame_id]
 
     def marginalize_to(self, new_pin):
+        """Marginalize visual/VI variables before ``new_pin``.
+
+        In delayed PI3X mode marginalization is driven explicitly after a
+        multi-frame PI3X window has been inserted and optimized.  The resulting
+        ``marg_factor`` is rekeyed so the next explicit optimization window can
+        start at ``last_pin`` while keeping the marginal prior anchored to the
+        first live keyframe.
+        """
         new_pin = int(new_pin)
         if new_pin <= self.last_pin:
             return
@@ -751,6 +780,15 @@ class FactorGraph:
         del aligncore
 
     def solve_imu_prior_window(self, window_end=None):
+        """Propagate delayed keyframe poses using IMU priors before PI3X flush.
+
+        PI3X multi-frame inference is run only after enough keyframes have been
+        accumulated.  Until that batch is ready, the frontend still needs usable
+        poses for tracking and for pose-prior conditioning.  This lightweight
+        update extends state storage through ``window_end`` and writes the
+        propagated pose for the newest keyframe back to SharedKeyframes; it does
+        not add visual factors or perform the full PI3X batch optimization.
+        """
         if not self.enable_ms:
             return True
 
@@ -767,6 +805,30 @@ class FactorGraph:
         return True
 
     def solve_GN_calib(self,use_calib_this_file = False, skip_marginalization = False, window_start = None, window_end = None):
+        """Optimize the current graph, optionally over an explicit PI3X batch.
+
+        The base MASt3R backend derives its active window from recent visual
+        edges.  PI3X delayed matching instead runs inference over a fixed set of
+        accumulated keyframes, converts the PI3X result into pairwise factors,
+        and then asks the backend to optimize exactly that global-index window.
+
+        Args:
+            use_calib_this_file: Kept for compatibility with the original
+                global optimizer call sites.
+            skip_marginalization: Defer marginalization to the caller.  Delayed
+                PI3X uses this so factors are added and optimized before the
+                post-optimization sliding-window marginalization step.
+            window_start: Optional global keyframe index for the explicit PI3X
+                optimization window.  If it lies after ``last_pin``, the window
+                is expanded back to ``last_pin`` so the current marginal prior
+                remains connected.
+            window_end: Optional global keyframe index for the end of the PI3X
+                optimization window.
+
+        Returns:
+            ``True`` when an optimization was run, otherwise ``False`` when
+            there are no valid keyframes or factors for the requested window.
+        """
         print("solve_GN_calib!!!!")
 
         fix_noise = 1e-6
