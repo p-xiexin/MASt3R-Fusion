@@ -265,6 +265,16 @@ def run_delayed_imu_backend(states, keyframes, idx):
     return optimized
 
 
+def update_current_state(states, frame):
+    with states.lock:
+        states.dataset_idx[:] = frame.frame_id
+        states.img[:] = frame.img
+        states.uimg[:] = frame.uimg
+        states.img_shape[:] = frame.img_shape
+        states.img_true_shape[:] = frame.img_true_shape
+        states.T_WC[:] = frame.T_WC.data
+
+
 def initialize_delayed_keyframe_placeholders(states, frame):
     frame.X_canon = torch.zeros_like(states.X)
     frame.C = torch.zeros_like(states.C)
@@ -364,7 +374,7 @@ if __name__ == "__main__":
                 args.foxglove_host,
                 args.foxglove_port,
                 args.foxglove_hz,
-                1.5,
+                0.5,
                 120000,
                 10,
                 70,
@@ -481,6 +491,8 @@ if __name__ == "__main__":
                 run_delayed_imu_backend(states, keyframes, delayed_kf_idx)
                 if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
                     run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
+            else:
+                update_current_state(states, frame)
         else:
             raise Exception("Invalid mode")
 
