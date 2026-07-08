@@ -21,7 +21,7 @@ from scipy.spatial.transform import Rotation
 import io
 import h5py
 
-def matrix_to_sim3(T, device='cpu'):
+def matrix_to_sim3(T, device='cpu', scale=1.0):
     TSim3 = lietorch.Sim3.Identity(1, device=device)
     q = Rotation.from_matrix(T[0:3, 0:3]).as_quat()
     TSim3[0].data[0] = T[0, 3]
@@ -31,7 +31,7 @@ def matrix_to_sim3(T, device='cpu'):
     TSim3[0].data[4] = q[1]
     TSim3[0].data[5] = q[2]
     TSim3[0].data[6] = q[3]
-    TSim3[0].data[7] = 1.0
+    TSim3[0].data[7] = scale
     return TSim3
 
 
@@ -53,6 +53,17 @@ def integrate_camera_gyro_prior(factor_graph, t0, t1):
 
     R_ic = np.asarray(factor_graph.Tic[:3, :3], dtype=np.float64)
     return R_ic.T @ R_imu @ R_ic
+
+
+def apply_camera_gyro_rotation(T_WC, R_cur_prev):
+    if R_cur_prev is None:
+        return T_WC
+    T_WC64 = lietorch.Sim3(T_WC.data.to(torch.float64))
+    scale = T_WC64.data.reshape(-1, T_WC64.data.shape[-1])[0, -1].item()
+    T = T_WC64.matrix().cpu().numpy()[0]
+    T[0:3, 0:3] /= scale
+    T[0:3, 0:3] = T[0:3, 0:3] @ np.asarray(R_cur_prev, dtype=np.float64).T
+    return matrix_to_sim3(T, device=T_WC.data.device, scale=scale)
 
 
 def get_backend_edges(idx):
@@ -451,7 +462,7 @@ if __name__ == "__main__":
     pending_delayed_kf_idx = []
     i = 0
     fps_timer = time.time()
-    sparse_flow_prev_timestamp = None
+    prev_frame_timestamp = None
 
     while True:
         mode = states.get_mode()
@@ -478,6 +489,10 @@ if __name__ == "__main__":
         timestamp, img = dataset[i]
         # time.sleep(0.2)
 
+        camera_gyro_R = None
+        if pi3x_cfg.get("imu_predict", False) or (sparse_flow_frontend is not None and sparse_flow_cfg.get("use_imu_prior", True)):
+            camera_gyro_R = integrate_camera_gyro_prior(factor_graph, prev_frame_timestamp, timestamp)
+
         TSim3 = lietorch.Sim3.Identity(1, device='cpu')
         Tic0 = np.array([1, 0,  0, 0,
                          0, 0,  1, 0,
@@ -498,6 +513,8 @@ if __name__ == "__main__":
             if i == 0
             else states.get_frame().T_WC
         )
+        if i > 0 and not factor_graph.enable_ms and camera_gyro_R is not None:
+            T_WC = apply_camera_gyro_rotation(T_WC, camera_gyro_R)
         wTc_pred = None
         pred_dt = float("inf")
         use_imu_pose_prior = (
@@ -514,12 +531,8 @@ if __name__ == "__main__":
             frame.K = K
         sparse_flow_overlay = None
         if sparse_flow_frontend is not None:
-            gyro_R = None
-            if sparse_flow_cfg.get("use_imu_prior", True):
-                gyro_R = integrate_camera_gyro_prior(factor_graph, sparse_flow_prev_timestamp, timestamp)
-            sparse_flow_result = sparse_flow_frontend.process_frame(frame, timestamp, gyro_R=gyro_R)
+            sparse_flow_result = sparse_flow_frontend.process_frame(frame, timestamp, gyro_R=camera_gyro_R)
             sparse_flow_overlay = sparse_flow_frontend.draw_overlay(sparse_flow_result)
-            sparse_flow_prev_timestamp = timestamp
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
@@ -529,6 +542,7 @@ if __name__ == "__main__":
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame, notify=sparse_flow_overlay is None)
             set_sparse_flow_overlay(states, sparse_flow_overlay)
+            prev_frame_timestamp = timestamp
             i += 1
             continue
 
@@ -550,6 +564,7 @@ if __name__ == "__main__":
                 update_current_state(states, frame, sparse_flow_overlay)
         else:
             raise Exception("Invalid mode")
+        prev_frame_timestamp = timestamp
 
         print('[INFO] backend',time.time())
 
