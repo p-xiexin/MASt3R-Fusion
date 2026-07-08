@@ -55,6 +55,38 @@ def integrate_camera_gyro_prior(factor_graph, t0, t1):
     return R_ic.T @ R_imu @ R_ic
 
 
+def gyro_angle_deg(R_cur_prev):
+    if R_cur_prev is None:
+        return 0.0
+    return float(Rotation.from_matrix(np.asarray(R_cur_prev, dtype=np.float64)).magnitude() * 180.0 / np.pi)
+
+
+def should_add_delayed_keyframe(frame_id, last_kf_frame_id, flow_result, gyro_R, cfg):
+    gap = frame_id - last_kf_frame_id
+    if flow_result is None:
+        return gap >= max(1, int(cfg.get("min_keyframe_gap", 2)))
+
+    debug = flow_result.debug
+    debug["frames_since_keyframe"] = float(gap)
+    avg_parallax = debug.get("avg_parallax", 0.0)
+    gyro_deg = gyro_angle_deg(gyro_R)
+    add_new_kf = bool(flow_result.new_keyframe)
+
+    if not add_new_kf and gyro_deg > float(cfg.get("force_keyframe_gyro_deg", 30.0)):
+        add_new_kf = True
+    if add_new_kf and (
+        avg_parallax < float(cfg.get("suppress_keyframe_parallax", 3.0))
+        and gyro_deg < float(cfg.get("suppress_keyframe_gyro_deg", 5.0))
+        and gap < int(cfg.get("max_keyframe_gap", 20))
+    ):
+        add_new_kf = False
+    if gap >= int(cfg.get("max_keyframe_gap", 20)):
+        add_new_kf = True
+    if gap < max(1, int(cfg.get("min_keyframe_gap", 2))):
+        add_new_kf = False
+    return add_new_kf
+
+
 def get_backend_edges(idx):
     """Return local backend edges for the PI3X delayed keyframe.
 
@@ -516,9 +548,17 @@ if __name__ == "__main__":
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
         if use_calib:
             frame.K = K
+        last_kf = keyframes.last_keyframe()
+        last_kf_frame_id = last_kf.frame_id if last_kf is not None else -delayed_keyframe_stride
         sparse_flow_overlay = None
+        sparse_flow_result = None
         if sparse_flow_frontend is not None:
-            sparse_flow_result = sparse_flow_frontend.process_frame(frame, timestamp, gyro_R=camera_gyro_R)
+            sparse_flow_result = sparse_flow_frontend.process_frame(
+                frame,
+                timestamp,
+                gyro_R=camera_gyro_R,
+                frames_since_keyframe=frame.frame_id - last_kf_frame_id,
+            )
             sparse_flow_overlay = sparse_flow_frontend.draw_overlay(sparse_flow_result)
 
         if mode == Mode.INIT:
@@ -534,9 +574,16 @@ if __name__ == "__main__":
             continue
 
         if mode == Mode.TRACKING:
-            last_kf = keyframes.last_keyframe()
-            last_kf_frame_id = last_kf.frame_id if last_kf is not None else -delayed_keyframe_stride
-            add_new_kf = frame.frame_id - last_kf_frame_id >= delayed_keyframe_stride
+            if sparse_flow_frontend is not None:
+                add_new_kf = should_add_delayed_keyframe(
+                    frame.frame_id,
+                    last_kf_frame_id,
+                    sparse_flow_result,
+                    camera_gyro_R,
+                    sparse_flow_cfg,
+                )
+            else:
+                add_new_kf = frame.frame_id - last_kf_frame_id >= delayed_keyframe_stride
             if add_new_kf:
                 initialize_delayed_keyframe_placeholders(states, frame)
                 keyframes.append(frame)

@@ -49,7 +49,6 @@ class SparseFlowFrontend:
         self.ids = np.empty((0,), dtype=np.int64)
         self.track_cnt = np.empty((0,), dtype=np.int32)
         self.next_track_id = 0
-        self.last_keyframe_id = 0
         self.debug = {}
         self.focal = float((self.K[0, 0] + self.K[1, 1]) * 0.5)
 
@@ -72,10 +71,12 @@ class SparseFlowFrontend:
         )
         return cls(K, width, height, cfg)
 
-    def process_frame(self, frame, timestamp=None, gyro_R: Optional[np.ndarray] = None) -> SparseFlowResult:
+    def process_frame(self, frame, timestamp=None, gyro_R: Optional[np.ndarray] = None, frames_since_keyframe=None) -> SparseFlowResult:
         image = self._frame_rgb(frame)
         gray = self._gray(image)
         self.debug = {}
+        if frames_since_keyframe is not None:
+            self.debug["frames_since_keyframe"] = float(frames_since_keyframe)
 
         if self.cur_gray is None:
             draw_prev_pts = np.empty((0, 2), dtype=np.float32)
@@ -93,8 +94,6 @@ class SparseFlowFrontend:
         self._spawn_points(gray)
 
         new_keyframe = self._is_keyframe(frame.frame_id, draw_prev_pts)
-        if new_keyframe:
-            self.last_keyframe_id = frame.frame_id
         self.cur_gray = gray
         return self._result(frame.frame_id, image, draw_prev_pts, new_keyframe)
 
@@ -254,7 +253,7 @@ class SparseFlowFrontend:
             return True
         if self.debug.get("new_feature_num", 0.0) > 0.5 * max(1, last_track_num):
             return True
-        if frame_id - self.last_keyframe_id >= self.cfg.keyframe_gap:
+        if self.debug.get("frames_since_keyframe", 0.0) >= self.cfg.keyframe_gap:
             return True
         return avg_parallax >= self.cfg.keyframe_parallax
 

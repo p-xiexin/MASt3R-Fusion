@@ -12,6 +12,11 @@ pi3x:
     quality: 0.01
     keyframe_gap: 5
     keyframe_parallax: 20.0
+    min_keyframe_gap: 2
+    max_keyframe_gap: 20
+    force_keyframe_gyro_deg: 30.0
+    suppress_keyframe_gyro_deg: 5.0
+    suppress_keyframe_parallax: 3.0
     reject_with_f: true
     f_ransac_thresh: 1.5
     use_imu_prior: true
