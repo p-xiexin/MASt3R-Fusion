@@ -12,7 +12,6 @@ pi3x:
     quality: 0.01
     keyframe_gap: 5
     keyframe_parallax: 20.0
-    fb_thresh: 2.0
     reject_with_f: true
     f_ransac_thresh: 1.5
     use_imu_prior: true

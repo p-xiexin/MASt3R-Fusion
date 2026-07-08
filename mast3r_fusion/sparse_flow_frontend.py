@@ -15,7 +15,6 @@ class SparseFlowConfig:
     quality: float = 0.01
     lk_win: int = 21
     lk_levels: int = 3
-    fb_thresh: float = 2.0
     f_ransac_thresh: float = 1.5
     keyframe_parallax: float = 20.0
     keyframe_gap: int = 5
@@ -62,7 +61,6 @@ class SparseFlowFrontend:
             quality=float(cfg_dict.get("quality", 0.01)),
             lk_win=int(cfg_dict.get("lk_win", 21)),
             lk_levels=int(cfg_dict.get("lk_levels", 3)),
-            fb_thresh=float(cfg_dict.get("fb_thresh", 2.0)),
             f_ransac_thresh=float(cfg_dict.get("f_ransac_thresh", 1.5)),
             keyframe_parallax=float(cfg_dict.get("keyframe_parallax", 20.0)),
             keyframe_gap=int(cfg_dict.get("keyframe_gap", 5)),
@@ -135,21 +133,6 @@ class SparseFlowFrontend:
             return
         cur = cur.reshape(-1, 2)
         valid = st.reshape(-1).astype(bool) & self._inside(cur)
-
-        if self.cfg.fb_thresh > 0:
-            back, st_back, _ = cv2.calcOpticalFlowPyrLK(
-                gray,
-                self.cur_gray,
-                cur.reshape(-1, 1, 2),
-                None,
-                winSize=(self.cfg.lk_win, self.cfg.lk_win),
-                maxLevel=self.cfg.lk_levels,
-                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-            )
-            if back is not None and st_back is not None:
-                fb = np.linalg.norm(back.reshape(-1, 2) - self.cur_pts, axis=1)
-                valid &= st_back.reshape(-1).astype(bool) & (fb <= self.cfg.fb_thresh)
-                self.debug["fb_median"] = float(np.median(fb)) if len(fb) else 0.0
 
         self.cur_pts = cur[valid].astype(np.float32)
         self.ids = self.ids[valid]
@@ -333,7 +316,7 @@ class SparseFlowFrontend:
         return (proj[:, :2] / np.maximum(proj[:, 2:3], 1e-8)).astype(np.float32)
 
     def _age_color(self, age):
-        t = min(1.0, age / 20.0)
+        t = min(1.0, age / 8.0)
         return (int(255 * (1 - t)), int(220 * t), 40)
 
     def _clear_tracks(self):
