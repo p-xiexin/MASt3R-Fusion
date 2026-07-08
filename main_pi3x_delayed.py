@@ -55,17 +55,6 @@ def integrate_camera_gyro_prior(factor_graph, t0, t1):
     return R_ic.T @ R_imu @ R_ic
 
 
-def apply_camera_gyro_rotation(T_WC, R_cur_prev):
-    if R_cur_prev is None:
-        return T_WC
-    T_WC64 = lietorch.Sim3(T_WC.data.to(torch.float64))
-    scale = T_WC64.data.reshape(-1, T_WC64.data.shape[-1])[0, -1].item()
-    T = T_WC64.matrix().cpu().numpy()[0]
-    T[0:3, 0:3] /= scale
-    T[0:3, 0:3] = T[0:3, 0:3] @ np.asarray(R_cur_prev, dtype=np.float64).T
-    return matrix_to_sim3(T, device=T_WC.data.device, scale=scale)
-
-
 def get_backend_edges(idx):
     """Return local backend edges for the PI3X delayed keyframe.
 
@@ -513,8 +502,6 @@ if __name__ == "__main__":
             if i == 0
             else states.get_frame().T_WC
         )
-        if i > 0 and not factor_graph.enable_ms and camera_gyro_R is not None:
-            T_WC = apply_camera_gyro_rotation(T_WC, camera_gyro_R)
         wTc_pred = None
         pred_dt = float("inf")
         use_imu_pose_prior = (
@@ -554,12 +541,15 @@ if __name__ == "__main__":
                 initialize_delayed_keyframe_placeholders(states, frame)
                 keyframes.append(frame)
                 delayed_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
-                pending_delayed_kf_idx.append(delayed_kf_idx)
                 states.set_frame(frame, notify=sparse_flow_overlay is None)
                 set_sparse_flow_overlay(states, sparse_flow_overlay)
-                run_delayed_imu_backend(states, keyframes, delayed_kf_idx)
-                if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
-                    run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
+                if factor_graph.enable_ms:
+                    pending_delayed_kf_idx.append(delayed_kf_idx)
+                    run_delayed_imu_backend(states, keyframes, delayed_kf_idx)
+                    if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
+                        run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
+                else:
+                    run_pi3x_window_backend_indices(states, keyframes, [delayed_kf_idx])
             else:
                 update_current_state(states, frame, sparse_flow_overlay)
         else:
