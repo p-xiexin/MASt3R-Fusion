@@ -476,7 +476,7 @@ async def _send_json(server, channels, name, timestamp_ns, msg):
     await server.send_message(channels[name], timestamp_ns, json.dumps(msg, separators=(",", ":")).encode("utf8"))
 
 
-async def _publish_snapshot(server, channels, states, keyframes, options):
+async def _publish_current_frame(server, channels, states, options):
     timestamp_ns = time.time_ns()
     if states.get_mode() != Mode.INIT:
         try:
@@ -516,6 +516,8 @@ async def _publish_snapshot(server, channels, states, keyframes, options):
         except Exception as exc:
             print(f"[foxglove] current frame publish skipped: {exc}")
 
+async def _publish_scene_snapshot(server, channels, states, keyframes, options):
+    timestamp_ns = time.time_ns()
     frames = _snapshot_keyframes(keyframes)
     if frames:
         poses = [_pose_from_sim3_data(frame.T_WC.data.cpu().numpy()[0]) for frame in frames]
@@ -547,6 +549,11 @@ async def _publish_snapshot(server, channels, states, keyframes, options):
             await _send_json(server, channels, "keyframe_points", timestamp_ns, _point_cloud_msg(timestamp_ns, points, colors))
 
     await _publish_graph_edges(server, channels, states, keyframes, timestamp_ns)
+
+
+async def _publish_snapshot(server, channels, states, keyframes, options):
+    await _publish_current_frame(server, channels, states, options)
+    await _publish_scene_snapshot(server, channels, states, keyframes, options)
 
 
 async def _publish_graph_edges(server, channels, states, keyframes, timestamp_ns):
@@ -628,11 +635,29 @@ async def _run_server(cfg, states, keyframes, host, port, publish_hz, options):
         await _wait_opened(server)
         channels = await _add_channels(server)
         print(f"[foxglove] listening on ws://{host}:{port}")
-        interval = 1.0 / max(float(publish_hz), 0.1)
+        scene_interval = 1.0 / max(float(publish_hz), 0.1)
+        next_scene_publish = 0.0
+        last_frame_seq = 0
         while states.get_mode() != Mode.TERMINATED:
-            start = time.time()
-            await _publish_snapshot(server, channels, states, keyframes, options)
-            await asyncio.sleep(max(0.0, interval - (time.time() - start)))
+            frame_seq, has_frame_update = states.consume_frame_update(last_frame_seq)
+            if has_frame_update:
+                last_frame_seq = frame_seq
+                await _publish_current_frame(server, channels, states, options)
+
+            now = time.time()
+            if now >= next_scene_publish:
+                await _publish_scene_snapshot(server, channels, states, keyframes, options)
+                next_scene_publish = time.time() + scene_interval
+
+            wait_timeout = min(0.5, max(0.0, next_scene_publish - time.time()))
+            await _wait_frame_update(states, wait_timeout)
+
+
+async def _wait_frame_update(states, timeout):
+    if timeout <= 0.0:
+        return
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, states.frame_update_event.wait, timeout)
 
 
 async def _wait_opened(server, timeout=5.0):

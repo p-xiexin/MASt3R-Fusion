@@ -5,3 +5,14 @@ pi3x:
   delayed_matching: true
   delayed_batch_keyframes: 5
   delayed_keyframe_stride: 2
+  sparse_flow_frontend:
+    enabled: true
+    max_features: 400
+    min_distance: 15
+    quality: 0.01
+    keyframe_gap: 5
+    keyframe_parallax: 20.0
+    fb_thresh: 2.0
+    reject_with_f: true
+    f_ransac_thresh: 1.5
+    use_imu_prior: true

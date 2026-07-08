@@ -138,6 +138,8 @@ class SharedStates:
         self.paused = manager.Value("i", 0)
         self.mode = manager.Value("i", Mode.INIT)
         self.reloc_sem = manager.Value("i", 0)
+        self.frame_seq = manager.Value("i", 0)
+        self.frame_update_event = manager.Event()
         self.global_optimizer_tasks = manager.list()
         self.edges_ii = manager.list()
         self.edges_jj = manager.list()
@@ -162,7 +164,25 @@ class SharedStates:
         self.pos = torch.zeros(1, self.num_patches, 2, device=device, dtype=torch.long).share_memory_()
         # fmt: on
 
-    def set_frame(self, frame):
+    def _mark_frame_updated_locked(self):
+        self.frame_seq.value += 1
+        self.frame_update_event.set()
+
+    def notify_frame_updated(self):
+        with self.lock:
+            self._mark_frame_updated_locked()
+
+    def consume_frame_update(self, last_seq):
+        with self.lock:
+            current_seq = self.frame_seq.value
+            if current_seq == last_seq:
+                self.frame_update_event.clear()
+                return current_seq, False
+            if current_seq == last_seq + 1:
+                self.frame_update_event.clear()
+            return current_seq, True
+
+    def set_frame(self, frame, notify=True):
         with self.lock:
             self.dataset_idx[:] = frame.frame_id
             self.img[:] = frame.img
@@ -174,6 +194,8 @@ class SharedStates:
             self.C[:] = frame.C
             self.feat[:] = frame.feat
             self.pos[:] = frame.pos
+            if notify:
+                self._mark_frame_updated_locked()
 
     def get_frame(self):
         with self.lock:

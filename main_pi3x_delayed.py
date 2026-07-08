@@ -12,6 +12,7 @@ from mast3r_fusion.foxglove_debug import run_foxglove_publisher
 from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
 from mast3r_fusion.frontend_model import load_frontend_model
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
+from mast3r_fusion.sparse_flow_frontend import SparseFlowFrontend, overlay_to_uimg_tensor
 from mast3r_fusion.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
 import numpy as np
@@ -32,6 +33,26 @@ def matrix_to_sim3(T, device='cpu'):
     TSim3[0].data[6] = q[3]
     TSim3[0].data[7] = 1.0
     return TSim3
+
+
+def integrate_camera_gyro_prior(factor_graph, t0, t1):
+    if t0 is None or t1 is None or t1 <= t0 or not hasattr(factor_graph, "imu_pool"):
+        return None
+    try:
+        records = factor_graph.imu_pool.get_records(float(t0), float(t1))
+    except Exception as exc:
+        print(f"[WARN] sparse flow IMU prior skipped: {exc}")
+        return None
+
+    R_imu = np.eye(3, dtype=np.float64)
+    for seg_t0, seg_t1, data in records:
+        dt = float(seg_t1 - seg_t0)
+        if dt <= 0:
+            continue
+        R_imu = R_imu @ Rotation.from_rotvec(np.asarray(data[0:3], dtype=np.float64) * np.pi / 180.0 * dt).as_matrix()
+
+    R_ic = np.asarray(factor_graph.Tic[:3, :3], dtype=np.float64)
+    return R_ic.T @ R_imu @ R_ic
 
 
 def get_backend_edges(idx):
@@ -265,14 +286,24 @@ def run_delayed_imu_backend(states, keyframes, idx):
     return optimized
 
 
-def update_current_state(states, frame):
+def set_sparse_flow_overlay(states, overlay_image):
+    if overlay_image is None:
+        return
+    overlay = overlay_to_uimg_tensor(overlay_image, dtype=states.uimg.dtype)
+    with states.lock:
+        states.uimg[:] = overlay
+    states.notify_frame_updated()
+
+
+def update_current_state(states, frame, overlay_image=None):
     with states.lock:
         states.dataset_idx[:] = frame.frame_id
         states.img[:] = frame.img
-        states.uimg[:] = frame.uimg
+        states.uimg[:] = overlay_to_uimg_tensor(overlay_image, dtype=states.uimg.dtype) if overlay_image is not None else frame.uimg
         states.img_shape[:] = frame.img_shape
         states.img_true_shape[:] = frame.img_true_shape
         states.T_WC[:] = frame.T_WC.data
+    states.notify_frame_updated()
 
 
 def initialize_delayed_keyframe_placeholders(states, frame):
@@ -384,6 +415,7 @@ if __name__ == "__main__":
 
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]
+    pi3x_cfg = config.get("pi3x", {})
 
     if use_calib and not has_calib:
         print("[Warning] No calibration provided for this dataset!")
@@ -395,11 +427,23 @@ if __name__ == "__main__":
         )
         keyframes.set_intrinsics(K)
 
+    sparse_flow_frontend = None
+    sparse_flow_cfg = pi3x_cfg.get("sparse_flow_frontend", {})
+    if sparse_flow_cfg.get("enabled", True):
+        if K is None:
+            print("[Warning] Sparse flow frontend needs calibration; overlay disabled.")
+        else:
+            sparse_flow_frontend = SparseFlowFrontend.from_config(
+                K.detach().cpu().numpy(),
+                w,
+                h,
+                sparse_flow_cfg,
+            )
+
     last_msg = WindowMsg()
 
     factor_graph = FactorGraph(model, keyframes, K, device, args)
     factor_graph.poses_stamps = dataset.timestamps
-    pi3x_cfg = config.get("pi3x", {})
     if not pi3x_cfg.get("delayed_matching", False):
         raise ValueError("main_pi3x_delayed.py requires pi3x.delayed_matching=true.")
     delayed_batch_keyframes = max(1, int(pi3x_cfg.get("delayed_batch_keyframes", 5)))
@@ -407,6 +451,7 @@ if __name__ == "__main__":
     pending_delayed_kf_idx = []
     i = 0
     fps_timer = time.time()
+    sparse_flow_prev_timestamp = None
 
     while True:
         mode = states.get_mode()
@@ -430,7 +475,7 @@ if __name__ == "__main__":
             states.set_mode(Mode.TERMINATED)
             break
 
-        _, img = dataset[i]
+        timestamp, img = dataset[i]
         # time.sleep(0.2)
 
         TSim3 = lietorch.Sim3.Identity(1, device='cpu')
@@ -467,6 +512,14 @@ if __name__ == "__main__":
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
         if use_calib:
             frame.K = K
+        sparse_flow_overlay = None
+        if sparse_flow_frontend is not None:
+            gyro_R = None
+            if sparse_flow_cfg.get("use_imu_prior", True):
+                gyro_R = integrate_camera_gyro_prior(factor_graph, sparse_flow_prev_timestamp, timestamp)
+            sparse_flow_result = sparse_flow_frontend.process_frame(frame, timestamp, gyro_R=gyro_R)
+            sparse_flow_overlay = sparse_flow_frontend.draw_overlay(sparse_flow_result)
+            sparse_flow_prev_timestamp = timestamp
 
         if mode == Mode.INIT:
             # Initialize via mono inference, and encoded features neeed for database
@@ -474,7 +527,8 @@ if __name__ == "__main__":
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
             states.set_mode(Mode.TRACKING)
-            states.set_frame(frame)
+            states.set_frame(frame, notify=sparse_flow_overlay is None)
+            set_sparse_flow_overlay(states, sparse_flow_overlay)
             i += 1
             continue
 
@@ -487,12 +541,13 @@ if __name__ == "__main__":
                 keyframes.append(frame)
                 delayed_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
                 pending_delayed_kf_idx.append(delayed_kf_idx)
-                states.set_frame(frame)
+                states.set_frame(frame, notify=sparse_flow_overlay is None)
+                set_sparse_flow_overlay(states, sparse_flow_overlay)
                 run_delayed_imu_backend(states, keyframes, delayed_kf_idx)
                 if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
                     run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
             else:
-                update_current_state(states, frame)
+                update_current_state(states, frame, sparse_flow_overlay)
         else:
             raise Exception("Invalid mode")
 
