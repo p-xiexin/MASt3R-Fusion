@@ -3,7 +3,6 @@ import csv
 import io
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 
@@ -116,15 +115,13 @@ def trajectory_map(traj):
 
 
 def plot_window_start_markers(ax, start_frame_ids, prior_traj):
-    prior_by_frame = trajectory_map(prior_traj)
-    points = [prior_by_frame[frame_id] for frame_id in start_frame_ids if frame_id in prior_by_frame]
-    if not points:
+    marker_traj = window_start_marker_traj(start_frame_ids, prior_traj)
+    if marker_traj.size == 0:
         return
-    points = np.stack(points, axis=0)
     ax.scatter(
-        points[:, 0],
-        points[:, 1],
-        points[:, 2],
+        marker_traj[:, 1],
+        marker_traj[:, 2],
+        marker_traj[:, 3],
         color="red",
         s=36,
         marker="o",
@@ -133,26 +130,26 @@ def plot_window_start_markers(ax, start_frame_ids, prior_traj):
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Plot PI3X pose-prior debug trajectories.")
-    parser.add_argument("--debug-csv", required=True, help="Path to *.pi3x_pose_debug.csv.")
-    parser.add_argument("--result", default=None, help="SLAM result.txt path.")
-    parser.add_argument("--h5", default=None, help="data.h5 path for SLAM keyframe poses.")
-    parser.add_argument("--output", default="pi3x_pose_debug_trajectory.png")
-    parser.add_argument("--show", action="store_true")
-    parser.add_argument("--no-window-start-markers", action="store_true", help="Do not mark PI3X window start keyframes.")
-    parser.add_argument("--slam-keyframes-only", action="store_true", help="Plot only result rows with keyframe flag == 1.")
-    args = parser.parse_args()
+def window_start_marker_traj(start_frame_ids, prior_traj):
+    prior_by_frame = trajectory_map(prior_traj)
+    points = [
+        [frame_id, *prior_by_frame[frame_id]]
+        for frame_id in start_frame_ids
+        if frame_id in prior_by_frame
+    ]
+    if not points:
+        return np.empty((0, 4), dtype=np.float64)
+    return np.asarray(points, dtype=np.float64)
 
-    prior_traj, pi3x_traj, window_start_frame_ids = load_pose_debug(args.debug_csv)
-    if args.h5 is not None:
-        slam_traj = load_h5_keyframes(args.h5)
-        slam_label = "SLAM H5 keyframes"
-    elif args.result is not None:
-        slam_traj = load_slam_result(args.result, keyframes_only=args.slam_keyframes_only)
-        slam_label = "SLAM result"
-    else:
-        raise ValueError("Either --h5 or --result must be provided.")
+
+def choose_backend(args):
+    if args.backend != "auto":
+        return args.backend
+    return "plotly" if Path(args.output).suffix.lower() == ".html" else "matplotlib"
+
+
+def plot_matplotlib(prior_traj, pi3x_traj, slam_traj, slam_label, window_start_frame_ids, args):
+    import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
@@ -172,9 +169,92 @@ def main():
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output, dpi=200)
-    print(f"[INFO] saved {output}")
     if args.show:
         plt.show()
+    return output
+
+
+def plotly_trace(traj, name, color, mode="lines+markers", symbol="circle", size=4):
+    import plotly.graph_objects as go
+
+    if traj.size == 0:
+        print(f"[WARN] empty trajectory skipped: {name}")
+        return None
+    return go.Scatter3d(
+        x=traj[:, 1],
+        y=traj[:, 2],
+        z=traj[:, 3],
+        mode=mode,
+        name=name,
+        text=[f"frame_id={int(frame_id)}" for frame_id in traj[:, 0]],
+        hovertemplate="%{text}<br>x=%{x:.6g}<br>y=%{y:.6g}<br>z=%{z:.6g}<extra></extra>",
+        line={"color": color, "width": 4},
+        marker={"color": color, "size": size, "symbol": symbol},
+    )
+
+
+def plot_plotly(prior_traj, pi3x_traj, slam_traj, slam_label, window_start_frame_ids, args):
+    import plotly.graph_objects as go
+
+    traces = [
+        plotly_trace(prior_traj, "PI3X input prior / IMU preintegration", "orange", symbol="circle", size=3),
+        plotly_trace(pi3x_traj, "PI3X output pose", "green", symbol="diamond", size=3),
+        plotly_trace(slam_traj, slam_label, "blue", mode="lines+markers", symbol="circle", size=3),
+    ]
+    if not args.no_window_start_markers:
+        marker_traj = window_start_marker_traj(window_start_frame_ids, prior_traj)
+        traces.append(plotly_trace(marker_traj, "PI3X window starts", "red", mode="markers", symbol="circle", size=6))
+
+    fig = go.Figure(data=[trace for trace in traces if trace is not None])
+    fig.update_layout(
+        scene={
+            "xaxis_title": "x",
+            "yaxis_title": "y",
+            "zaxis_title": "z",
+            "aspectmode": "data",
+        },
+        legend={"itemsizing": "constant"},
+        margin={"l": 0, "r": 0, "t": 30, "b": 0},
+    )
+
+    output = Path(args.output)
+    if output.suffix.lower() != ".html":
+        output = output.with_suffix(".html")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.write_html(str(output), include_plotlyjs="cdn", full_html=True)
+    if args.show:
+        fig.show()
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Plot PI3X pose-prior debug trajectories.")
+    parser.add_argument("--debug-csv", required=True, help="Path to *.pi3x_pose_debug.csv.")
+    parser.add_argument("--result", default=None, help="SLAM result.txt path.")
+    parser.add_argument("--h5", default=None, help="data.h5 path for SLAM keyframe poses.")
+    parser.add_argument("--output", default="pi3x_pose_debug_trajectory.png")
+    parser.add_argument("--backend", choices=["auto", "matplotlib", "plotly"], default="auto")
+    parser.add_argument("--show", action="store_true")
+    parser.add_argument("--no-window-start-markers", action="store_true", help="Do not mark PI3X window start keyframes.")
+    parser.add_argument("--slam-keyframes-only", action="store_true", help="Plot only result rows with keyframe flag == 1.")
+    args = parser.parse_args()
+
+    prior_traj, pi3x_traj, window_start_frame_ids = load_pose_debug(args.debug_csv)
+    if args.h5 is not None:
+        slam_traj = load_h5_keyframes(args.h5)
+        slam_label = "SLAM H5 keyframes"
+    elif args.result is not None:
+        slam_traj = load_slam_result(args.result, keyframes_only=args.slam_keyframes_only)
+        slam_label = "SLAM result"
+    else:
+        raise ValueError("Either --h5 or --result must be provided.")
+
+    backend = choose_backend(args)
+    if backend == "plotly":
+        output = plot_plotly(prior_traj, pi3x_traj, slam_traj, slam_label, window_start_frame_ids, args)
+    else:
+        output = plot_matplotlib(prior_traj, pi3x_traj, slam_traj, slam_label, window_start_frame_ids, args)
+    print(f"[INFO] saved {output}")
 
 
 if __name__ == "__main__":
