@@ -18,6 +18,36 @@ def trajectory_from_map(positions_by_frame):
     return np.asarray(rows, dtype=np.float64)
 
 
+def transform_trajectory(trajectory, R, t):
+    if trajectory.size == 0:
+        return trajectory
+    transformed = trajectory.copy()
+    transformed[:, 1:4] = trajectory[:, 1:4] @ R.T + t
+    return transformed
+
+
+def align_to_reference(source_traj, reference_traj):
+    source_by_frame = trajectory_index(source_traj)
+    reference_by_frame = trajectory_index(reference_traj)
+    common_ids = sorted(set(source_by_frame) & set(reference_by_frame))
+    if len(common_ids) < 3:
+        print(f"[WARN] skip GT alignment: only {len(common_ids)} common frame ids.")
+        return np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+
+    source = np.stack([source_by_frame[frame_id] for frame_id in common_ids], axis=0)
+    reference = np.stack([reference_by_frame[frame_id] for frame_id in common_ids], axis=0)
+    source_mean = source.mean(axis=0)
+    reference_mean = reference.mean(axis=0)
+    H = (source - source_mean).T @ (reference - reference_mean)
+    U, _, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1.0
+        R = Vt.T @ U.T
+    t = reference_mean - R @ source_mean
+    return R, t
+
+
 def load_pi3x_debug(csv_path):
     windows = {}
     with open(csv_path, "r", newline="", encoding="utf-8") as fp:
@@ -161,6 +191,12 @@ def main():
     slam_traj = load_h5_keyframes(args.h5)
     gt_traj = load_kitti_ground_truth(args.gt_pose) if args.gt_pose is not None else None
     start_traj = window_start_trajectory(start_frame_ids, prior_traj)
+    if gt_traj is not None:
+        R_align, t_align = align_to_reference(slam_traj, gt_traj)
+        prior_traj = transform_trajectory(prior_traj, R_align, t_align)
+        pi3x_traj = transform_trajectory(pi3x_traj, R_align, t_align)
+        slam_traj = transform_trajectory(slam_traj, R_align, t_align)
+        start_traj = transform_trajectory(start_traj, R_align, t_align)
     output_path = default_output_path(args.debug_file)
     write_plotly_html(output_path, prior_traj, pi3x_traj, slam_traj, start_traj, gt_traj)
     print(f"[INFO] saved {output_path}")
