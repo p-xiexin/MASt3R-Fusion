@@ -56,7 +56,7 @@ def transform_trajectory(trajectory, T):
     return transformed
 
 
-def align_to_gt_with_evo(source_traj, timestamp_by_frame, gt_traj, gt_timestamp_by_frame):
+def align_to_gt_with_evo(source_traj, timestamp_by_frame, gt_traj, gt_timestamp_by_frame, align_count=200):
     from evo.core import lie_algebra, sync
     from evo.core.trajectory import PoseTrajectory3D
 
@@ -80,7 +80,9 @@ def align_to_gt_with_evo(source_traj, timestamp_by_frame, gt_traj, gt_timestamp_
     if traj_est_sel.num_poses < 3:
         print(f"[WARN] skip GT alignment: evo associated {traj_est_sel.num_poses} poses.")
         return np.eye(4, dtype=np.float64)
-    return lie_algebra.sim3(*traj_est_sel.align(traj_ref_sel, correct_scale=False))
+    n_to_align = min(align_count, traj_est_sel.num_poses)
+    print(f"[INFO] align to GT with first {n_to_align} associated poses")
+    return lie_algebra.sim3(*traj_est_sel.align(traj_ref_sel, correct_scale=False, n=n_to_align))
 
 
 def make_evo_trajectory(positions_xyz, timestamps):
