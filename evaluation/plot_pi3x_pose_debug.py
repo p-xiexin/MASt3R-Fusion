@@ -7,9 +7,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-def load_pose_debug(path, align_pi3x=True):
+def load_pose_debug(path):
     prior_by_frame = {}
     pi3x_by_frame = {}
+    window_start_frame_ids = []
     windows = {}
 
     with open(path, "r", newline="", encoding="utf-8") as fp:
@@ -21,15 +22,21 @@ def load_pose_debug(path, align_pi3x=True):
     for rows in windows.values():
         rows = sorted(rows, key=lambda row: int(row["local_idx"]))
         frame_ids = [int(row["frame_id"]) for row in rows]
+        if frame_ids:
+            window_start_frame_ids.append(frame_ids[0])
         prior = np.stack([matrix_from_row(row, "prior") for row in rows], axis=0)
         pi3x = np.stack([matrix_from_row(row, "pi3x") for row in rows], axis=0)
-        if align_pi3x and len(prior) > 0:
+        if len(prior) > 0:
             pi3x = np.einsum("ij,njk->nik", prior[0] @ np.linalg.inv(pi3x[0]), pi3x)
         for frame_id, prior_T, pi3x_T in zip(frame_ids, prior, pi3x):
             prior_by_frame[frame_id] = prior_T[:3, 3]
             pi3x_by_frame[frame_id] = pi3x_T[:3, 3]
 
-    return dict_to_trajectory(prior_by_frame), dict_to_trajectory(pi3x_by_frame)
+    return (
+        dict_to_trajectory(prior_by_frame),
+        dict_to_trajectory(pi3x_by_frame),
+        sorted(set(window_start_frame_ids)),
+    )
 
 
 def matrix_from_row(row, prefix):
@@ -104,6 +111,39 @@ def plot_traj(ax, traj, label, color, marker=None):
         ax.scatter(traj[:, 1], traj[:, 2], traj[:, 3], color=color, s=8, marker=marker)
 
 
+def trajectory_map(traj):
+    return {int(row[0]): row[1:4] for row in traj}
+
+
+def plot_window_start_links(ax, start_frame_ids, prior_traj, pi3x_traj, slam_traj):
+    prior_by_frame = trajectory_map(prior_traj)
+    pi3x_by_frame = trajectory_map(pi3x_traj)
+    slam_by_frame = trajectory_map(slam_traj)
+    label_used = False
+    for frame_id in start_frame_ids:
+        points = []
+        if frame_id in prior_by_frame:
+            points.append(prior_by_frame[frame_id])
+        if frame_id in pi3x_by_frame:
+            points.append(pi3x_by_frame[frame_id])
+        if frame_id in slam_by_frame:
+            points.append(slam_by_frame[frame_id])
+        if len(points) < 2:
+            continue
+        points = np.stack(points, axis=0)
+        ax.plot(
+            points[:, 0],
+            points[:, 1],
+            points[:, 2],
+            color="0.25",
+            linewidth=0.9,
+            linestyle="--",
+            alpha=0.65,
+            label="same keyframe links at window starts" if not label_used else None,
+        )
+        label_used = True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Plot PI3X pose-prior debug trajectories.")
     parser.add_argument("--debug-csv", required=True, help="Path to *.pi3x_pose_debug.csv.")
@@ -111,11 +151,11 @@ def main():
     parser.add_argument("--h5", default=None, help="data.h5 path for SLAM keyframe poses.")
     parser.add_argument("--output", default="pi3x_pose_debug_trajectory.png")
     parser.add_argument("--show", action="store_true")
-    parser.add_argument("--no-align-pi3x", action="store_true", help="Plot raw PI3X output poses without per-window first-pose alignment.")
+    parser.add_argument("--no-window-start-links", action="store_true", help="Do not connect same-keyframe points at each window start.")
     parser.add_argument("--slam-keyframes-only", action="store_true", help="Plot only result rows with keyframe flag == 1.")
     args = parser.parse_args()
 
-    prior_traj, pi3x_traj = load_pose_debug(args.debug_csv, align_pi3x=not args.no_align_pi3x)
+    prior_traj, pi3x_traj, window_start_frame_ids = load_pose_debug(args.debug_csv)
     if args.h5 is not None:
         slam_traj = load_h5_keyframes(args.h5)
         slam_label = "SLAM H5 keyframes"
@@ -130,6 +170,8 @@ def main():
     plot_traj(ax, prior_traj, "PI3X input prior / IMU preintegration", "tab:orange", marker="o")
     plot_traj(ax, pi3x_traj, "PI3X output pose", "tab:green", marker="^")
     plot_traj(ax, slam_traj, slam_label, "tab:blue")
+    if not args.no_window_start_links:
+        plot_window_start_links(ax, window_start_frame_ids, prior_traj, pi3x_traj, slam_traj)
     set_equal_axes(ax, [prior_traj, pi3x_traj, slam_traj])
     ax.set_xlabel("x")
     ax.set_ylabel("y")
