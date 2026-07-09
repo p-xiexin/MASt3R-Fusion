@@ -115,33 +115,22 @@ def trajectory_map(traj):
     return {int(row[0]): row[1:4] for row in traj}
 
 
-def plot_window_start_links(ax, start_frame_ids, prior_traj, pi3x_traj, slam_traj):
+def plot_window_start_markers(ax, start_frame_ids, prior_traj):
     prior_by_frame = trajectory_map(prior_traj)
-    pi3x_by_frame = trajectory_map(pi3x_traj)
-    slam_by_frame = trajectory_map(slam_traj)
-    label_used = False
-    for frame_id in start_frame_ids:
-        points = []
-        if frame_id in prior_by_frame:
-            points.append(prior_by_frame[frame_id])
-        if frame_id in pi3x_by_frame:
-            points.append(pi3x_by_frame[frame_id])
-        if frame_id in slam_by_frame:
-            points.append(slam_by_frame[frame_id])
-        if len(points) < 2:
-            continue
-        points = np.stack(points, axis=0)
-        ax.plot(
-            points[:, 0],
-            points[:, 1],
-            points[:, 2],
-            color="0.25",
-            linewidth=0.9,
-            linestyle="--",
-            alpha=0.65,
-            label="same keyframe links at window starts" if not label_used else None,
-        )
-        label_used = True
+    points = [prior_by_frame[frame_id] for frame_id in start_frame_ids if frame_id in prior_by_frame]
+    if not points:
+        return
+    points = np.stack(points, axis=0)
+    ax.scatter(
+        points[:, 0],
+        points[:, 1],
+        points[:, 2],
+        color="red",
+        s=36,
+        marker="o",
+        label="PI3X window starts",
+        zorder=5,
+    )
 
 
 def main():
@@ -151,7 +140,7 @@ def main():
     parser.add_argument("--h5", default=None, help="data.h5 path for SLAM keyframe poses.")
     parser.add_argument("--output", default="pi3x_pose_debug_trajectory.png")
     parser.add_argument("--show", action="store_true")
-    parser.add_argument("--no-window-start-links", action="store_true", help="Do not connect same-keyframe points at each window start.")
+    parser.add_argument("--no-window-start-markers", action="store_true", help="Do not mark PI3X window start keyframes.")
     parser.add_argument("--slam-keyframes-only", action="store_true", help="Plot only result rows with keyframe flag == 1.")
     args = parser.parse_args()
 
@@ -170,8 +159,8 @@ def main():
     plot_traj(ax, prior_traj, "PI3X input prior / IMU preintegration", "tab:orange", marker="o")
     plot_traj(ax, pi3x_traj, "PI3X output pose", "tab:green", marker="^")
     plot_traj(ax, slam_traj, slam_label, "tab:blue")
-    if not args.no_window_start_links:
-        plot_window_start_links(ax, window_start_frame_ids, prior_traj, pi3x_traj, slam_traj)
+    if not args.no_window_start_markers:
+        plot_window_start_markers(ax, window_start_frame_ids, prior_traj)
     set_equal_axes(ax, [prior_traj, pi3x_traj, slam_traj])
     ax.set_xlabel("x")
     ax.set_ylabel("y")
