@@ -6,9 +6,39 @@ from pathlib import Path
 import numpy as np
 
 
+def kitti360_camera_to_imu():
+    import mast3r_fusion.geoFunc.trans as trans
+
+    Tic = np.array(
+        [
+            [0.99944133, -0.00228419, -0.03334389, -0.03734697],
+            [0.03268308, -0.14183394, 0.98935078, 1.75837780],
+            [-0.00698916, -0.98988784, -0.14168005, 0.59911765],
+            [0.00000000, 0.00000000, 0.00000000, 1.00000000],
+        ],
+        dtype=np.float64,
+    )
+    Tic[:3, :3] = Tic[:3, :3] @ trans.att2m(np.array([-0.15, -0.1, 0.0], dtype=np.float64) / 57.3)
+    return Tic
+
+
+def camera_pose_to_imu_pose(T_wc, T_ci):
+    return T_wc @ T_ci
+
+
 def matrix_from_row(row, prefix):
     values = [float(row[f"{prefix}_{idx}"]) for idx in range(16)]
     return np.asarray(values, dtype=np.float64).reshape(4, 4)
+
+
+def matrix_from_sim3_data(sim3_data):
+    from scipy.spatial.transform import Rotation
+
+    pose = np.asarray(sim3_data, dtype=np.float64).reshape(-1, 8)[-1]
+    T_wc = np.eye(4, dtype=np.float64)
+    T_wc[:3, :3] = Rotation.from_quat(pose[3:7]).as_matrix()
+    T_wc[:3, 3] = pose[:3]
+    return T_wc
 
 
 def trajectory_from_map(positions_by_frame):
@@ -65,7 +95,7 @@ def make_evo_trajectory(positions_xyz, timestamps):
     )
 
 
-def load_pi3x_debug(csv_path):
+def load_pi3x_debug(csv_path, T_ci):
     windows = {}
     timestamp_by_frame = {}
     with open(csv_path, "r", newline="", encoding="utf-8") as fp:
@@ -91,8 +121,8 @@ def load_pi3x_debug(csv_path):
         pi3x_aligned = align_window_to_prior(prior, pi3x)
 
         for frame_id, prior_T, pi3x_T in zip(frame_ids, prior, pi3x_aligned):
-            prior_by_frame[frame_id] = prior_T[:3, 3]
-            pi3x_by_frame[frame_id] = pi3x_T[:3, 3]
+            prior_by_frame[frame_id] = camera_pose_to_imu_pose(prior_T, T_ci)[:3, 3]
+            pi3x_by_frame[frame_id] = camera_pose_to_imu_pose(pi3x_T, T_ci)[:3, 3]
 
     return (
         trajectory_from_map(prior_by_frame),
@@ -108,7 +138,7 @@ def align_window_to_prior(prior, pi3x):
     return np.einsum("ij,njk->nik", prior[0] @ np.linalg.inv(pi3x[0]), pi3x)
 
 
-def load_h5_keyframes(h5_path):
+def load_h5_keyframes(h5_path, T_ci):
     import h5py
     import torch
 
@@ -117,8 +147,8 @@ def load_h5_keyframes(h5_path):
         for key in sorted(h5_file.keys(), key=frame_key_sort):
             frame = torch.load(io.BytesIO(bytes(h5_file[key][()])), map_location="cpu", weights_only=False)
             frame_id = int(np.asarray(frame.get("id", frame_key_sort(key))).reshape(-1)[0])
-            pose = np.asarray(frame["T_WC"], dtype=np.float64).reshape(-1, 8)[-1]
-            positions_by_frame[frame_id] = pose[:3]
+            T_wc = matrix_from_sim3_data(frame["T_WC"])
+            positions_by_frame[frame_id] = camera_pose_to_imu_pose(T_wc, T_ci)[:3, 3]
     return trajectory_from_map(positions_by_frame)
 
 
@@ -211,8 +241,9 @@ def parse_args():
 
 def main():
     args = parse_args()
-    prior_traj, pi3x_traj, start_frame_ids, timestamp_by_frame = load_pi3x_debug(args.debug_file)
-    slam_traj = load_h5_keyframes(args.h5)
+    T_ci = np.linalg.inv(kitti360_camera_to_imu())
+    prior_traj, pi3x_traj, start_frame_ids, timestamp_by_frame = load_pi3x_debug(args.debug_file, T_ci)
+    slam_traj = load_h5_keyframes(args.h5, T_ci)
     gt_data = load_kitti_ground_truth(args.gt_pose) if args.gt_pose is not None else None
     gt_traj = gt_data[0] if gt_data is not None else None
     start_traj = window_start_trajectory(start_frame_ids, prior_traj)
