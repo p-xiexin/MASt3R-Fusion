@@ -1,5 +1,6 @@
 import argparse
 import csv
+import io
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -58,6 +59,28 @@ def load_slam_result(path, keyframes_only=False):
     return dict_to_trajectory(by_frame)
 
 
+def load_h5_keyframes(path):
+    import h5py
+    import torch
+
+    by_frame = {}
+    with h5py.File(path, "r") as h5_file:
+        for key in sorted(h5_file.keys(), key=frame_key_sort):
+            data = bytes(h5_file[key][()])
+            frame = torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
+            frame_id = int(np.asarray(frame.get("id", frame_key_sort(key))).reshape(-1)[0])
+            pose = np.asarray(frame["T_WC"], dtype=np.float64).reshape(-1, 8)[-1]
+            by_frame[frame_id] = pose[:3]
+    return dict_to_trajectory(by_frame)
+
+
+def frame_key_sort(key):
+    try:
+        return int(str(key).split("_")[-1])
+    except ValueError:
+        return str(key)
+
+
 def set_equal_axes(ax, trajectories):
     points = [traj[:, 1:4] for traj in trajectories if traj.size]
     if not points:
@@ -84,7 +107,8 @@ def plot_traj(ax, traj, label, color, marker=None):
 def main():
     parser = argparse.ArgumentParser(description="Plot PI3X pose-prior debug trajectories.")
     parser.add_argument("--debug-csv", required=True, help="Path to *.pi3x_pose_debug.csv.")
-    parser.add_argument("--result", required=True, help="SLAM result.txt path.")
+    parser.add_argument("--result", default=None, help="SLAM result.txt path.")
+    parser.add_argument("--h5", default=None, help="data.h5 path for SLAM keyframe poses.")
     parser.add_argument("--output", default="pi3x_pose_debug_trajectory.png")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--no-align-pi3x", action="store_true", help="Plot raw PI3X output poses without per-window first-pose alignment.")
@@ -92,13 +116,20 @@ def main():
     args = parser.parse_args()
 
     prior_traj, pi3x_traj = load_pose_debug(args.debug_csv, align_pi3x=not args.no_align_pi3x)
-    slam_traj = load_slam_result(args.result, keyframes_only=args.slam_keyframes_only)
+    if args.h5 is not None:
+        slam_traj = load_h5_keyframes(args.h5)
+        slam_label = "SLAM H5 keyframes"
+    elif args.result is not None:
+        slam_traj = load_slam_result(args.result, keyframes_only=args.slam_keyframes_only)
+        slam_label = "SLAM result"
+    else:
+        raise ValueError("Either --h5 or --result must be provided.")
 
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
     plot_traj(ax, prior_traj, "PI3X input prior / IMU preintegration", "tab:orange", marker="o")
     plot_traj(ax, pi3x_traj, "PI3X output pose", "tab:green", marker="^")
-    plot_traj(ax, slam_traj, "SLAM result", "tab:blue")
+    plot_traj(ax, slam_traj, slam_label, "tab:blue")
     set_equal_axes(ax, [prior_traj, pi3x_traj, slam_traj])
     ax.set_xlabel("x")
     ax.set_ylabel("y")
