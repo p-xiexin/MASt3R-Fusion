@@ -1,5 +1,5 @@
 import argparse
-import json
+import csv
 import pathlib
 import sys
 import time
@@ -24,6 +24,11 @@ import io
 import h5py
 
 pi3x_pose_debug_path = None
+PI3X_POSE_DEBUG_HEADER = (
+    ["record_time", "window_start", "window_end", "local_idx", "window_idx", "frame_id", "timestamp"]
+    + [f"prior_{i}" for i in range(16)]
+    + [f"pi3x_{i}" for i in range(16)]
+)
 
 def matrix_to_sim3(T, device='cpu', scale=1.0):
     TSim3 = lietorch.Sim3.Identity(1, device=device)
@@ -48,29 +53,41 @@ def sim3_to_se3_matrix(T_WC):
     return matrix
 
 
+def pose_timestamp(frame_id):
+    stamps = factor_graph.poses_stamps
+    if hasattr(stamps, "get"):
+        return float(stamps.get(int(frame_id), np.nan))
+    try:
+        return float(stamps[int(frame_id)])
+    except Exception:
+        return float("nan")
+
+
 def save_pi3x_pose_debug(window_indices, window_frames, pi3x_poses):
     if pi3x_pose_debug_path is None:
         return
     poses_np = pi3x_poses.detach().cpu().numpy() if torch.is_tensor(pi3x_poses) else np.asarray(pi3x_poses)
-    record = {
-        "time": time.time(),
-        "window_indices": [int(idx) for idx in window_indices],
-        "frame_ids": [int(frame.frame_id) for frame in window_frames],
-        "timestamps": [
-            float(factor_graph.poses_stamps.get(int(frame.frame_id), np.nan))
-            for frame in window_frames
-        ],
-        "prior_T_WC": [
-            sim3_to_se3_matrix(frame.T_WC).tolist()
-            for frame in window_frames
-        ],
-        "pi3x_T_WC": [
-            np.asarray(poses_np[idx], dtype=np.float64).tolist()
-            for idx in range(len(window_frames))
-        ],
-    }
-    with open(pi3x_pose_debug_path, "a", encoding="utf-8") as fp:
-        fp.write(json.dumps(record, separators=(",", ":")) + "\n")
+    record_time = time.time()
+    window_start = int(min(window_indices))
+    window_end = int(max(window_indices))
+    with open(pi3x_pose_debug_path, "a", newline="", encoding="utf-8") as fp:
+        writer = csv.writer(fp)
+        for local_idx, (window_idx, frame) in enumerate(zip(window_indices, window_frames)):
+            prior_T = sim3_to_se3_matrix(frame.T_WC).reshape(-1)
+            pi3x_T = np.asarray(poses_np[local_idx], dtype=np.float64).reshape(4, 4).reshape(-1)
+            writer.writerow(
+                [
+                    record_time,
+                    window_start,
+                    window_end,
+                    local_idx,
+                    int(window_idx),
+                    int(frame.frame_id),
+                    pose_timestamp(frame.frame_id),
+                    *prior_T.tolist(),
+                    *pi3x_T.tolist(),
+                ]
+            )
 
 
 def integrate_camera_gyro_prior(factor_graph, t0, t1):
@@ -416,11 +433,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.pi3x_pose_debug_path is None:
         result_path = pathlib.Path(args.result_path)
-        pi3x_pose_debug_path = str(result_path.with_suffix(result_path.suffix + ".pi3x_pose_debug.jsonl"))
+        pi3x_pose_debug_path = str(result_path.with_suffix(result_path.suffix + ".pi3x_pose_debug.csv"))
     else:
         pi3x_pose_debug_path = args.pi3x_pose_debug_path
     pathlib.Path(pi3x_pose_debug_path).parent.mkdir(parents=True, exist_ok=True)
-    pathlib.Path(pi3x_pose_debug_path).write_text("", encoding="utf-8")
+    with open(pi3x_pose_debug_path, "w", newline="", encoding="utf-8") as fp:
+        csv.writer(fp).writerow(PI3X_POSE_DEBUG_HEADER)
     print(f"[INFO] PI3X pose debug: {pi3x_pose_debug_path}")
     load_config(args.config)
 

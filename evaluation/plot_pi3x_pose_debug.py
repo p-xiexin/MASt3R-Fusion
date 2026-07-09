@@ -1,5 +1,5 @@
 import argparse
-import json
+import csv
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -9,23 +9,30 @@ import numpy as np
 def load_pose_debug(path, align_pi3x=True):
     prior_by_frame = {}
     pi3x_by_frame = {}
+    windows = {}
 
-    with open(path, "r", encoding="utf-8") as fp:
-        for line in fp:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            frame_ids = [int(v) for v in record["frame_ids"]]
-            prior = np.asarray(record["prior_T_WC"], dtype=np.float64)
-            pi3x = np.asarray(record["pi3x_T_WC"], dtype=np.float64)
-            if align_pi3x and len(prior) > 0:
-                pi3x = np.einsum("ij,njk->nik", prior[0] @ np.linalg.inv(pi3x[0]), pi3x)
-            for frame_id, prior_T, pi3x_T in zip(frame_ids, prior, pi3x):
-                prior_by_frame[frame_id] = prior_T[:3, 3]
-                pi3x_by_frame[frame_id] = pi3x_T[:3, 3]
+    with open(path, "r", newline="", encoding="utf-8") as fp:
+        reader = csv.DictReader(fp)
+        for row in reader:
+            key = (row["record_time"], row["window_start"], row["window_end"])
+            windows.setdefault(key, []).append(row)
+
+    for rows in windows.values():
+        rows = sorted(rows, key=lambda row: int(row["local_idx"]))
+        frame_ids = [int(row["frame_id"]) for row in rows]
+        prior = np.stack([matrix_from_row(row, "prior") for row in rows], axis=0)
+        pi3x = np.stack([matrix_from_row(row, "pi3x") for row in rows], axis=0)
+        if align_pi3x and len(prior) > 0:
+            pi3x = np.einsum("ij,njk->nik", prior[0] @ np.linalg.inv(pi3x[0]), pi3x)
+        for frame_id, prior_T, pi3x_T in zip(frame_ids, prior, pi3x):
+            prior_by_frame[frame_id] = prior_T[:3, 3]
+            pi3x_by_frame[frame_id] = pi3x_T[:3, 3]
 
     return dict_to_trajectory(prior_by_frame), dict_to_trajectory(pi3x_by_frame)
+
+
+def matrix_from_row(row, prefix):
+    return np.asarray([float(row[f"{prefix}_{idx}"]) for idx in range(16)], dtype=np.float64).reshape(4, 4)
 
 
 def dict_to_trajectory(values):
@@ -76,7 +83,7 @@ def plot_traj(ax, traj, label, color, marker=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Plot PI3X pose-prior debug trajectories.")
-    parser.add_argument("--debug-jsonl", required=True, help="Path to *.pi3x_pose_debug.jsonl.")
+    parser.add_argument("--debug-csv", required=True, help="Path to *.pi3x_pose_debug.csv.")
     parser.add_argument("--result", required=True, help="SLAM result.txt path.")
     parser.add_argument("--output", default="pi3x_pose_debug_trajectory.png")
     parser.add_argument("--show", action="store_true")
@@ -84,7 +91,7 @@ def main():
     parser.add_argument("--slam-keyframes-only", action="store_true", help="Plot only result rows with keyframe flag == 1.")
     args = parser.parse_args()
 
-    prior_traj, pi3x_traj = load_pose_debug(args.debug_jsonl, align_pi3x=not args.no_align_pi3x)
+    prior_traj, pi3x_traj = load_pose_debug(args.debug_csv, align_pi3x=not args.no_align_pi3x)
     slam_traj = load_slam_result(args.result, keyframes_only=args.slam_keyframes_only)
 
     fig = plt.figure(figsize=(9, 7))
