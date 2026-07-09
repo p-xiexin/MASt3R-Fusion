@@ -18,42 +18,63 @@ def trajectory_from_map(positions_by_frame):
     return np.asarray(rows, dtype=np.float64)
 
 
-def transform_trajectory(trajectory, R, t):
+def transform_trajectory(trajectory, T):
     if trajectory.size == 0:
         return trajectory
     transformed = trajectory.copy()
-    transformed[:, 1:4] = trajectory[:, 1:4] @ R.T + t
+    transformed[:, 1:4] = trajectory[:, 1:4] @ T[:3, :3].T + T[:3, 3]
     return transformed
 
 
-def align_to_reference(source_traj, reference_traj):
-    source_by_frame = trajectory_index(source_traj)
-    reference_by_frame = trajectory_index(reference_traj)
-    common_ids = sorted(set(source_by_frame) & set(reference_by_frame))
-    if len(common_ids) < 3:
-        print(f"[WARN] skip GT alignment: only {len(common_ids)} common frame ids.")
-        return np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+def align_to_gt_with_evo(source_traj, timestamp_by_frame, gt_traj, gt_timestamp_by_frame):
+    from evo.core import lie_algebra, sync
+    from evo.core.trajectory import PoseTrajectory3D
 
-    source = np.stack([source_by_frame[frame_id] for frame_id in common_ids], axis=0)
-    reference = np.stack([reference_by_frame[frame_id] for frame_id in common_ids], axis=0)
-    source_mean = source.mean(axis=0)
-    reference_mean = reference.mean(axis=0)
-    H = (source - source_mean).T @ (reference - reference_mean)
-    U, _, Vt = np.linalg.svd(H)
-    R = Vt.T @ U.T
-    if np.linalg.det(R) < 0:
-        Vt[-1, :] *= -1.0
-        R = Vt.T @ U.T
-    t = reference_mean - R @ source_mean
-    return R, t
+    source_rows = [row for row in source_traj if int(row[0]) in timestamp_by_frame]
+    gt_rows = [row for row in gt_traj if int(row[0]) in gt_timestamp_by_frame]
+    if len(source_rows) < 3 or len(gt_rows) < 3:
+        print(f"[WARN] skip GT alignment: source={len(source_rows)}, gt={len(gt_rows)}")
+        return np.eye(4, dtype=np.float64)
+
+    source_rows = np.asarray(source_rows, dtype=np.float64)
+    gt_rows = np.asarray(gt_rows, dtype=np.float64)
+    traj_est = make_evo_trajectory(
+        source_rows[:, 1:4],
+        [timestamp_by_frame[int(frame_id)] for frame_id in source_rows[:, 0]],
+    )
+    traj_ref = make_evo_trajectory(
+        gt_rows[:, 1:4],
+        [gt_timestamp_by_frame[int(frame_id)] for frame_id in gt_rows[:, 0]],
+    )
+    traj_ref_sel, traj_est_sel = sync.associate_trajectories(traj_ref, traj_est, 0.01, 0.0)
+    if traj_est_sel.num_poses < 3:
+        print(f"[WARN] skip GT alignment: evo associated {traj_est_sel.num_poses} poses.")
+        return np.eye(4, dtype=np.float64)
+    return lie_algebra.sim3(*traj_est_sel.align(traj_ref_sel, correct_scale=False))
+
+
+def make_evo_trajectory(positions_xyz, timestamps):
+    from evo.core.trajectory import PoseTrajectory3D
+
+    positions_xyz = np.asarray(positions_xyz, dtype=np.float64)
+    orientations = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float64), (positions_xyz.shape[0], 1))
+    return PoseTrajectory3D(
+        positions_xyz=positions_xyz,
+        orientations_quat_wxyz=orientations,
+        timestamps=np.asarray(timestamps, dtype=np.float64),
+    )
 
 
 def load_pi3x_debug(csv_path):
     windows = {}
+    timestamp_by_frame = {}
     with open(csv_path, "r", newline="", encoding="utf-8") as fp:
         for row in csv.DictReader(fp):
             key = (row["record_time"], row["window_start"], row["window_end"])
             windows.setdefault(key, []).append(row)
+            timestamp = float(row["timestamp"])
+            if np.isfinite(timestamp):
+                timestamp_by_frame[int(row["frame_id"])] = timestamp
 
     prior_by_frame = {}
     pi3x_by_frame = {}
@@ -77,6 +98,7 @@ def load_pi3x_debug(csv_path):
         trajectory_from_map(prior_by_frame),
         trajectory_from_map(pi3x_by_frame),
         sorted(set(window_start_frame_ids)),
+        timestamp_by_frame,
     )
 
 
@@ -104,11 +126,13 @@ def load_kitti_ground_truth(gt_path):
     data = np.loadtxt(gt_path)
     data = np.atleast_2d(data)
     positions_by_frame = {}
+    timestamp_by_frame = {}
     for row_idx, row in enumerate(data):
         if row.size < 8:
             raise ValueError(f"KITTI-360 gt_local.txt row must have at least 8 values, got {row.size}.")
         positions_by_frame[row_idx] = row[1:4].astype(np.float64)
-    return trajectory_from_map(positions_by_frame)
+        timestamp_by_frame[row_idx] = float(row[0])
+    return trajectory_from_map(positions_by_frame), timestamp_by_frame
 
 
 def frame_key_sort(key):
@@ -187,16 +211,17 @@ def parse_args():
 
 def main():
     args = parse_args()
-    prior_traj, pi3x_traj, start_frame_ids = load_pi3x_debug(args.debug_file)
+    prior_traj, pi3x_traj, start_frame_ids, timestamp_by_frame = load_pi3x_debug(args.debug_file)
     slam_traj = load_h5_keyframes(args.h5)
-    gt_traj = load_kitti_ground_truth(args.gt_pose) if args.gt_pose is not None else None
+    gt_data = load_kitti_ground_truth(args.gt_pose) if args.gt_pose is not None else None
+    gt_traj = gt_data[0] if gt_data is not None else None
     start_traj = window_start_trajectory(start_frame_ids, prior_traj)
     if gt_traj is not None:
-        R_align, t_align = align_to_reference(slam_traj, gt_traj)
-        prior_traj = transform_trajectory(prior_traj, R_align, t_align)
-        pi3x_traj = transform_trajectory(pi3x_traj, R_align, t_align)
-        slam_traj = transform_trajectory(slam_traj, R_align, t_align)
-        start_traj = transform_trajectory(start_traj, R_align, t_align)
+        T_align = align_to_gt_with_evo(slam_traj, timestamp_by_frame, gt_data[0], gt_data[1])
+        prior_traj = transform_trajectory(prior_traj, T_align)
+        pi3x_traj = transform_trajectory(pi3x_traj, T_align)
+        slam_traj = transform_trajectory(slam_traj, T_align)
+        start_traj = transform_trajectory(start_traj, T_align)
     output_path = default_output_path(args.debug_file)
     write_plotly_html(output_path, prior_traj, pi3x_traj, slam_traj, start_traj, gt_traj)
     print(f"[INFO] saved {output_path}")
