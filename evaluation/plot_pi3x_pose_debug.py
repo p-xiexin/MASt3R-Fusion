@@ -75,17 +75,9 @@ def load_kitti_ground_truth(gt_path):
     data = np.atleast_2d(data)
     positions_by_frame = {}
     for row_idx, row in enumerate(data):
-        if row.size == 12:
-            frame_id = row_idx
-            pose_values = row
-        elif row.size >= 13:
-            frame_id = int(row[0])
-            pose_values = row[1:13]
-        else:
-            raise ValueError(f"KITTI ground truth row must have 12 or 13+ values, got {row.size}.")
-        T = np.eye(4, dtype=np.float64)
-        T[:3, :4] = np.asarray(pose_values, dtype=np.float64).reshape(3, 4)
-        positions_by_frame[frame_id] = T[:3, 3]
+        if row.size < 8:
+            raise ValueError(f"KITTI-360 gt_local.txt row must have at least 8 values, got {row.size}.")
+        positions_by_frame[row_idx] = row[1:4].astype(np.float64)
     return trajectory_from_map(positions_by_frame)
 
 
