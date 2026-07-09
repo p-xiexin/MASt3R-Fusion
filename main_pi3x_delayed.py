@@ -1,4 +1,6 @@
 import argparse
+import json
+import pathlib
 import sys
 import time
 import lietorch
@@ -21,6 +23,8 @@ from scipy.spatial.transform import Rotation
 import io
 import h5py
 
+pi3x_pose_debug_path = None
+
 def matrix_to_sim3(T, device='cpu', scale=1.0):
     TSim3 = lietorch.Sim3.Identity(1, device=device)
     q = Rotation.from_matrix(T[0:3, 0:3]).as_quat()
@@ -33,6 +37,40 @@ def matrix_to_sim3(T, device='cpu', scale=1.0):
     TSim3[0].data[6] = q[3]
     TSim3[0].data[7] = scale
     return TSim3
+
+
+def sim3_to_se3_matrix(T_WC):
+    T_WC64 = lietorch.Sim3(T_WC.data.to(torch.float64))
+    matrix = T_WC64.matrix().detach().cpu().numpy()[0]
+    scale = T_WC64.data.reshape(-1, T_WC64.data.shape[-1])[0, -1].detach().cpu().item()
+    if np.isfinite(scale) and abs(scale) > 1e-8:
+        matrix[:3, :3] /= scale
+    return matrix
+
+
+def save_pi3x_pose_debug(window_indices, window_frames, pi3x_poses):
+    if pi3x_pose_debug_path is None:
+        return
+    poses_np = pi3x_poses.detach().cpu().numpy() if torch.is_tensor(pi3x_poses) else np.asarray(pi3x_poses)
+    record = {
+        "time": time.time(),
+        "window_indices": [int(idx) for idx in window_indices],
+        "frame_ids": [int(frame.frame_id) for frame in window_frames],
+        "timestamps": [
+            float(factor_graph.poses_stamps.get(int(frame.frame_id), np.nan))
+            for frame in window_frames
+        ],
+        "prior_T_WC": [
+            sim3_to_se3_matrix(frame.T_WC).tolist()
+            for frame in window_frames
+        ],
+        "pi3x_T_WC": [
+            np.asarray(poses_np[idx], dtype=np.float64).tolist()
+            for idx in range(len(window_frames))
+        ],
+    }
+    with open(pi3x_pose_debug_path, "a", encoding="utf-8") as fp:
+        fp.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
 def integrate_camera_gyro_prior(factor_graph, t0, t1):
@@ -274,6 +312,7 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
         local_edges,
         subpixel_factor=factor_graph.subpixel_factor,
     )
+    save_pi3x_pose_debug(window_indices, window_frames, poses)
     for local_idx, frame in enumerate(window_frames):
         frame.update_pointmap(Xs[local_idx : local_idx + 1], Cs[local_idx : local_idx + 1])
         keyframes[window_indices[local_idx]] = frame
@@ -365,6 +404,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_from", type =  int, default=0)
     parser.add_argument("--end_at", type =  int, default=-1)
     parser.add_argument("--save_h5", action="store_true")
+    parser.add_argument("--pi3x_pose_debug_path", default=None)
     parser.add_argument("--frontend-model", choices=["pi3x"], default=None)
     parser.add_argument("--frontend-weights", default=None)
     parser.add_argument("--foxglove", action="store_true", help="Enable Foxglove WebSocket debug publisher.")
@@ -374,6 +414,14 @@ if __name__ == "__main__":
 
 
     args = parser.parse_args()
+    if args.pi3x_pose_debug_path is None:
+        result_path = pathlib.Path(args.result_path)
+        pi3x_pose_debug_path = str(result_path.with_suffix(result_path.suffix + ".pi3x_pose_debug.jsonl"))
+    else:
+        pi3x_pose_debug_path = args.pi3x_pose_debug_path
+    pathlib.Path(pi3x_pose_debug_path).parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path(pi3x_pose_debug_path).write_text("", encoding="utf-8")
+    print(f"[INFO] PI3X pose debug: {pi3x_pose_debug_path}")
     load_config(args.config)
 
 
