@@ -1,5 +1,7 @@
 import argparse
 import csv
+import gc
+import os
 import pathlib
 import sys
 import time
@@ -280,6 +282,10 @@ def add_precomputed_factor_matches(factor_graph, ii, jj, matches, min_match_frac
     factor_graph.Q_ii2jj = torch.cat([factor_graph.Q_ii2jj, Qj])
     factor_graph.Q_jj2ii = torch.cat([factor_graph.Q_jj2ii, Qi])
 
+    factor_graph.save_match_visualizations(
+        ii_tensor, jj_tensor, idx_i2j, valid_match_j
+    )
+
     retain_mask = torch.logical_not(
         torch.logical_and(
             factor_graph.ii < torch.max(factor_graph.ii) - 20,
@@ -441,6 +447,12 @@ if __name__ == "__main__":
         csv.writer(fp).writerow(PI3X_POSE_DEBUG_HEADER)
     print(f"[INFO] PI3X pose debug: {pi3x_pose_debug_path}")
     load_config(args.config)
+
+    if not args.no_viz and os.name != "nt" and not (
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    ):
+        print("[WARN] No display server found; disabling visualization. Pass --no-viz explicitly for headless runs.")
+        args.no_viz = True
 
 
     if args.save_h5:
@@ -640,7 +652,7 @@ if __name__ == "__main__":
             continue
 
         if mode == Mode.TRACKING:
-            if sparse_flow_frontend is not None:
+            if sparse_flow_frontend is not None and factor_graph.enable_ms:
                 add_new_kf = should_add_delayed_keyframe(
                     frame.frame_id,
                     last_kf_frame_id,
@@ -788,3 +800,8 @@ if __name__ == "__main__":
         viz.join()
     if args.foxglove:
         foxglove.join()
+    factor_graph.close()
+    manager.shutdown()
+    torch.cuda.empty_cache()
+    gc.collect()
+    os._exit(0)

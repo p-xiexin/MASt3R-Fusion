@@ -3,6 +3,7 @@ inherit: config/base_kitti360_pi3x.yaml
 pi3x:
   imu_predict: true
   delayed_matching: true
+  viz_matching: true
   delayed_batch_keyframes: 5
   delayed_keyframe_stride: 2
   sparse_flow_frontend:

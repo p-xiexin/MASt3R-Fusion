@@ -156,7 +156,7 @@ class FactorGraph:
 
         self.init_vi_signal = False
         self.enable_ms = False
-        self.viz_matching = False
+        self.viz_matching = bool(config.get("pi3x", {}).get("viz_matching", False))
 
 
         self.enable_excalib = config["ms_opt"]['enable_excalib']
@@ -343,7 +343,77 @@ class FactorGraph:
                                          'tstamps':[self.poses_stamps[self.frames[ii[iii]].frame_id],self.poses_stamps[self.frames[jj[iii]].frame_id]],
                                          'params':[self.wTcs[ii[iii]],self.ss[ii[iii]],self.wTcs[jj[iii]],self.ss[jj[iii]]]})
                 self.all_factors.append({'type':'param','ii':ii[iii].item(),'v':self.vs[ii[iii]],'b':self.bs[ii[iii]]})
-        pickle.dump(self.all_factors,open(path,'wb'))
+        with open(path, 'wb') as fp:
+            pickle.dump(self.all_factors, fp)
+
+    def close(self):
+        if getattr(self, "fp", None) is not None and not self.fp.closed:
+            self.fp.close()
+        self.cur_graph = None
+        self.cur_result = None
+        self.marg_factor = None
+        self.preintegrations = []
+        self.bs = []
+        self.vs = []
+        self.all_factors = []
+
+        if self.viz_matching:
+            print("[INFO] PI3X match visualization: temp/pi3x_matches")
+
+    def save_match_visualizations(self, ii, jj, idx_i2j, valid_match_j):
+        if not self.viz_matching or len(ii) == 0:
+            return
+
+        output_dir = os.path.join("temp", "pi3x_matches")
+        os.makedirs(output_dir, exist_ok=True)
+        for edge_idx in range(len(ii)):
+            kf_i = int(ii[edge_idx].item())
+            kf_j = int(jj[edge_idx].item())
+            frame_i = self.frames[kf_i]
+            frame_j = self.frames[kf_j]
+            img_i = frame_i.uimg
+            img_j = frame_j.uimg
+            _, w_i = img_i.shape[:2]
+            _, w_j = img_j.shape[:2]
+            target_w = w_i * self.subpixel_factor
+
+            valid = valid_match_j[edge_idx, :, 0].bool()
+            pts_j = torch.nonzero(valid, as_tuple=False).flatten()
+            if pts_j.numel() > 2000:
+                sample = torch.linspace(
+                    0, pts_j.numel() - 1, 2000, device=pts_j.device
+                ).long()
+                pts_j = pts_j[sample]
+            pts_i = idx_i2j[edge_idx, pts_j]
+            pts_j = pts_j.cpu().numpy()
+            pts_i = pts_i.cpu().numpy()
+            colors = np.arange(len(pts_j))
+
+            plt.figure(figsize=(8, 8))
+            plt.subplot(2, 1, 1)
+            plt.imshow(img_i)
+            plt.scatter(
+                (pts_i % target_w) // self.subpixel_factor,
+                (pts_i // target_w) // self.subpixel_factor,
+                s=1.0,
+                c=colors,
+                cmap="jet",
+            )
+            plt.axis("off")
+
+            plt.subplot(2, 1, 2)
+            plt.imshow(img_j)
+            plt.scatter(pts_j % w_j, pts_j // w_j, s=1.0, c=colors, cmap="jet")
+            plt.axis("off")
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(
+                    output_dir,
+                    f"kf{kf_i}_frame{frame_i.frame_id}__kf{kf_j}_frame{frame_j.frame_id}.jpg",
+                ),
+                dpi=160,
+            )
+            plt.close()
 
     def add_factors(self, ii, jj, min_match_frac, is_reloc=False):
         # print('1',time.time())
@@ -440,51 +510,9 @@ class FactorGraph:
         self.Q_jj2ii = torch.cat([self.Q_jj2ii, Qi])
         
 
-        # Saving matching resutls
-        if  self.viz_matching:
-            if not os.path.exists('temp'):
-                os.mkdir('temp')
-            for iiii in range(ii_tensor.shape[0]):
-                frame_i = self.frames[ii_tensor[iiii].item()]
-                frame_j = self.frames[jj_tensor[iiii].item()]
-                img_i = frame_i.uimg
-                img_j = frame_j.uimg
-                h_i, w_i = img_i.shape[:2]
-                h_j, w_j = img_j.shape[:2]
-                target_w = w_i * self.subpixel_factor
-
-                plt.figure('1',figsize=[5,6])
-                plt.subplot(2,1,1)
-                plt.imshow(img_i)
-
-                mask = valid_match_j[iiii,::100,0].cpu().numpy()
-                pts_j = np.arange(valid_match_j.shape[1])[::100]
-                pts_i = idx_i2j[iiii,::100].cpu().numpy()
-                clr = np.arange(valid_match_j.shape[1])[::100]
-                pts_j = pts_j[mask]
-                pts_i = pts_i[mask]
-                clr = clr[mask]
-
-                x_i = (pts_i % target_w) // self.subpixel_factor
-                y_i = (pts_i // target_w) // self.subpixel_factor
-                plt.scatter(x_i, y_i, s=0.7, c=clr, cmap='jet')
-                plt.gca().tick_params(labelbottom=False, labelleft=False)
-
-                plt.subplot(2,1,2)
-                plt.imshow(img_j)
-                plt.scatter(pts_j % w_j, pts_j // w_j, s=0.7, c=clr, cmap='jet')
-                plt.gca().tick_params(labelbottom=False, labelleft=False)
-                plt.tight_layout()
-                plt.savefig(
-                    'temp/kf%d_frame%d__kf%d_frame%d.jpg'
-                    % (
-                        ii_tensor[iiii].item(),
-                        frame_i.frame_id,
-                        jj_tensor[iiii].item(),
-                        frame_j.frame_id,
-                    )
-                )
-                plt.close('all')
+        self.save_match_visualizations(
+            ii_tensor, jj_tensor, idx_i2j, valid_match_j
+        )
 
         retain_mask = torch.logical_not(torch.logical_and(self.ii<torch.max(self.ii)-20,self.jj<torch.max(self.jj)-self.retain_num))
         self.ii = self.ii[retain_mask]

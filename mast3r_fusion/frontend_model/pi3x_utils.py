@@ -434,11 +434,15 @@ def pi3x_match_window_edges(model, frames, edges, subpixel_factor=1):
         Cjj = C[edge_j : edge_j + 1]
         pose_i = poses[edge_i : edge_i + 1]
         pose_j = poses[edge_j : edge_j + 1]
+        K_i = _frame_intrinsics_for_match(frames[edge_i], Xii)
+        K_j = _frame_intrinsics_for_match(frames[edge_j], Xjj)
         idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
-            Xjj, Xii, pose_j, pose_i, Cjj, Cii, conf_threshold=conf_threshold
+            Xjj, Xii, pose_j, pose_i, Cjj, Cii, K_dst=K_i,
+            conf_threshold=conf_threshold
         )
         idx_j2i, valid_match_i, pair_conf_j2i = pi3_matching.match(
-            Xii, Xjj, pose_i, pose_j, Cii, Cjj, conf_threshold=conf_threshold
+            Xii, Xjj, pose_i, pose_j, Cii, Cjj, K_dst=K_j,
+            conf_threshold=conf_threshold
         )
         constraints[(edge_i, edge_j)] = (
             idx_i2j,
@@ -493,6 +497,20 @@ def _match_conf_threshold():
     return config.get("pi3x", {}).get("match_conf_threshold", 0.0)
 
 
+def _frame_intrinsics_for_match(frame, points):
+    K = getattr(frame, "K", None)
+    if K is None:
+        return None
+    K = torch.as_tensor(K, device=points.device, dtype=points.dtype).clone()
+    if K.ndim == 3 and K.shape[0] == 1:
+        K = K[0]
+    downsample = int(config["dataset"].get("img_downsample", 1))
+    if downsample > 1:
+        K[0, :] /= downsample
+        K[1, :] /= downsample
+    return K
+
+
 def _match_debug_enabled():
     return config.get("pi3x", {}).get("debug_match", True)
 
@@ -527,6 +545,7 @@ def _print_match_debug(name, frame_i, frame_j, valid, pair_conf, conf_src, conf_
             f"valid={valid_count}/{total} ({valid_count / max(total, 1):.6f}) "
             f"in_bounds={_ratio(debug['in_bounds'][batch_idx]):.6f} "
             f"depth={_ratio(debug['positive_depth'][batch_idx]):.6f} "
+            f"geom={_ratio(debug['valid_distance'][batch_idx]):.6f} "
             f"src_conf={_ratio(debug['valid_conf_src'][batch_idx]):.6f} "
             f"dst_conf={_ratio(debug['valid_conf_dst'][batch_idx]):.6f} "
             f"z[min={torch.nan_to_num(z).min().item():.3g}, "
@@ -609,13 +628,19 @@ def pi3x_match_symmetric(
     Qii, Qji, Qjj, Qij = Q[0], Q[1], Q[2], Q[3]
     pose_i = torch.stack(pose_i, dim=0)
     pose_j = torch.stack(pose_j, dim=0)
+    K_i = [_frame_intrinsics_for_match(frame, Xii) for frame in frames_i]
+    K_j = [_frame_intrinsics_for_match(frame, Xjj) for frame in frames_j]
+    K_i = None if any(K is None for K in K_i) else torch.stack(K_i)
+    K_j = None if any(K is None for K in K_j) else torch.stack(K_j)
 
     conf_threshold = _match_conf_threshold()
     idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
-        Xjj, Xii, pose_j, pose_i, Cjj, Cii, conf_threshold=conf_threshold
+        Xjj, Xii, pose_j, pose_i, Cjj, Cii, K_dst=K_i,
+        conf_threshold=conf_threshold
     )
     idx_j2i, valid_match_i, pair_conf_j2i = pi3_matching.match(
-        Xii, Xjj, pose_i, pose_j, Cii, Cjj, conf_threshold=conf_threshold
+        Xii, Xjj, pose_i, pose_j, Cii, Cjj, K_dst=K_j,
+        conf_threshold=conf_threshold
     )
 
     return (
@@ -676,6 +701,7 @@ def pi3x_match_asymmetric(
         pose_dst,
         Cjj_match,
         Cii_match,
+        K_dst=_frame_intrinsics_for_match(frame_i, Xii_match),
         conf_threshold=_match_conf_threshold(),
         return_debug=True,
     )

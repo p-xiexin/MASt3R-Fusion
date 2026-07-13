@@ -1,5 +1,7 @@
 import torch
 
+from mast3r_fusion.config import config
+
 
 def _ensure_batch_points(points: torch.Tensor) -> torch.Tensor:
     if points.ndim == 3:
@@ -109,16 +111,24 @@ def transform_points(points: torch.Tensor, pose_src: torch.Tensor, pose_dst: tor
 
 def project_to_index(
     points_dst: torch.Tensor,
+    target_points: torch.Tensor,
     K_dst: torch.Tensor,
     conf_src: torch.Tensor,
     conf_dst: torch.Tensor,
     conf_threshold: float = 0.0,
     min_depth: float = 1e-6,
+    max_3d_distance: float = None,
     return_debug: bool = False,
 ):
     """Project source-grid points in destination coordinates to destination indices."""
 
     points_dst = _ensure_batch_points(points_dst)
+    target_points = _ensure_batch_points(target_points)
+    if target_points.shape != points_dst.shape:
+        raise ValueError(
+            "Projected and target point maps must have the same shape: "
+            f"projected={tuple(points_dst.shape)}, target={tuple(target_points.shape)}."
+        )
     conf_src = _ensure_batch_conf(conf_src, points_dst)
     conf_dst = _ensure_batch_conf(conf_dst, points_dst)
     if K_dst.ndim == 2:
@@ -139,21 +149,34 @@ def project_to_index(
     in_bounds = (u_round >= 0) & (u_round < w) & (v_round >= 0) & (v_round < h)
 
     conf_projected_dst = torch.zeros_like(conf_src)
+    projected_target_points = torch.zeros_like(points_dst)
     batch_idx = torch.arange(b, device=points_dst.device)[:, None, None].expand(b, h, w)
     conf_projected_dst[in_bounds] = conf_dst[
         batch_idx[in_bounds], v_round[in_bounds], u_round[in_bounds]
     ]
+    projected_target_points[in_bounds] = target_points[
+        batch_idx[in_bounds], v_round[in_bounds], u_round[in_bounds]
+    ]
     finite_points = torch.isfinite(points_dst).all(dim=-1)
+    finite_target_points = torch.isfinite(projected_target_points).all(dim=-1)
     finite_projection = torch.isfinite(u) & torch.isfinite(v)
     positive_depth = z > min_depth
+    positive_target_depth = projected_target_points[..., 2] > min_depth
     valid_conf_src = conf_src > conf_threshold
     valid_conf_dst = conf_projected_dst > conf_threshold
+    if max_3d_distance is None:
+        max_3d_distance = float(config.get("matching", {}).get("dist_thresh", 1.0))
+    distance_3d = torch.linalg.norm(points_dst - projected_target_points, dim=-1)
+    valid_distance = distance_3d < max_3d_distance
     valid = (
         finite_points
+        & finite_target_points
         & finite_projection
         & positive_depth
+        & positive_target_depth
         & valid_conf_src
         & valid_conf_dst
+        & valid_distance
         & in_bounds
     )
     idx = torch.zeros(b, h, w, device=points_dst.device, dtype=torch.long)
@@ -168,10 +191,14 @@ def project_to_index(
         "v": v.view(b, -1),
         "in_bounds": in_bounds.view(b, -1),
         "finite_points": finite_points.view(b, -1),
+        "finite_target_points": finite_target_points.view(b, -1),
         "finite_projection": finite_projection.view(b, -1),
         "positive_depth": positive_depth.view(b, -1),
+        "positive_target_depth": positive_target_depth.view(b, -1),
         "valid_conf_src": valid_conf_src.view(b, -1),
         "valid_conf_dst": valid_conf_dst.view(b, -1),
+        "valid_distance": valid_distance.view(b, -1),
+        "distance_3d": distance_3d.view(b, -1),
         "conf_projected_dst": conf_projected_dst.view(b, -1, 1),
         "z": z.view(b, -1),
     }
@@ -222,6 +249,7 @@ def match(
     points_src_in_dst = transform_points(points_src, pose_src, pose_dst)
     result = project_to_index(
         points_src_in_dst,
+        points_dst,
         K_dst,
         conf_src,
         conf_dst,
