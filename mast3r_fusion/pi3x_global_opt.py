@@ -1,5 +1,6 @@
 import lietorch
 import torch
+import csv
 from mast3r_fusion.config import config
 from mast3r_fusion.frame import SharedKeyframes
 from mast3r_fusion.geometry import (
@@ -165,6 +166,23 @@ class FactorGraph:
         self.window_num = config["ms_opt"]['window_num']
         self.retain_num = self.window_num + 10 # reserved for marginalization
         self.frames_to_save = []
+        self.degeneracy_projection = bool(
+            config["ms_opt"].get("degeneracy_projection", False)
+        )
+        self.degeneracy_eigen_ratio = float(
+            config["ms_opt"].get("degeneracy_eigen_ratio", 1e-4)
+        )
+        if not 0.0 <= self.degeneracy_eigen_ratio < 1.0:
+            raise ValueError("ms_opt.degeneracy_eigen_ratio must be in [0, 1).")
+        self.defer_marginalization_on_degeneracy = bool(
+            config["ms_opt"].get("defer_marginalization_on_degeneracy", False)
+        )
+        self.marginalization_delay_keyframes = int(
+            config["ms_opt"].get("marginalization_delay_keyframes", 10)
+        )
+        if self.marginalization_delay_keyframes < 0:
+            raise ValueError("ms_opt.marginalization_delay_keyframes must be non-negative.")
+        self.last_visual_degenerate = False
 
         calib = yaml.load(open(args.calib,'rt'), Loader=yaml.SafeLoader)
         self.poses_ref = {}
@@ -238,11 +256,111 @@ class FactorGraph:
             self.imu_pool = data_utils.IMUPool(all_imu_new, degree = True, dt = args.imu_dt)
 
         self.fp = open(args.result_path,'wt')
+        self.degeneracy_fp = open(
+            f"{args.result_path}.degeneracy.csv", "w", newline="", encoding="utf-8"
+        )
+        self.degeneracy_writer = csv.writer(self.degeneracy_fp)
+        self.degeneracy_writer.writerow(
+            [
+                "record_time", "phase", "iteration", "pin", "edge_i", "edge_j",
+                "rank", "condition", "threshold", "projection_enabled",
+                *[f"eigenvalue_{idx}" for idx in range(7)],
+            ]
+        )
         self.fp_id = 0
         self.transform_world = False
 
         self.all_factors = []
 
+        if self.viz_matching:
+            print("[INFO] PI3X match visualization: temp/pi3x_matches")
+        print(f"[INFO] PI3X degeneracy log: {args.result_path}.degeneracy.csv")
+
+
+    def filter_degenerate_visual_directions(
+        self, H11, v11, ii, jj, phase, iteration, pin
+    ):
+        if H11.numel() == 0:
+            return
+
+        symmetric_H = 0.5 * (H11 + H11.transpose(-1, -2))
+        eigenvalues, eigenvectors = torch.linalg.eigh(symmetric_H)
+        if not torch.isfinite(eigenvalues).all():
+            raise ValueError(f"Non-finite visual Hessian eigenvalues during {phase}.")
+
+        max_eigenvalue = eigenvalues[..., -1]
+        if torch.any(max_eigenvalue <= 0):
+            raise ValueError(f"Visual Hessian is not positive during {phase}.")
+        threshold = max_eigenvalue * self.degeneracy_eigen_ratio
+        retained = eigenvalues > threshold.unsqueeze(-1)
+        ranks = retained.sum(dim=-1)
+        if phase == "solve":
+            self.last_visual_degenerate = bool(torch.any(ranks < H11.shape[-1]).item())
+
+        positive_floor = torch.finfo(eigenvalues.dtype).eps
+        smallest = torch.clamp(eigenvalues[..., 0], min=positive_floor)
+        conditions = max_eigenvalue / smallest
+        eigenvalues_cpu = eigenvalues[0].detach().cpu().numpy()
+        ranks_cpu = ranks[0].detach().cpu().numpy()
+        conditions_cpu = conditions[0].detach().cpu().numpy()
+        thresholds_cpu = threshold[0].detach().cpu().numpy()
+        for edge_idx, (edge_i, edge_j) in enumerate(
+            zip(ii.detach().cpu().tolist(), jj.detach().cpu().tolist())
+        ):
+            self.degeneracy_writer.writerow(
+                [
+                    time.time(), phase, iteration, pin, edge_i, edge_j,
+                    int(ranks_cpu[edge_idx]), float(conditions_cpu[edge_idx]),
+                    float(thresholds_cpu[edge_idx]), int(self.degeneracy_projection),
+                    *eigenvalues_cpu[edge_idx].tolist(),
+                ]
+            )
+        self.degeneracy_fp.flush()
+        print(
+            f"[INFO] visual rank {phase} iter={iteration} "
+            f"min={int(ranks.min().item())} max={int(ranks.max().item())}"
+        )
+
+        if not self.degeneracy_projection:
+            return
+
+        degenerate = ranks < H11.shape[-1]
+        if not torch.any(degenerate):
+            return
+
+        filtered_eigenvalues = torch.where(
+            retained, torch.clamp(eigenvalues, min=0.0), torch.zeros_like(eigenvalues)
+        )
+        filtered_H = (
+            eigenvectors
+            @ torch.diag_embed(filtered_eigenvalues)
+            @ eigenvectors.transpose(-1, -2)
+        )
+        eigen_gradient = eigenvectors.transpose(-1, -2) @ v11.unsqueeze(-1)
+        filtered_v = eigenvectors @ (eigen_gradient * retained.unsqueeze(-1))
+        H11.copy_(
+            torch.where(degenerate.unsqueeze(-1).unsqueeze(-1), filtered_H, H11)
+        )
+        v11.copy_(torch.where(degenerate.unsqueeze(-1), filtered_v.squeeze(-1), v11))
+
+    def marginalize_after_window(self, requested_pin, window_end):
+        requested_pin = int(requested_pin)
+        window_end = int(window_end)
+        target_pin = requested_pin
+        if self.defer_marginalization_on_degeneracy and self.last_visual_degenerate:
+            extended_window = self.window_num + self.marginalization_delay_keyframes
+            target_pin = max(self.last_pin, window_end - extended_window, 0)
+            print(
+                f"[INFO] defer marginalization requested={requested_pin} "
+                f"target={target_pin} last_pin={self.last_pin} "
+                f"window_end={window_end} extended_window={extended_window}"
+            )
+        elif self.defer_marginalization_on_degeneracy and requested_pin > self.last_pin:
+            print(
+                f"[INFO] visual observability recovered; marginalize "
+                f"from={self.last_pin} to={requested_pin}"
+            )
+        self.marginalize_to(target_pin)
 
     def save_graph(self, path):
 
@@ -337,6 +455,9 @@ class FactorGraph:
             v11 = torch.zeros([1,ii.shape[0],7],dtype=torch.float64,device='cpu')
             c11 = torch.zeros([ii.shape[0]],dtype=torch.float64,device='cpu')
             aligncore.hessian_pieces(H11,v11,c11)
+            self.filter_degenerate_visual_directions(
+                H11, v11, ii, jj, "save_graph", -1, pin
+            )
             vfactors = Align2GTSAM_factors(H11.numpy(),v11.numpy(),self.wTcs[pin:],self.ss[pin:],ii.cpu().numpy(),jj.cpu().numpy(),pin)
             for iii in range(H11.shape[1]):
                 self.all_factors.append({'type':'visual','H':H11[0,iii],'v':v11[0,iii],'iijj':[ii[iii].item(),jj[iii].item()],
@@ -349,6 +470,8 @@ class FactorGraph:
     def close(self):
         if getattr(self, "fp", None) is not None and not self.fp.closed:
             self.fp.close()
+        if getattr(self, "degeneracy_fp", None) is not None and not self.degeneracy_fp.closed:
+            self.degeneracy_fp.close()
         self.cur_graph = None
         self.cur_result = None
         self.marg_factor = None
@@ -356,9 +479,6 @@ class FactorGraph:
         self.bs = []
         self.vs = []
         self.all_factors = []
-
-        if self.viz_matching:
-            print("[INFO] PI3X match visualization: temp/pi3x_matches")
 
     def save_match_visualizations(self, ii, jj, idx_i2j, valid_match_j):
         if not self.viz_matching or len(ii) == 0:
@@ -688,6 +808,9 @@ class FactorGraph:
             v11 = torch.zeros([1,ii.shape[0],7],dtype=torch.float64,device='cpu')
             c11 = torch.zeros([ii.shape[0]],dtype=torch.float64,device='cpu')
             aligncore.hessian_pieces(H11,v11,c11)
+            self.filter_degenerate_visual_directions(
+                H11, v11, ii, jj, "marginalize", -1, pin
+            )
             vfactors = Align2GTSAM_factors(H11.numpy(),v11.numpy(),self.wTcs[pin:],self.ss[pin:],ii.cpu().numpy(),jj.cpu().numpy(),pin)
             for iii in range(H11.shape[1]):
                 self.all_factors.append({'type':'visual','H':H11[0,iii],'v':v11[0,iii],'iijj':[ii[iii].item(),jj[iii].item()],
@@ -787,6 +910,7 @@ class FactorGraph:
     def solve_GN_calib(self,use_calib_this_file = False, skip_marginalization = False, window_start = None, window_end = None):
         """Optimize the current graph, optionally over an explicit PI3X batch."""
         print("solve_GN_calib!!!!")
+        self.last_visual_degenerate = True
 
         fix_noise = 1e-6
 
@@ -894,6 +1018,9 @@ class FactorGraph:
             v11 = torch.zeros([1,ii.shape[0],7],dtype=torch.float64,device='cpu')
             c11 = torch.zeros([ii.shape[0]],dtype=torch.float64,device='cpu')
             aligncore.hessian_pieces(H11,v11,c11)
+            self.filter_degenerate_visual_directions(
+                H11, v11, ii, jj, "solve", i, pin
+            )
             vfactors = Align2GTSAM_factors(H11.numpy(),v11.numpy(),self.wTcs[pin:],self.ss[pin:],ii.cpu().numpy(),jj.cpu().numpy(),pin)
 
             initials = gtsam.Values()
