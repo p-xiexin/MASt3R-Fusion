@@ -1,11 +1,5 @@
 inherit: config/base_kitti360_pi3x.yaml
 
-ms_opt:
-  degeneracy_projection: true
-  degeneracy_eigen_ratio: 1e-4
-  defer_marginalization_on_degeneracy: false
-  marginalization_delay_keyframes: 10
-
 pi3x:
   imu_predict: true
   delayed_matching: true

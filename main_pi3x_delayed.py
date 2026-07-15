@@ -209,7 +209,7 @@ def finish_backend_update(
 
     if marginalize_to is not None:
         print('[INFO] post optim marg', time.time(), marginalize_to)
-        factor_graph.marginalize_after_window(marginalize_to, window_end)
+        factor_graph.marginalize_to(marginalize_to)
         print('[INFO] post optim marg.', time.time())
 
 
