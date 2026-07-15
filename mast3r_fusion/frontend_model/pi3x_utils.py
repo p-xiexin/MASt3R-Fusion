@@ -416,11 +416,88 @@ def pi3x_inference_window(model, frames):
     return _window_output_to_maps(output, images)
 
 
+def _anchor_pointmap(frame, h, w, device, dtype):
+    if frame.N <= 0 or frame.X_canon is None or frame.C is None:
+        raise ValueError("PI3X overlap anchor has no initialized pointmap.")
+
+    pointmap = frame.X_canon.to(device=device, dtype=dtype).reshape(-1, 3)
+    confidence = frame.get_average_conf().to(device=device, dtype=dtype).reshape(-1)
+    if pointmap.shape[0] != h * w or confidence.shape[0] != h * w:
+        raise ValueError(
+            "PI3X overlap anchor shape does not match the inferred window: "
+            f"stored={pointmap.shape[0]}, inferred={h * w}."
+        )
+    return pointmap.reshape(h, w, 3), confidence.reshape(h, w)
+
+
+def _robust_anchor_scale(stored_points, stored_conf, inferred_points, inferred_conf):
+    stored_depth = stored_points[..., 2]
+    inferred_depth = inferred_points[..., 2]
+    threshold = _match_conf_threshold()
+    valid = (
+        torch.isfinite(stored_points).all(dim=-1)
+        & torch.isfinite(inferred_points).all(dim=-1)
+        & torch.isfinite(stored_conf)
+        & torch.isfinite(inferred_conf)
+        & (stored_depth > 1e-6)
+        & (inferred_depth > 1e-6)
+        & (stored_conf > threshold)
+        & (inferred_conf > threshold)
+    )
+    ratios = stored_depth[valid] / inferred_depth[valid]
+    ratios = ratios[torch.isfinite(ratios) & (ratios > 1e-6)]
+    if ratios.numel() < 64:
+        raise RuntimeError(
+            "PI3X overlap anchor has too few valid pixels for scale alignment: "
+            f"valid={ratios.numel()}."
+        )
+
+    median = ratios.median()
+    absolute_deviation = torch.abs(ratios - median)
+    mad = absolute_deviation.median()
+    if mad > 1e-8:
+        inliers = absolute_deviation <= 3.0 * 1.4826 * mad
+        if inliers.sum() >= 64:
+            ratios = ratios[inliers]
+    scale = ratios.median()
+    if not torch.isfinite(scale) or scale <= 1e-6:
+        raise RuntimeError(f"PI3X overlap anchor produced invalid scale: {scale.item()}.")
+    return scale, ratios.numel()
+
+
+def _align_window_to_anchor(X, C, poses, anchor_frame):
+    h, w = X.shape[1:3]
+    stored_X, stored_C = _anchor_pointmap(anchor_frame, h, w, X.device, X.dtype)
+    scale, valid_count = _robust_anchor_scale(stored_X, stored_C, X[0], C[0])
+
+    anchor_pose = _sim3_to_c2w_matrix(anchor_frame.T_WC, poses.device, poses.dtype)
+    inferred_anchor_inv = torch.linalg.inv(poses[0])
+    relative_poses = inferred_anchor_inv.unsqueeze(0) @ poses
+    relative_poses[:, :3, 3] *= scale
+    aligned_poses = anchor_pose.unsqueeze(0) @ relative_poses
+
+    aligned_X = X * scale
+    aligned_X[0] = stored_X
+    aligned_C = C.clone()
+    aligned_C[0] = stored_C
+    return aligned_X, aligned_C, aligned_poses, scale.item(), valid_count
+
+
 @torch.inference_mode()
-def pi3x_match_window_edges(model, frames, edges, subpixel_factor=1):
+def pi3x_match_window_edges(
+    model, frames, edges, subpixel_factor=1, preserve_anchor=False
+):
     if subpixel_factor != 1:
         raise ValueError("PI3X window matching currently supports subpixel_factor=1 only.")
     X, C, poses = pi3x_inference_window(model, frames)
+    if preserve_anchor:
+        X, C, poses, scale, valid_count = _align_window_to_anchor(
+            X, C, poses, frames[0]
+        )
+        print(
+            "[INFO] pi3x anchor alignment "
+            f"frame={frames[0].frame_id} scale={scale:.6f} valid={valid_count}"
+        )
     h, w = X.shape[1:3]
     X_flat = X.reshape(X.shape[0], h * w, 3)
     C_flat = C.reshape(C.shape[0], h * w, 1)
