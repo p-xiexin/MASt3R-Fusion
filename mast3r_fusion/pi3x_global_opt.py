@@ -182,9 +182,6 @@ class FactorGraph:
         # sliding window related
 
         self.init_bias_noise = np.array(config['ms_opt']['init_bias_noise'])
-        self.init_velocity_noise = np.array(
-            config['ms_opt'].get('init_velocity_noise', [1.0, 1.0, 1.0])
-        )
         self.regularization_noise = np.array(config['ms_opt']['regularization_noise'])
         noise = np.array(config['ms_opt']['imu_noise'])
         accel_noise_sigma = noise[0]
@@ -246,56 +243,6 @@ class FactorGraph:
 
         self.all_factors = []
 
-        if self.viz_matching:
-            print("[INFO] PI3X match visualization: temp/pi3x_matches")
-
-    @staticmethod
-    def _select_informative_visual_edges(H11, v11, ii, jj, phase):
-        """Drop visual edges whose linearization contains no usable information."""
-        if H11.shape[1] == 0:
-            return H11, v11, ii, jj
-
-        finite = torch.isfinite(H11).all(dim=(-1, -2))[0]
-        finite &= torch.isfinite(v11).all(dim=-1)[0]
-        information = torch.diagonal(H11[0], dim1=-2, dim2=-1).abs().sum(dim=-1)
-        reference = information[finite].max() if finite.any() else information.new_tensor(0.0)
-        threshold = max(float(reference) * torch.finfo(H11.dtype).eps * 64.0, 1e-15)
-        keep = finite & (information > threshold)
-
-        dropped = (~keep).sum().item()
-        if dropped:
-            bad_edges = list(
-                zip(ii[~keep].detach().cpu().tolist(), jj[~keep].detach().cpu().tolist())
-            )
-            print(
-                f"[WARN] {phase}: dropped {dropped} zero/non-finite visual "
-                f"factor(s): {bad_edges}"
-            )
-        return H11[:, keep], v11[:, keep], ii[keep], jj[keep]
-
-    def _active_scale_indices(self, ii, jj, pin, count):
-        active = set((torch.cat((ii, jj)) - pin).detach().cpu().tolist())
-        if self.marg_factor is not None:
-            marg_keys = set(self.marg_factor.keys())
-            active.update(idx for idx in range(count) if S(idx) in marg_keys)
-        return active
-
-    @staticmethod
-    def _validate_factor_graph_keys(graph, initials, phase):
-        factor_keys = set()
-        for factor_idx in range(graph.size()):
-            factor = graph.at(factor_idx)
-            if factor is not None:
-                factor_keys.update(factor.keys())
-        initial_keys = set(initials.keys())
-        missing = factor_keys - initial_keys
-        orphaned = initial_keys - factor_keys
-        if missing or orphaned:
-            raise RuntimeError(
-                f"{phase} factor graph key mismatch: "
-                f"missing_initials={keys2str(sorted(missing))}, "
-                f"orphaned_initials={keys2str(sorted(orphaned))}"
-            )
 
     def save_graph(self, path):
 
@@ -390,12 +337,7 @@ class FactorGraph:
             v11 = torch.zeros([1,ii.shape[0],7],dtype=torch.float64,device='cpu')
             c11 = torch.zeros([ii.shape[0]],dtype=torch.float64,device='cpu')
             aligncore.hessian_pieces(H11,v11,c11)
-            H11, v11, ii, jj = self._select_informative_visual_edges(
-                H11, v11, ii, jj, "save_graph"
-            )
-            vfactors = []
-            if ii.numel() > 0:
-                vfactors = Align2GTSAM_factors(H11.numpy(),v11.numpy(),self.wTcs[pin:],self.ss[pin:],ii.cpu().numpy(),jj.cpu().numpy(),pin)
+            vfactors = Align2GTSAM_factors(H11.numpy(),v11.numpy(),self.wTcs[pin:],self.ss[pin:],ii.cpu().numpy(),jj.cpu().numpy(),pin)
             for iii in range(H11.shape[1]):
                 self.all_factors.append({'type':'visual','H':H11[0,iii],'v':v11[0,iii],'iijj':[ii[iii].item(),jj[iii].item()],
                                          'tstamps':[self.poses_stamps[self.frames[ii[iii]].frame_id],self.poses_stamps[self.frames[jj[iii]].frame_id]],
@@ -414,6 +356,9 @@ class FactorGraph:
         self.bs = []
         self.vs = []
         self.all_factors = []
+
+        if self.viz_matching:
+            print("[INFO] PI3X match visualization: temp/pi3x_matches")
 
     def save_match_visualizations(self, ii, jj, idx_i2j, valid_match_j):
         if not self.viz_matching or len(ii) == 0:
@@ -743,12 +688,7 @@ class FactorGraph:
             v11 = torch.zeros([1,ii.shape[0],7],dtype=torch.float64,device='cpu')
             c11 = torch.zeros([ii.shape[0]],dtype=torch.float64,device='cpu')
             aligncore.hessian_pieces(H11,v11,c11)
-            H11, v11, ii, jj = self._select_informative_visual_edges(
-                H11, v11, ii, jj, "marginalize"
-            )
-            vfactors = []
-            if ii.numel() > 0:
-                vfactors = Align2GTSAM_factors(H11.numpy(),v11.numpy(),self.wTcs[pin:],self.ss[pin:],ii.cpu().numpy(),jj.cpu().numpy(),pin)
+            vfactors = Align2GTSAM_factors(H11.numpy(),v11.numpy(),self.wTcs[pin:],self.ss[pin:],ii.cpu().numpy(),jj.cpu().numpy(),pin)
             for iii in range(H11.shape[1]):
                 self.all_factors.append({'type':'visual','H':H11[0,iii],'v':v11[0,iii],'iijj':[ii[iii].item(),jj[iii].item()],
                                          'tstamps':[self.poses_stamps[self.frames[ii[iii]].frame_id],self.poses_stamps[self.frames[jj[iii]].frame_id]],
@@ -759,13 +699,10 @@ class FactorGraph:
         marg_graph = gtsam.NonlinearFactorGraph()
         keys_to_marg = []
         prior_factors = []
-        active_scales = self._active_scale_indices(ii, jj, pin, T_WCs.shape[0])
         for iii in range(0,T_WCs.shape[0]):
             abs_idx = iii + pin
             initials.insert(X(iii),gtsam.Pose3(self.wTcs[abs_idx]))
-            has_scale = iii in active_scales
-            if has_scale:
-                initials.insert(S(iii),self.ss[abs_idx])
+            initials.insert(S(iii),self.ss[abs_idx])
 
             initials.insert(C(iii),gtsam.Pose3(self.Tic))
             initials.insert(Z(iii),gtsam.Pose3(self.wTcs[abs_idx] @ np.linalg.inv(self.Tic)))
@@ -773,19 +710,11 @@ class FactorGraph:
             initials.insert(V(iii),self.vs[abs_idx])
             if abs_idx == 0:
                 prior_factors.append(gtsam.PriorFactorConstantBias(B(iii), gtsam.imuBias.ConstantBias(np.array([.0,.0,.0]),np.array([.0,.0,.0])), gtsam.noiseModel.Diagonal.Sigmas(self.init_bias_noise)))
-                prior_factors.append(
-                    gtsam.PriorFactorVector(
-                        V(iii), self.vs[abs_idx],
-                        gtsam.noiseModel.Diagonal.Sigmas(self.init_velocity_noise),
-                    )
-                )
 
             if abs_idx < new_pin:
                 keys_to_marg.append(C(iii)); keys_to_marg.append(V(iii))
                 keys_to_marg.append(Z(iii)); keys_to_marg.append(X(iii))
-                keys_to_marg.append(B(iii))
-                if has_scale:
-                    keys_to_marg.append(S(iii))
+                keys_to_marg.append(B(iii)); keys_to_marg.append(S(iii))
 
             if iii > 0:
                 new_preintegration =  gtsam.PreintegratedCombinedMeasurements(self.params,self.bs[abs_idx-1])
@@ -820,12 +749,10 @@ class FactorGraph:
 
             if iii == 0 and self.enable_ms:
                 prior_factors.append(gtsam.PriorFactorPose3(X(iii),gtsam.Pose3(self.wTcs[abs_idx]), gtsam.noiseModel.Diagonal.Sigmas(self.regularization_noise)))
-                if has_scale:
-                    prior_factors.append(gtsam.PriorFactorDouble(S(iii),self.ss[abs_idx], gtsam.noiseModel.Diagonal.Sigmas([1.0])))
+                prior_factors.append(gtsam.PriorFactorDouble(S(iii),self.ss[abs_idx], gtsam.noiseModel.Diagonal.Sigmas([1.0])))
             elif iii == 0:
                 prior_factors.append(gtsam.PriorFactorPose3(X(iii),gtsam.Pose3(self.wTcs[abs_idx]), gtsam.noiseModel.Diagonal.Sigmas(np.array([0.0001,0.0001,0.0001,0.01,0.01,0.01]))))
-                if has_scale:
-                    prior_factors.append(gtsam.PriorFactorDouble(S(iii),self.ss[abs_idx], gtsam.noiseModel.Diagonal.Sigmas([0.0001])))
+                prior_factors.append(gtsam.PriorFactorDouble(S(iii),self.ss[abs_idx], gtsam.noiseModel.Diagonal.Sigmas([0.0001])))
 
         for h_factor in vfactors:
             marg_graph.add(h_factor)
@@ -833,7 +760,6 @@ class FactorGraph:
             marg_graph.add(factor)
         if not(self.marg_factor is None):
             marg_graph.add(self.marg_factor)
-        self._validate_factor_graph_keys(marg_graph, initials, "marginalization")
         self.marg_factor = gtsam.marginalizeOut(marg_graph,initials,keys_to_marg)
         self.marg_factor = self.marg_factor.rekey((np.array(self.marg_factor.keys())-(new_pin-pin)).tolist())
         for iiii in range(self.last_pin,new_pin):
@@ -968,30 +894,17 @@ class FactorGraph:
             v11 = torch.zeros([1,ii.shape[0],7],dtype=torch.float64,device='cpu')
             c11 = torch.zeros([ii.shape[0]],dtype=torch.float64,device='cpu')
             aligncore.hessian_pieces(H11,v11,c11)
-            H11, v11, ii, jj = self._select_informative_visual_edges(
-                H11, v11, ii, jj, f"solve iteration {i}"
-            )
-            vfactors = []
-            if ii.numel() > 0:
-                vfactors = Align2GTSAM_factors(H11.numpy(),v11.numpy(),self.wTcs[pin:],self.ss[pin:],ii.cpu().numpy(),jj.cpu().numpy(),pin)
+            vfactors = Align2GTSAM_factors(H11.numpy(),v11.numpy(),self.wTcs[pin:],self.ss[pin:],ii.cpu().numpy(),jj.cpu().numpy(),pin)
 
             initials = gtsam.Values()
             cur_graph = gtsam.NonlinearFactorGraph()
             symbols = []
-            active_scales = self._active_scale_indices(ii, jj, pin, T_WCs.shape[0])
-            for factor in prior_factors:
-                factor_keys = set(factor.keys())
-                active_scales.update(
-                    idx for idx in range(T_WCs.shape[0]) if S(idx) in factor_keys
-                )
 
             # print('1',time.time())
             for iii in range(0,T_WCs.shape[0]):
                 initials.insert(X(iii),gtsam.Pose3(self.wTcs[iii+pin]))
-                has_scale = iii in active_scales
-                if has_scale:
-                    initials.insert(S(iii),self.ss[iii+pin])
-                    symbols.append(S(iii))
+                initials.insert(S(iii),self.ss[iii+pin])
+                symbols.append(S(iii))
                 symbols.append(X(iii))
                 # print('c',time.time())
 
@@ -999,11 +912,10 @@ class FactorGraph:
                     if i == 0:
                         if iii == 0:
                             prior_factors.append(gtsam.PriorFactorPose3(X(iii),gtsam.Pose3(self.wTcs[iii+pin]), gtsam.noiseModel.Diagonal.Sigmas(np.array([1,1,1,1,1,1])*0.0001)))
-                            if has_scale:
-                                if T_WCs.shape[0]== 2:
-                                    prior_factors.append(gtsam.PriorFactorDouble(S(iii),3.0, gtsam.noiseModel.Diagonal.Sigmas([0.0001])))
-                                else:
-                                    prior_factors.append(gtsam.PriorFactorDouble(S(iii),self.ss[iii+pin], gtsam.noiseModel.Diagonal.Sigmas([0.0001])))
+                            if T_WCs.shape[0]== 2:
+                                prior_factors.append(gtsam.PriorFactorDouble(S(iii),3.0, gtsam.noiseModel.Diagonal.Sigmas([0.0001])))
+                            else:
+                                prior_factors.append(gtsam.PriorFactorDouble(S(iii),self.ss[iii+pin], gtsam.noiseModel.Diagonal.Sigmas([0.0001])))
                 else:
                     initials.insert(C(iii),gtsam.Pose3(self.Tic))
                     initials.insert(Z(iii),gtsam.Pose3(self.wTcs[iii+pin] @ np.linalg.inv(self.Tic)))
@@ -1014,19 +926,12 @@ class FactorGraph:
                     if i == 0:
                         if iii+pin == 0:
                             prior_factors.append(gtsam.PriorFactorConstantBias(B(iii), gtsam.imuBias.ConstantBias(np.array([.0,.0,.0]),np.array([.0,.0,.0])), gtsam.noiseModel.Diagonal.Sigmas(self.init_bias_noise)))
-                            prior_factors.append(
-                                gtsam.PriorFactorVector(
-                                    V(iii), self.vs[iii+pin],
-                                    gtsam.noiseModel.Diagonal.Sigmas(self.init_velocity_noise),
-                                )
-                            )
                         if iii == 0 and pin>0 :
                             if self.marg_factor is not None and pin == self.last_pin:
                                 prior_factors.append(self.marg_factor)
                             else:
                                 prior_factors.append(gtsam.PriorFactorPose3(X(iii),gtsam.Pose3(self.wTcs[iii+pin]), gtsam.noiseModel.Diagonal.Sigmas(self.regularization_noise)))
-                                if has_scale:
-                                    prior_factors.append(gtsam.PriorFactorDouble(S(iii),self.ss[iii+pin], gtsam.noiseModel.Diagonal.Sigmas([1.0])))
+                                prior_factors.append(gtsam.PriorFactorDouble(S(iii),self.ss[iii+pin], gtsam.noiseModel.Diagonal.Sigmas([1.0])))
 
                         # print('z',time.time())
                         if iii > 0:
@@ -1075,7 +980,6 @@ class FactorGraph:
                 cur_graph.add(h_factor)
             for factor in prior_factors:
                 cur_graph.add(factor)
-            self._validate_factor_graph_keys(cur_graph, initials, f"solve iteration {i}")
             # print(time.time())
             # print('time4',time.time())
             
@@ -1093,10 +997,8 @@ class FactorGraph:
                     self.Tic = cur_result.atPose3(C(0)).matrix()
                     self.bs[iii+pin] = cur_result.atConstantBias(B(iii))
                     self.vs[iii+pin] = cur_result.atVector(V(iii))
+                next_scale = cur_result.atDouble(S(iii))
                 next_wTc = cur_result.atPose3(X(iii)).matrix()
-                next_scale = self.ss[iii+pin]
-                if iii in active_scales:
-                    next_scale = cur_result.atDouble(S(iii))
                 assert_valid_pose_state(next_wTc, next_scale, f"solve_GN_calib idx={iii+pin}, pin={pin}, iter={i}")
                 self.ss[iii+pin] = next_scale
                 self.wTcs[iii+pin] = next_wTc
