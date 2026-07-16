@@ -369,6 +369,19 @@ def update_current_state(states, frame, overlay_image=None):
     states.notify_frame_updated()
 
 
+def update_sparse_map_points(states, sparse_map):
+    points = sparse_map.export_point_cloud()
+    states.set_sparse_map_points(points)
+
+
+def align_sparse_map_to_last_keyframe(sparse_map, keyframes):
+    last_kf = keyframes.last_keyframe()
+    if last_kf is None:
+        return
+    last_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
+    sparse_map.align_world_to_keyframe(last_kf_idx, last_kf)
+
+
 def initialize_delayed_keyframe_placeholders(states, frame):
     frame.X_canon = torch.zeros_like(states.X)
     frame.C = torch.zeros_like(states.C)
@@ -593,11 +606,9 @@ if __name__ == "__main__":
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
         if use_calib:
             frame.K = K
+        align_sparse_map_to_last_keyframe(sparse_map, keyframes)
         last_kf = keyframes.last_keyframe()
         last_kf_frame_id = last_kf.frame_id if last_kf is not None else -1
-        if last_kf is not None:
-            last_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
-            sparse_map.align_world_to_keyframe(last_kf_idx, last_kf)
         tracking_result = sparse_map.process_frame(
             frame,
             timestamp,
@@ -613,6 +624,7 @@ if __name__ == "__main__":
             keyframes.append(frame)
             initial_keyframe_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
             sparse_map.register_keyframe(initial_keyframe_idx, frame)
+            update_sparse_map_points(states, sparse_map)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame, notify=sparse_map_overlay is None)
             set_sparse_map_overlay(states, sparse_map_overlay)
@@ -746,6 +758,9 @@ if __name__ == "__main__":
             if rollup > 0:
                 keyframes.roll_up(rollup)
                 sparse_map.prune_before(keyframes.rollup_sum.value)
+
+        align_sparse_map_to_last_keyframe(sparse_map, keyframes)
+        update_sparse_map_points(states, sparse_map)
 
         # log time
         if i % 30 == 0:

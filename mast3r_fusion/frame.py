@@ -129,7 +129,15 @@ def create_frame(i, img, T_WC, img_size=512, device="cuda:0"):
 
 
 class SharedStates:
-    def __init__(self, manager, h, w, dtype=torch.float32, device="cuda", feature_spec=None):
+    def __init__(
+        self,
+        manager,
+        h,
+        w,
+        dtype=torch.float32,
+        device="cuda",
+        feature_spec=None,
+    ):
         self.h, self.w = h, w
         self.dtype = dtype
         self.device = device
@@ -143,6 +151,7 @@ class SharedStates:
         self.global_optimizer_tasks = manager.list()
         self.edges_ii = manager.list()
         self.edges_jj = manager.list()
+        self.sparse_map_points = manager.list()
 
         self.feat_dim = getattr(feature_spec, "feat_dim", 1024)
         if feature_spec is not None:
@@ -212,6 +221,22 @@ class SharedStates:
             frame.feat = self.feat
             frame.pos = self.pos
             return frame
+
+    def set_sparse_map_points(self, points):
+        with self.lock:
+            self.sparse_map_points[:] = (
+                torch.as_tensor(points, dtype=torch.float32, device="cpu")
+                .reshape(-1, 3)
+                .numpy()
+                .tolist()
+            )
+
+    def get_sparse_map_points(self):
+        with self.lock:
+            points = list(self.sparse_map_points)
+            if not points:
+                return None
+            return torch.as_tensor(points, dtype=torch.float32).numpy()
 
     def queue_global_optimization(self, idx):
         with self.lock:

@@ -224,6 +224,7 @@ CHANNEL_DEFS = [
     ("current_pose", "/current_pose", "foxglove.PoseInFrame", POSE_SCHEMA),
     ("trajectory", "/trajectory", "foxglove.PosesInFrame", POSES_SCHEMA),
     ("keyframe_points", "/keyframe_points", "foxglove.PointCloud", POINT_CLOUD_SCHEMA),
+    ("sparse_flow_points", "/sparse_flow_points", "foxglove.PointCloud", POINT_CLOUD_SCHEMA),
     ("current_image", "/current_image", "foxglove.CompressedImage", COMPRESSED_IMAGE_SCHEMA),
     ("graph_edges", "/graph_edges", "foxglove.SceneUpdate", SCENE_UPDATE_SCHEMA),
 ]
@@ -428,6 +429,32 @@ def _point_cloud_msg(timestamp_ns, points, colors):
     }
 
 
+def _xyz_point_cloud_msg(timestamp_ns, points):
+    packed = np.empty(
+        points.shape[0],
+        dtype=[
+            ("x", "<f4"),
+            ("y", "<f4"),
+            ("z", "<f4"),
+        ],
+    )
+    packed["x"] = points[:, 0]
+    packed["y"] = points[:, 1]
+    packed["z"] = points[:, 2]
+    return {
+        "timestamp": _time_msg(timestamp_ns),
+        "frame_id": "world",
+        "pose": _identity_pose(),
+        "point_stride": 12,
+        "fields": [
+            {"name": "x", "offset": 0, "type": 7},
+            {"name": "y", "offset": 4, "type": 7},
+            {"name": "z", "offset": 8, "type": 7},
+        ],
+        "data": base64.b64encode(packed.tobytes()).decode("ascii"),
+    }
+
+
 def _image_msg(timestamp_ns, frame, jpeg_quality):
     image = np.clip(frame.uimg.detach().cpu().numpy() * 255.0, 0, 255).astype(np.uint8)
     ok, encoded = cv2.imencode(
@@ -548,12 +575,32 @@ async def _publish_scene_snapshot(server, channels, states, keyframes, options):
                 colors = colors[::stride]
             await _send_json(server, channels, "keyframe_points", timestamp_ns, _point_cloud_msg(timestamp_ns, points, colors))
 
+    await _publish_sparse_flow_points(server, channels, states, timestamp_ns)
     await _publish_graph_edges(server, channels, states, keyframes, timestamp_ns)
 
 
 async def _publish_snapshot(server, channels, states, keyframes, options):
     await _publish_current_frame(server, channels, states, options)
     await _publish_scene_snapshot(server, channels, states, keyframes, options)
+
+
+async def _publish_sparse_flow_points(server, channels, states, timestamp_ns):
+    try:
+        points = states.get_sparse_map_points()
+        if points is None:
+            return
+        if points.size == 0:
+            return
+        points = points @ R_FOXGLOVE_FROM_SLAM.T
+        await _send_json(
+            server,
+            channels,
+            "sparse_flow_points",
+            timestamp_ns,
+            _xyz_point_cloud_msg(timestamp_ns, points.astype(np.float32)),
+        )
+    except Exception as exc:
+        print(f"[foxglove] sparse flow point publish skipped: {exc}")
 
 
 async def _publish_graph_edges(server, channels, states, keyframes, timestamp_ns):

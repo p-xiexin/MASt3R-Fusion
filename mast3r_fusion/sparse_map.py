@@ -69,6 +69,9 @@ class SparseMap:
 
         self.max_local_keyframes = int(cfg.get("local_keyframes", 80))
         self.max_points_per_keyframe = int(cfg.get("map_points_per_keyframe", 2000))
+        self.visualization_downsample = max(
+            1, int(cfg.get("visualization_downsample", 1))
+        )
         self.reprojection_error = float(cfg.get("reprojection_error", 3.0))
         self.initializer_min_frame_gap = int(cfg.get("initializer_min_frame_gap", 2))
         self.initializer_min_features = int(cfg.get("initializer_min_features", 100))
@@ -126,32 +129,15 @@ class SparseMap:
 
     def draw_overlay(self, result):
         image = result.flow.image.copy()
-        if not self.initialized:
-            for uv, age, is_inlier in zip(
-                result.flow.pts,
-                result.flow.track_cnt,
-                result.flow.inlier_mask,
-            ):
-                if not is_inlier or not np.isfinite(uv).all():
-                    continue
-                color = (0, 255, 0) if age >= 4 else (255, 0, 0)
-                cv2.circle(
-                    image,
-                    tuple(np.rint(uv).astype(int)),
-                    2,
-                    color,
-                    -1,
-                    cv2.LINE_AA,
-                )
-            return image
+        valid = result.flow.inlier_mask & np.isfinite(result.flow.pts).all(axis=1)
+        indices = np.flatnonzero(valid)[:: self.visualization_downsample]
 
-        for point_id, uv in zip(result.inlier_point_ids, result.inlier_image_points):
+        for index in indices:
+            uv = result.flow.pts[index]
+            age = result.flow.track_cnt[index]
             if not np.isfinite(uv).all():
                 continue
-            map_point = self.map_points.get(int(point_id))
-            if map_point is None or map_point.bad:
-                continue
-            color = (0, 255, 0) if len(map_point.observations) > 2 else (255, 0, 0)
+            color = (255, 0, 0) if age >= 4 else (0, 0, 255)
             cv2.circle(
                 image,
                 tuple(np.rint(uv).astype(int)),
@@ -161,6 +147,18 @@ class SparseMap:
                 cv2.LINE_AA,
             )
         return image
+
+    def export_point_cloud(self):
+        points = []
+        for map_point in self.map_points.values():
+            if map_point.bad or not np.isfinite(map_point.position_world).all():
+                continue
+            points.append(map_point.position_world)
+        if not points:
+            return np.empty((0, 3), dtype=np.float32)
+
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        return points[:: self.visualization_downsample]
 
     def need_new_keyframe(
         self,

@@ -16,4 +16,5 @@ pi3x:
     min_tracking_inliers: 20
     local_keyframes: 80
     map_points_per_keyframe: 2000
+    visualization_downsample: 5
     reprojection_error: 3.0
