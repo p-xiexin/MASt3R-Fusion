@@ -339,16 +339,12 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
         window_frames,
         local_edges,
         subpixel_factor=factor_graph.subpixel_factor,
-        preserve_anchor=preserve_anchor,
     )
     save_pi3x_pose_debug(window_indices, window_frames, poses)
     for local_idx, frame in enumerate(window_frames):
         if preserve_anchor and local_idx == 0:
             continue
-        frame.X_canon = Xs[local_idx : local_idx + 1].clone()
-        frame.C = Cs[local_idx : local_idx + 1].clone()
-        frame.N = 1
-        frame.N_updates += 1
+        frame.update_pointmap(Xs[local_idx : local_idx + 1], Cs[local_idx : local_idx + 1])
         keyframes[window_indices[local_idx]] = frame
 
     matches = [constraints[edge] for edge in local_edges]

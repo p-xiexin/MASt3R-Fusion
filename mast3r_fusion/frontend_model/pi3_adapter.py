@@ -94,7 +94,6 @@ class PI3Adapter(FeedForwardFrontend):
             frames,
             list(edges),
             kwargs.get("subpixel_factor", 1),
-            preserve_anchor=kwargs.get("preserve_anchor", False),
         )
 
     def match_symmetric_batch(
