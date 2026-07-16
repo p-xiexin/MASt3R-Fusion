@@ -10,6 +10,8 @@ pi3x:
     max_keyframe_gap: 20
     keyframe_ref_ratio: 0.9
     min_tracked_points_for_keyframe: 15
+    initializer_min_frame_gap: 2
+    initializer_min_inliers: 15
     min_tracking_inliers: 20
     local_keyframes: 80
     map_points_per_keyframe: 2000

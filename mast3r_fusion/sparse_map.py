@@ -81,6 +81,8 @@ class SparseMap:
         self.max_points_per_keyframe = int(cfg.get("map_points_per_keyframe", 2000))
         self.map_confidence = float(cfg.get("map_point_confidence", 0.3))
         self.reprojection_error = float(cfg.get("reprojection_error", 3.0))
+        self.initializer_min_frame_gap = int(cfg.get("initializer_min_frame_gap", 2))
+        self.initializer_min_inliers = int(cfg.get("initializer_min_inliers", 15))
         self.min_tracking_inliers = int(cfg.get("min_tracking_inliers", 20))
         self.ref_ratio = float(cfg.get("keyframe_ref_ratio", 0.9))
         self.min_points_for_keyframe = int(cfg.get("min_tracked_points_for_keyframe", 15))
@@ -138,8 +140,9 @@ class SparseMap:
         gap = int(frame_id) - int(last_keyframe_frame_id)
         if len(self.keyframes) < 2:
             return bool(
-                result.tracking_ok
-                and result.matched_inlier_map_points > self.min_points_for_keyframe
+                gap >= self.initializer_min_frame_gap
+                and result.tracking_ok
+                and result.matched_inlier_map_points >= self.initializer_min_inliers
             )
         if not result.tracking_ok:
             return False
@@ -299,10 +302,12 @@ class SparseMap:
         optimized_pose, inlier_mask = self._optimize_pose(
             world_points, image_points, prior_pose
         )
-        if (
-            optimized_pose is None
-            or np.count_nonzero(inlier_mask) < self.min_tracking_inliers
-        ):
+        required_inliers = (
+            self.initializer_min_inliers
+            if len(self.keyframes) < 2
+            else self.min_tracking_inliers
+        )
+        if optimized_pose is None or np.count_nonzero(inlier_mask) < required_inliers:
             return empty
         self._set_frame_pose(frame, optimized_pose, prior_pose[7])
 
