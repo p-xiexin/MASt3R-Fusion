@@ -127,7 +127,7 @@ class LkFeatureTracker:
 
 @dataclass
 class SparseFlowConfig:
-    max_features: int = 400
+    max_features: int = 2000
     keyframe_parallax: float = 20.0
     keyframe_gap: int = 5
 
@@ -140,6 +140,7 @@ class SparseFlowResult:
     prev_pts: np.ndarray
     track_cnt: np.ndarray
     ids: np.ndarray
+    inlier_mask: np.ndarray
     new_keyframe: bool
     debug: dict
 
@@ -165,7 +166,7 @@ class SparseFlowFrontend:
     @classmethod
     def from_config(cls, K: np.ndarray, width: int, height: int, cfg_dict: dict):
         cfg = SparseFlowConfig(
-            max_features=int(cfg_dict.get("max_features", 400)),
+            max_features=2000,
             keyframe_parallax=float(cfg_dict.get("keyframe_parallax", 20.0)),
             keyframe_gap=int(cfg_dict.get("keyframe_gap", 5)),
         )
@@ -185,7 +186,8 @@ class SparseFlowFrontend:
         if self.ref_gray is None or self.ref_pts.shape[0] == 0:
             self._redetect(gray)
             prev_pts = np.full_like(self.ref_pts, np.nan)
-            return self._result(frame.frame_id, image, self.ref_pts, prev_pts, self.ref_ages, self.ref_ids, True, 0.0, frames_since_keyframe)
+            inlier_mask = np.ones(self.ref_pts.shape[0], dtype=bool)
+            return self._result(frame.frame_id, image, self.ref_pts, prev_pts, self.ref_ages, self.ref_ids, inlier_mask, True, 0.0, frames_since_keyframe)
 
         tracked = self.tracker.track(self.ref_gray, gray, self.ref_pts)
         idxs_ref = np.asarray(tracked.idxs_ref, dtype=np.int64)
@@ -193,8 +195,8 @@ class SparseFlowFrontend:
         cur_pts = tracked.kps_cur_matched.astype(np.float32)
         ids = self.ref_ids[idxs_ref]
         ages = self.ref_ages[idxs_ref] + 1
-        parallax = np.linalg.norm(cur_pts - prev_pts, axis=1)
-        avg_parallax = float(np.mean(parallax)) if parallax.size else 0.0
+        inlier_mask = self._estimate_pose_inliers(prev_pts, cur_pts)
+        avg_parallax = float(np.mean(np.abs(prev_pts - cur_pts)))
         gap = 0 if frames_since_keyframe is None else int(frames_since_keyframe)
         new_keyframe = (
             cur_pts.shape[0] < 20
@@ -208,6 +210,7 @@ class SparseFlowFrontend:
             prev_pts,
             ages,
             ids,
+            inlier_mask,
             new_keyframe,
             avg_parallax,
             frames_since_keyframe,
@@ -226,7 +229,11 @@ class SparseFlowFrontend:
 
     def draw_overlay(self, result: SparseFlowResult) -> np.ndarray:
         image = result.image.copy()
-        for cur_xy, ref_xy in zip(result.pts, result.prev_pts):
+        for cur_xy, ref_xy, is_inlier in zip(
+            result.pts, result.prev_pts, result.inlier_mask
+        ):
+            if not is_inlier:
+                continue
             cur_pt = tuple(np.rint(cur_xy).astype(int))
             if np.all(np.isfinite(ref_xy)):
                 ref_pt = tuple(np.rint(ref_xy).astype(int))
@@ -245,6 +252,36 @@ class SparseFlowFrontend:
         self.ref_ages = np.ones(count, dtype=np.int32)
         self.next_track_id += count
 
+    def _estimate_pose_inliers(self, ref_pts, cur_pts):
+        if ref_pts.shape[0] < 5:
+            raise ValueError("pySLAM LK frontend needs at least five matches for pose estimation.")
+        ref_norm = cv2.undistortPoints(
+            np.ascontiguousarray(ref_pts).reshape(-1, 1, 2), self.K, None
+        ).reshape(-1, 2)
+        cur_norm = cv2.undistortPoints(
+            np.ascontiguousarray(cur_pts).reshape(-1, 1, 2), self.K, None
+        ).reshape(-1, 2)
+        essential, mask = cv2.findEssentialMat(
+            cur_norm,
+            ref_norm,
+            focal=1,
+            pp=(0.0, 0.0),
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=0.0004,
+        )
+        essential = None if essential is None else np.asarray(essential)
+        if essential is None or essential.size < 9 or mask is None:
+            raise ValueError("findEssentialMat failed to produce a valid essential matrix.")
+        cv2.recoverPose(
+            np.ascontiguousarray(essential),
+            cur_norm,
+            ref_norm,
+            focal=1,
+            pp=(0.0, 0.0),
+        )
+        return mask.reshape(-1).astype(bool)
+
     def _result(
         self,
         frame_id,
@@ -253,6 +290,7 @@ class SparseFlowFrontend:
         prev_pts,
         ages,
         ids,
+        inlier_mask,
         new_keyframe,
         avg_parallax,
         frames_since_keyframe,
@@ -261,6 +299,8 @@ class SparseFlowFrontend:
             "track_num": float(pts.shape[0]),
             "last_track_num": float(pts.shape[0]),
             "long_track_num": float(np.count_nonzero(ages >= 4)),
+            "inlier_num": float(np.count_nonzero(inlier_mask)),
+            "inlier_fraction": float(np.mean(inlier_mask)) if inlier_mask.size else 0.0,
             "avg_parallax": avg_parallax,
             "age_median": float(np.median(ages)) if ages.size else 0.0,
         }
@@ -273,6 +313,7 @@ class SparseFlowFrontend:
             prev_pts=prev_pts.copy(),
             track_cnt=ages.copy(),
             ids=ids.copy(),
+            inlier_mask=inlier_mask.copy(),
             new_keyframe=new_keyframe,
             debug=debug,
         )
