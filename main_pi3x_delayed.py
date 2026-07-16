@@ -328,11 +328,6 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
         (window_index_to_local[ii], window_index_to_local[jj])
         for ii, jj in zip(all_kf_idx, all_frame_idx)
     ]
-    anchor_idx = window_indices[0]
-    preserve_anchor = bool(
-        factor_graph.ii.numel()
-        and torch.any((factor_graph.ii == anchor_idx) | (factor_graph.jj == anchor_idx)).item()
-    )
 
     print('[INFO] pi3x window inference', time.time(), window_indices)
     Xs, Cs, poses, constraints = factor_graph.model.build_pair_constraints_from_window(
@@ -342,8 +337,6 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
     )
     save_pi3x_pose_debug(window_indices, window_frames, poses)
     for local_idx, frame in enumerate(window_frames):
-        if preserve_anchor and local_idx == 0:
-            continue
         frame.update_pointmap(Xs[local_idx : local_idx + 1], Cs[local_idx : local_idx + 1])
         keyframes[window_indices[local_idx]] = frame
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Optional
 
 import cv2
@@ -8,21 +9,127 @@ import numpy as np
 import torch
 
 
+# The Shi-Tomasi/LK implementation below follows pySLAM commit
+# 8a7b88b9e6be3f823d4330122ab6c7b3dcc89b8c. pySLAM is Copyright (C)
+# 2016-present Luigi Freda and licensed under GPLv3.
+
+
+class FeatureDetectorTypes(Enum):
+    SHI_TOMASI = 1
+
+
+class FeatureDescriptorTypes(Enum):
+    NONE = 0
+
+
+class FeatureTrackerTypes(Enum):
+    LK = 0
+
+
+class FeatureTrackingResult:
+    def __init__(self):
+        self.kps_ref = None
+        self.kps_cur = None
+        self.des_ref = None
+        self.des_cur = None
+        self.idxs_ref = None
+        self.idxs_cur = None
+        self.kps_ref_matched = None
+        self.kps_cur_matched = None
+
+
+class ShiTomasiDetector:
+    def __init__(self, num_features=2000, quality_level=0.01, min_coner_distance=3):
+        self.num_features = num_features
+        self.quality_level = quality_level
+        self.min_coner_distance = min_coner_distance
+        self.blockSize = 5
+
+    def setMaxFeatures(self, num_features):
+        self.num_features = num_features
+
+    def detect(self, frame, mask=None):
+        pts = cv2.goodFeaturesToTrack(
+            frame,
+            self.num_features,
+            self.quality_level,
+            self.min_coner_distance,
+            blockSize=self.blockSize,
+            mask=mask,
+        )
+        if pts is not None:
+            kps = [cv2.KeyPoint(p[0][0], p[0][1], self.blockSize) for p in pts]
+        else:
+            kps = []
+        return kps
+
+
+class ShiTomasiFeatureManager:
+    def __init__(self, num_features, num_levels):
+        self.num_features = num_features
+        self.num_levels = num_levels
+        self.detector = ShiTomasiDetector(num_features=num_features)
+
+    def detect(self, frame, mask=None):
+        return self.detector.detect(frame, mask)
+
+
+class LkFeatureTracker:
+    def __init__(
+        self,
+        num_features=2000,
+        num_levels=3,
+        detector_type=FeatureDetectorTypes.SHI_TOMASI,
+        descriptor_type=FeatureDescriptorTypes.NONE,
+        tracker_type=FeatureTrackerTypes.LK,
+    ):
+        if detector_type != FeatureDetectorTypes.SHI_TOMASI:
+            raise ValueError("The pySLAM LK frontend only supports Shi-Tomasi.")
+        if descriptor_type != FeatureDescriptorTypes.NONE:
+            raise ValueError("The pySLAM LK frontend does not use descriptors.")
+        self.detector_type = detector_type
+        self.descriptor_type = descriptor_type
+        self.tracker_type = tracker_type
+        self.feature_manager = ShiTomasiFeatureManager(num_features, num_levels)
+
+        optic_flow_num_levels = max(3, num_levels)
+        self.lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=optic_flow_num_levels,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
+
+    @property
+    def num_features(self):
+        return self.feature_manager.num_features
+
+    def detectAndCompute(self, frame, mask=None):
+        return self.feature_manager.detect(frame, mask), None
+
+    def track(self, image_ref, image_cur, kps_ref, des_ref=None, mask_ref=None, mask_cur=None):
+        del des_ref, mask_ref, mask_cur
+        kps_cur, st, err = cv2.calcOpticalFlowPyrLK(
+            image_ref, image_cur, kps_ref, None, **self.lk_params
+        )
+        del err
+        st = st.reshape(st.shape[0])
+        res = FeatureTrackingResult()
+        res.idxs_ref = [i for i, v in enumerate(st) if v == 1]
+        res.idxs_cur = res.idxs_ref.copy()
+        res.kps_ref_matched = kps_ref[res.idxs_ref]
+        res.kps_cur_matched = kps_cur[res.idxs_cur]
+        res.kps_ref = res.kps_ref_matched
+        res.kps_cur = res.kps_cur_matched
+        res.des_ref = None
+        res.des_cur = None
+        return res
+
+
 @dataclass
 class SparseFlowConfig:
     max_features: int = 400
-    min_distance: int = 15
-    quality: float = 0.01
-    lk_win: int = 21
-    lk_levels: int = 3
-    f_ransac_thresh: float = 1.5
     keyframe_parallax: float = 20.0
     keyframe_gap: int = 5
-    equalize: bool = True
-    use_fast: bool = False
-    reject_with_f: bool = True
-    border_size: int = 1
-    use_imu_prior: bool = True
 
 
 @dataclass
@@ -38,241 +145,134 @@ class SparseFlowResult:
 
 
 class SparseFlowFrontend:
+    """Adapter from MASt3R-Fusion frames to pySLAM's Shi-Tomasi/LK tracker."""
+
     def __init__(self, K: np.ndarray, width: int, height: int, cfg: Optional[SparseFlowConfig] = None):
         self.K = np.asarray(K, dtype=np.float64)
-        self.K_inv = np.linalg.inv(self.K)
         self.width = int(width)
         self.height = int(height)
         self.cfg = cfg or SparseFlowConfig()
-        self.cur_gray = None
-        self.cur_pts = np.empty((0, 2), dtype=np.float32)
-        self.ids = np.empty((0,), dtype=np.int64)
-        self.track_cnt = np.empty((0,), dtype=np.int32)
+        self.tracker = LkFeatureTracker(
+            num_features=self.cfg.max_features,
+            num_levels=3,
+        )
+        self.ref_gray = None
+        self.ref_pts = np.empty((0, 2), dtype=np.float32)
+        self.ref_ids = np.empty((0,), dtype=np.int64)
+        self.ref_ages = np.empty((0,), dtype=np.int32)
         self.next_track_id = 0
-        self.debug = {}
-        self.focal = float((self.K[0, 0] + self.K[1, 1]) * 0.5)
 
     @classmethod
     def from_config(cls, K: np.ndarray, width: int, height: int, cfg_dict: dict):
         cfg = SparseFlowConfig(
             max_features=int(cfg_dict.get("max_features", 400)),
-            min_distance=int(cfg_dict.get("min_distance", 15)),
-            quality=float(cfg_dict.get("quality", 0.01)),
-            lk_win=int(cfg_dict.get("lk_win", 21)),
-            lk_levels=int(cfg_dict.get("lk_levels", 3)),
-            f_ransac_thresh=float(cfg_dict.get("f_ransac_thresh", 1.5)),
             keyframe_parallax=float(cfg_dict.get("keyframe_parallax", 20.0)),
             keyframe_gap=int(cfg_dict.get("keyframe_gap", 5)),
-            equalize=bool(cfg_dict.get("equalize", True)),
-            use_fast=bool(cfg_dict.get("use_fast", False)),
-            reject_with_f=bool(cfg_dict.get("reject_with_f", True)),
-            border_size=int(cfg_dict.get("border_size", 1)),
-            use_imu_prior=bool(cfg_dict.get("use_imu_prior", True)),
         )
         return cls(K, width, height, cfg)
 
-    def process_frame(self, frame, timestamp=None, gyro_R: Optional[np.ndarray] = None, frames_since_keyframe=None) -> SparseFlowResult:
+    def process_frame(
+        self,
+        frame,
+        timestamp=None,
+        gyro_R: Optional[np.ndarray] = None,
+        frames_since_keyframe=None,
+    ) -> SparseFlowResult:
+        del timestamp, gyro_R
         image = self._frame_rgb(frame)
         gray = self._gray(image)
-        self.debug = {}
-        if frames_since_keyframe is not None:
-            self.debug["frames_since_keyframe"] = float(frames_since_keyframe)
 
-        if self.cur_gray is None:
-            draw_prev_pts = np.empty((0, 2), dtype=np.float32)
-            self._spawn_points(gray)
-            self.cur_gray = gray
-            return self._result(frame.frame_id, image, draw_prev_pts, True)
+        if self.ref_gray is None or self.ref_pts.shape[0] == 0:
+            self._redetect(gray)
+            prev_pts = np.full_like(self.ref_pts, np.nan)
+            return self._result(frame.frame_id, image, self.ref_pts, prev_pts, self.ref_ages, self.ref_ids, True, 0.0, frames_since_keyframe)
 
-        draw_prev_pts = self.cur_pts.copy()
-        self._track_by_lk(gray, draw_prev_pts, gyro_R)
-        draw_prev_pts = getattr(self, "_last_draw_prev_pts", draw_prev_pts[: self.cur_pts.shape[0]])
-        if self.cfg.reject_with_f:
-            draw_prev_pts = self._reject_with_f(draw_prev_pts)
-        self._set_mask()
-        draw_prev_pts = self._reorder_draw_prev_pts(draw_prev_pts)
-        self._spawn_points(gray)
+        tracked = self.tracker.track(self.ref_gray, gray, self.ref_pts)
+        idxs_ref = np.asarray(tracked.idxs_ref, dtype=np.int64)
+        prev_pts = tracked.kps_ref_matched.astype(np.float32)
+        cur_pts = tracked.kps_cur_matched.astype(np.float32)
+        ids = self.ref_ids[idxs_ref]
+        ages = self.ref_ages[idxs_ref] + 1
+        parallax = np.linalg.norm(cur_pts - prev_pts, axis=1)
+        avg_parallax = float(np.mean(parallax)) if parallax.size else 0.0
+        gap = 0 if frames_since_keyframe is None else int(frames_since_keyframe)
+        new_keyframe = (
+            cur_pts.shape[0] < 20
+            or avg_parallax >= self.cfg.keyframe_parallax
+            or gap >= self.cfg.keyframe_gap
+        )
+        result = self._result(
+            frame.frame_id,
+            image,
+            cur_pts,
+            prev_pts,
+            ages,
+            ids,
+            new_keyframe,
+            avg_parallax,
+            frames_since_keyframe,
+        )
 
-        new_keyframe = self._is_keyframe(frame.frame_id, draw_prev_pts)
-        self.cur_gray = gray
-        return self._result(frame.frame_id, image, draw_prev_pts, new_keyframe)
+        # Match pySLAM visual_odometry.py: once tracks drop below the requested
+        # count, redetect a complete reference set instead of merging points.
+        if tracked.kps_cur.shape[0] < self.tracker.num_features:
+            self._redetect(gray)
+        else:
+            self.ref_gray = gray
+            self.ref_pts = cur_pts
+            self.ref_ids = ids
+            self.ref_ages = ages
+        return result
 
     def draw_overlay(self, result: SparseFlowResult) -> np.ndarray:
         image = result.image.copy()
-        for xy, prev_xy, age in zip(result.pts, result.prev_pts, result.track_cnt):
-            color = self._age_color(int(age))
-            p1 = tuple(np.rint(xy).astype(int))
-            cv2.circle(image, p1, 2, color, -1, cv2.LINE_AA)
-            if age > 1 and np.all(np.isfinite(prev_xy)):
-                p0 = tuple(np.rint(prev_xy).astype(int))
-                cv2.line(image, p0, p1, color, 1, cv2.LINE_AA)
+        for cur_xy, ref_xy in zip(result.pts, result.prev_pts):
+            cur_pt = tuple(np.rint(cur_xy).astype(int))
+            if np.all(np.isfinite(ref_xy)):
+                ref_pt = tuple(np.rint(ref_xy).astype(int))
+                cv2.line(image, ref_pt, cur_pt, (0, 255, 0), 1, cv2.LINE_AA)
+                cv2.circle(image, ref_pt, 1, (255, 0, 0), -1, cv2.LINE_AA)
+            else:
+                cv2.circle(image, cur_pt, 1, (0, 255, 0), -1, cv2.LINE_AA)
         return image
 
-    def _track_by_lk(self, gray, draw_prev_pts, gyro_R):
-        if self.cur_pts.shape[0] == 0:
-            return
-        before = self.cur_pts.shape[0]
-        init = None
-        flags = 0
-        if self.cfg.use_imu_prior and gyro_R is not None:
-            init = self._gyro_predict(self.cur_pts, gyro_R)
-            flags = cv2.OPTFLOW_USE_INITIAL_FLOW
-        cur, st, _ = cv2.calcOpticalFlowPyrLK(
-            self.cur_gray,
-            gray,
-            self.cur_pts.reshape(-1, 1, 2),
-            None if init is None else np.ascontiguousarray(init.reshape(-1, 1, 2), dtype=np.float32),
-            winSize=(self.cfg.lk_win, self.cfg.lk_win),
-            maxLevel=self.cfg.lk_levels,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
-            flags=flags,
-        )
-        if cur is None or st is None:
-            self._clear_tracks()
-            return
-        cur = cur.reshape(-1, 2)
-        valid = st.reshape(-1).astype(bool) & self._inside(cur)
+    def _redetect(self, gray):
+        keypoints, _ = self.tracker.detectAndCompute(gray)
+        self.ref_gray = gray
+        self.ref_pts = np.asarray([kp.pt for kp in keypoints], dtype=np.float32).reshape(-1, 2)
+        count = self.ref_pts.shape[0]
+        self.ref_ids = np.arange(self.next_track_id, self.next_track_id + count, dtype=np.int64)
+        self.ref_ages = np.ones(count, dtype=np.int32)
+        self.next_track_id += count
 
-        self.cur_pts = cur[valid].astype(np.float32)
-        self.ids = self.ids[valid]
-        self.track_cnt = self.track_cnt[valid] + 1
-        self._last_draw_prev_pts = draw_prev_pts[valid].astype(np.float32)
-        self.debug["lk_before"] = float(before)
-        self.debug["lk_kept"] = float(valid.sum())
-
-    def _reject_with_f(self, draw_prev_pts):
-        if self.cur_pts.shape[0] < 8:
-            return draw_prev_pts[: self.cur_pts.shape[0]]
-
-        aligned_prev = draw_prev_pts[: self.cur_pts.shape[0]]
-        prev_virtual = self._virtual_pixel_points(aligned_prev)
-        cur_virtual = self._virtual_pixel_points(self.cur_pts)
-        _, mask = cv2.findFundamentalMat(
-            prev_virtual,
-            cur_virtual,
-            cv2.FM_RANSAC,
-            self.cfg.f_ransac_thresh,
-            0.99,
-        )
-        if mask is None:
-            return aligned_prev
-        keep = mask.reshape(-1).astype(bool)
-        before = self.cur_pts.shape[0]
-        self.cur_pts = self.cur_pts[keep]
-        self.ids = self.ids[keep]
-        self.track_cnt = self.track_cnt[keep]
-        aligned_prev = aligned_prev[keep]
-        self.debug["f_before"] = float(before)
-        self.debug["f_kept"] = float(keep.sum())
-        return aligned_prev
-
-    def _set_mask(self):
-        mask = np.full((self.height, self.width), 255, dtype=np.uint8)
-        if self.cur_pts.shape[0] == 0:
-            self.mask = mask
-            self._sort_order = np.empty((0,), dtype=np.int64)
-            return
-
-        order = np.argsort(-self.track_cnt)
-        kept = []
-        for idx in order:
-            x, y = np.rint(self.cur_pts[idx]).astype(int)
-            if 0 <= x < self.width and 0 <= y < self.height and mask[y, x] == 255:
-                kept.append(idx)
-                cv2.circle(mask, (x, y), self.cfg.min_distance, 0, -1)
-        kept = np.asarray(kept, dtype=np.int64)
-        self.cur_pts = self.cur_pts[kept]
-        self.ids = self.ids[kept]
-        self.track_cnt = self.track_cnt[kept]
-        self.mask = mask
-        self._sort_order = kept
-
-    def _reorder_draw_prev_pts(self, draw_prev_pts):
-        aligned_prev = draw_prev_pts
-        order = getattr(self, "_sort_order", np.arange(self.cur_pts.shape[0]))
-        if order.shape[0] == 0:
-            return np.empty((0, 2), dtype=np.float32)
-        if aligned_prev.shape[0] >= np.max(order) + 1:
-            return aligned_prev[order].astype(np.float32)
-        return aligned_prev[: self.cur_pts.shape[0]].astype(np.float32)
-
-    def _spawn_points(self, gray):
-        need = self.cfg.max_features - self.cur_pts.shape[0]
-        if need <= 0:
-            return
-        if not hasattr(self, "mask"):
-            self.mask = np.full(gray.shape, 255, dtype=np.uint8)
-        pts = self._detect(gray, self.mask, need)
-        if pts is None:
-            self.debug["new_feature_num"] = 0.0
-            return
-        pts = pts.reshape(-1, 2).astype(np.float32)
-        new_ids = np.arange(self.next_track_id, self.next_track_id + pts.shape[0], dtype=np.int64)
-        self.next_track_id += pts.shape[0]
-        self.cur_pts = np.vstack([self.cur_pts, pts]).astype(np.float32)
-        self.ids = np.concatenate([self.ids, new_ids])
-        self.track_cnt = np.concatenate([self.track_cnt, np.ones(pts.shape[0], dtype=np.int32)])
-        self.debug["new_feature_num"] = float(pts.shape[0])
-
-    def _detect(self, gray, mask, max_count):
-        if self.cfg.use_fast:
-            fast = cv2.FastFeatureDetector_create(threshold=20, nonmaxSuppression=True)
-            kps = fast.detect(gray, mask)
-            kps = sorted(kps, key=lambda k: -k.response)[:max_count]
-            if not kps:
-                return None
-            return np.array([kp.pt for kp in kps], dtype=np.float32).reshape(-1, 1, 2)
-        return cv2.goodFeaturesToTrack(
-            gray,
-            maxCorners=max_count,
-            qualityLevel=self.cfg.quality,
-            minDistance=self.cfg.min_distance,
-            mask=mask,
-            blockSize=7,
-        )
-
-    def _is_keyframe(self, frame_id, draw_prev_pts):
-        tracked = self.track_cnt > 1
-        last_track_num = int(np.count_nonzero(tracked))
-        long_track_num = int(np.count_nonzero(self.track_cnt >= 4))
-        parallax = []
-        if draw_prev_pts.shape[0] > 0 and self.cur_pts.shape[0] > 0:
-            n = min(draw_prev_pts.shape[0], self.cur_pts.shape[0])
-            tracked_n = tracked[:n]
-            if np.any(tracked_n):
-                cur_norm = self._undistort_points(self.cur_pts[:n][tracked_n])
-                prev_norm = self._undistort_points(draw_prev_pts[:n][tracked_n])
-                parallax = np.linalg.norm(cur_norm - prev_norm, axis=1) * self.focal
-
-        avg_parallax = float(np.mean(parallax)) if len(parallax) else 0.0
-        self.debug["last_track_num"] = float(last_track_num)
-        self.debug["long_track_num"] = float(long_track_num)
-        self.debug["avg_parallax"] = avg_parallax
-
-        if frame_id < 2 or last_track_num < 20 or long_track_num < 40:
-            return True
-        if self.debug.get("new_feature_num", 0.0) > 0.5 * max(1, last_track_num):
-            return True
-        if self.debug.get("frames_since_keyframe", 0.0) >= self.cfg.keyframe_gap:
-            return True
-        return avg_parallax >= self.cfg.keyframe_parallax
-
-    def _result(self, frame_id, image, draw_prev_pts, new_keyframe):
-        if draw_prev_pts.shape[0] < self.cur_pts.shape[0]:
-            pad = np.full((self.cur_pts.shape[0] - draw_prev_pts.shape[0], 2), np.nan, dtype=np.float32)
-            draw_prev_pts = np.vstack([draw_prev_pts, pad])
-        ages = self.track_cnt
-        debug = dict(self.debug)
-        debug["age_median"] = float(np.median(ages)) if ages.size else 0.0
-        debug["age_gt10"] = float(np.count_nonzero(ages > 10))
-        debug["track_num"] = float(self.cur_pts.shape[0])
+    def _result(
+        self,
+        frame_id,
+        image,
+        pts,
+        prev_pts,
+        ages,
+        ids,
+        new_keyframe,
+        avg_parallax,
+        frames_since_keyframe,
+    ):
+        debug = {
+            "track_num": float(pts.shape[0]),
+            "last_track_num": float(pts.shape[0]),
+            "long_track_num": float(np.count_nonzero(ages >= 4)),
+            "avg_parallax": avg_parallax,
+            "age_median": float(np.median(ages)) if ages.size else 0.0,
+        }
+        if frames_since_keyframe is not None:
+            debug["frames_since_keyframe"] = float(frames_since_keyframe)
         return SparseFlowResult(
             frame_id=frame_id,
             image=image,
-            pts=self.cur_pts.copy(),
-            prev_pts=draw_prev_pts[: self.cur_pts.shape[0]].copy(),
-            track_cnt=self.track_cnt.copy(),
-            ids=self.ids.copy(),
+            pts=pts.copy(),
+            prev_pts=prev_pts.copy(),
+            track_cnt=ages.copy(),
+            ids=ids.copy(),
             new_keyframe=new_keyframe,
             debug=debug,
         )
@@ -282,48 +282,7 @@ class SparseFlowFrontend:
         return np.clip(image * 255.0, 0, 255).astype(np.uint8)
 
     def _gray(self, image):
-        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-        if self.cfg.equalize:
-            gray = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray)
-        return gray
-
-    def _inside(self, pts):
-        b = self.cfg.border_size
-        return (
-            (pts[:, 0] >= b)
-            & (pts[:, 0] < self.width - b)
-            & (pts[:, 1] >= b)
-            & (pts[:, 1] < self.height - b)
-        )
-
-    def _undistort_points(self, pts):
-        pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
-        homog = np.c_[pts, np.ones(len(pts), dtype=np.float64)]
-        rays = (self.K_inv @ homog.T).T
-        return rays[:, :2] / np.maximum(rays[:, 2:3], 1e-12)
-
-    def _virtual_pixel_points(self, pts):
-        norm = self._undistort_points(pts)
-        return (norm * self.focal + np.array([[self.width * 0.5, self.height * 0.5]])).astype(np.float32)
-
-    def _gyro_predict(self, pts, R_cur_prev):
-        R_cur_prev = np.asarray(R_cur_prev, dtype=np.float64)
-        homog = np.c_[pts, np.ones(len(pts), dtype=np.float64)]
-        rays = (self.K_inv @ homog.T).T
-        rays = (R_cur_prev @ rays.T).T
-        proj = (self.K @ rays.T).T
-        return (proj[:, :2] / np.maximum(proj[:, 2:3], 1e-8)).astype(np.float32)
-
-    def _age_color(self, age):
-        t = min(1.0, age / 8.0)
-        return (int(255 * (1 - t)), int(220 * t), 40)
-
-    def _clear_tracks(self):
-        self.cur_pts = np.empty((0, 2), dtype=np.float32)
-        self.ids = np.empty((0,), dtype=np.int64)
-        self.track_cnt = np.empty((0,), dtype=np.int32)
-        self._last_draw_prev_pts = np.empty((0, 2), dtype=np.float32)
-
+        return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
 def overlay_to_uimg_tensor(image: np.ndarray, dtype=torch.float32):
     return torch.from_numpy(image.copy()).to(dtype=dtype) / 255.0
