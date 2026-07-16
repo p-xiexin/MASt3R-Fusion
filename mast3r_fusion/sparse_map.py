@@ -64,6 +64,7 @@ class SparseMap:
         self.reference_keyframe_idx = None
         self.last_keyframe_idx = None
         self.last_tracking_result = None
+        self.map_ready = False
         self.initialized = False
 
         self.max_local_keyframes = int(cfg.get("local_keyframes", 80))
@@ -97,14 +98,17 @@ class SparseMap:
             gyro_R=gyro_R,
             frames_since_keyframe=frames_since_keyframe,
         )
-        tracking = (
-            self._track_local_map(frame, self.flow.frame_gray(frame))
-            if self.initialized
-            else self._empty_tracking_result()
-        )
+        tracking = self._empty_tracking_result()
+        if self.map_ready:
+            tracking = self._track_local_map(
+                frame, self.flow.frame_gray(frame)
+            )
+            if tracking.tracking_ok:
+                self.initialized = True
         tracking.flow = flow_result
         flow_result.debug.update(
             {
+                "map_ready": float(self.map_ready),
                 "map_initialized": float(self.initialized),
                 "map_tracking_ok": float(tracking.tracking_ok),
                 "map_inlier_num": float(tracking.matched_inlier_map_points),
@@ -122,6 +126,25 @@ class SparseMap:
 
     def draw_overlay(self, result):
         image = result.flow.image.copy()
+        if not self.initialized:
+            for uv, age, is_inlier in zip(
+                result.flow.pts,
+                result.flow.track_cnt,
+                result.flow.inlier_mask,
+            ):
+                if not is_inlier or not np.isfinite(uv).all():
+                    continue
+                color = (0, 255, 0) if age >= 4 else (255, 0, 0)
+                cv2.circle(
+                    image,
+                    tuple(np.rint(uv).astype(int)),
+                    2,
+                    color,
+                    -1,
+                    cv2.LINE_AA,
+                )
+            return image
+
         for point_id, uv in zip(result.inlier_point_ids, result.inlier_image_points):
             if not np.isfinite(uv).all():
                 continue
@@ -198,20 +221,27 @@ class SparseMap:
 
         self.last_keyframe_idx = record.keyframe_idx
         self.reference_keyframe_idx = record.keyframe_idx
-        was_initialized = self.initialized
-        self.initialized = self._reference_point_count() >= self.min_tracking_inliers
-        if not was_initialized or added > 0:
+        was_ready = self.map_ready
+        self.map_ready = (
+            self._reference_point_count() >= self.min_tracking_inliers
+        )
+        if not self.map_ready:
+            self.initialized = False
+        if not was_ready or added > 0:
             print(
                 f"[INFO] SparseMap keyframe={record.keyframe_idx} "
                 f"triangulated={added} map_points={len(self.map_points)} "
                 f"reference_points={self._reference_point_count()} "
+                f"map_ready={self.map_ready} "
                 f"initialized={self.initialized}"
             )
-        if self.initialized:
+        if self.map_ready:
             self._cull_recent_map_points()
-            self.initialized = (
+            self.map_ready = (
                 self._reference_point_count() >= self.min_tracking_inliers
             )
+            if not self.map_ready:
+                self.initialized = False
 
     def optimize_local_bundle_adjustment(self):
         """Reserved for a future sparse visual-inertial BA stage."""
@@ -276,7 +306,11 @@ class SparseMap:
             self.last_keyframe_idx = max(self.keyframes, default=None)
         if self.reference_keyframe_idx not in self.keyframes:
             self.reference_keyframe_idx = self.last_keyframe_idx
-        self.initialized = self._reference_point_count() >= self.min_tracking_inliers
+        self.map_ready = (
+            self._reference_point_count() >= self.min_tracking_inliers
+        )
+        if not self.map_ready:
+            self.initialized = False
 
     def _store_keyframe_observations(self, record, result):
         if result is None:
