@@ -545,35 +545,38 @@ async def _publish_current_frame(server, channels, states, options):
 
 async def _publish_scene_snapshot(server, channels, states, keyframes, options):
     timestamp_ns = time.time_ns()
-    frames = _snapshot_keyframes(keyframes)
-    if frames:
-        poses = [_pose_from_sim3_data(frame.T_WC.data.cpu().numpy()[0]) for frame in frames]
-        await _send_json(
-            server,
-            channels,
-            "trajectory",
-            timestamp_ns,
-            {"timestamp": _time_msg(timestamp_ns), "frame_id": "world", "poses": poses},
-        )
+    try:
+        frames = _snapshot_keyframes(keyframes)
+        if frames:
+            poses = [_pose_from_sim3_data(frame.T_WC.data.cpu().numpy()[0]) for frame in frames]
+            await _send_json(
+                server,
+                channels,
+                "trajectory",
+                timestamp_ns,
+                {"timestamp": _time_msg(timestamp_ns), "frame_id": "world", "poses": poses},
+            )
 
-        points_accum = []
-        colors_accum = []
-        per_kf_limit = max(1, options["max_points"] // min(len(frames), options["max_keyframes"]))
-        for frame in frames[-options["max_keyframes"] :]:
-            result = _world_points(frame, options["conf_threshold"], per_kf_limit)
-            if result is None:
-                continue
-            points, colors = result
-            points_accum.append(points)
-            colors_accum.append(colors)
-        if points_accum:
-            points = np.concatenate(points_accum, axis=0)
-            colors = np.concatenate(colors_accum, axis=0)
-            if points.shape[0] > options["max_points"]:
-                stride = int(np.ceil(points.shape[0] / options["max_points"]))
-                points = points[::stride]
-                colors = colors[::stride]
-            await _send_json(server, channels, "keyframe_points", timestamp_ns, _point_cloud_msg(timestamp_ns, points, colors))
+            points_accum = []
+            colors_accum = []
+            per_kf_limit = max(1, options["max_points"] // min(len(frames), options["max_keyframes"]))
+            for frame in frames[-options["max_keyframes"] :]:
+                result = _world_points(frame, options["conf_threshold"], per_kf_limit)
+                if result is None:
+                    continue
+                points, colors = result
+                points_accum.append(points)
+                colors_accum.append(colors)
+            if points_accum:
+                points = np.concatenate(points_accum, axis=0)
+                colors = np.concatenate(colors_accum, axis=0)
+                if points.shape[0] > options["max_points"]:
+                    stride = int(np.ceil(points.shape[0] / options["max_points"]))
+                    points = points[::stride]
+                    colors = colors[::stride]
+                await _send_json(server, channels, "keyframe_points", timestamp_ns, _point_cloud_msg(timestamp_ns, points, colors))
+    except Exception as exc:
+        print(f"[foxglove] scene publish skipped: {exc}")
 
     await _publish_sparse_flow_points(server, channels, states, timestamp_ns)
     await _publish_graph_edges(server, channels, states, keyframes, timestamp_ns)
@@ -722,6 +725,39 @@ async def _wait_opened(server, timeout=5.0):
     return await server.wait_opened()
 
 
+def _manager_disconnected(exc):
+    return isinstance(
+        exc,
+        (
+            BrokenPipeError,
+            ConnectionResetError,
+            EOFError,
+            FileNotFoundError,
+        ),
+    )
+
+
+def _get_mode_or_terminated(states):
+    try:
+        return states.get_mode()
+    except Exception as exc:
+        if _manager_disconnected(exc):
+            print("[foxglove] state manager disconnected; stopping")
+            return Mode.TERMINATED
+        raise
+
+
+async def _run_server_forever(cfg, states, keyframes, host, port, publish_hz, options):
+    while _get_mode_or_terminated(states) != Mode.TERMINATED:
+        try:
+            await _run_server(cfg, states, keyframes, host, port, publish_hz, options)
+        except Exception as exc:
+            if _get_mode_or_terminated(states) == Mode.TERMINATED:
+                break
+            print(f"[foxglove] server restart after error: {exc}")
+            await asyncio.sleep(1.0)
+
+
 def run_foxglove_publisher(
     cfg,
     states,
@@ -750,6 +786,6 @@ def run_foxglove_publisher(
         "Tic": Tic,
     }
     try:
-        asyncio.run(_run_server(cfg, states, keyframes, host, int(port), publish_hz, options))
+        asyncio.run(_run_server_forever(cfg, states, keyframes, host, int(port), publish_hz, options))
     finally:
         print("[foxglove] stopped")

@@ -218,28 +218,41 @@ class SparseFlowFrontend:
             or avg_parallax >= self.cfg.keyframe_parallax
             or gap >= self.cfg.keyframe_gap
         )
+        new_pts, new_ids, new_ages = self._new_points(gray, cur_pts)
+        if new_pts.shape[0] > 0:
+            display_pts = np.concatenate([cur_pts, new_pts], axis=0)
+            display_prev_pts = np.concatenate(
+                [prev_pts, np.full_like(new_pts, np.nan)], axis=0
+            )
+            display_ages = np.concatenate([ages, new_ages], axis=0)
+            display_ids = np.concatenate([ids, new_ids], axis=0)
+            display_inlier_mask = np.concatenate(
+                [inlier_mask, np.ones(new_pts.shape[0], dtype=bool)], axis=0
+            )
+        else:
+            display_pts = cur_pts
+            display_prev_pts = prev_pts
+            display_ages = ages
+            display_ids = ids
+            display_inlier_mask = inlier_mask
+
         result = self._result(
             frame.frame_id,
             image,
-            cur_pts,
-            prev_pts,
-            ages,
-            ids,
-            inlier_mask,
+            display_pts,
+            display_prev_pts,
+            display_ages,
+            display_ids,
+            display_inlier_mask,
             new_keyframe,
             avg_parallax,
             frames_since_keyframe,
         )
 
-        # Match pySLAM visual_odometry.py: once tracks drop below the requested
-        # count, redetect a complete reference set instead of merging points.
-        if tracked.kps_cur.shape[0] < self.tracker.num_features:
-            self._redetect(gray)
-        else:
-            self.ref_gray = gray
-            self.ref_pts = cur_pts
-            self.ref_ids = ids
-            self.ref_ages = ages
+        self.ref_gray = gray
+        self.ref_pts = display_pts
+        self.ref_ids = display_ids
+        self.ref_ages = display_ages
         return result
 
     def draw_overlay(self, result: SparseFlowResult) -> np.ndarray:
@@ -311,6 +324,30 @@ class SparseFlowFrontend:
         self.ref_ids = np.arange(self.next_track_id, self.next_track_id + count, dtype=np.int64)
         self.ref_ages = np.ones(count, dtype=np.int32)
         self.next_track_id += count
+
+    def _new_points(self, gray, existing_points):
+        need = int(self.tracker.num_features) - int(existing_points.shape[0])
+        if need <= 0:
+            return (
+                np.empty((0, 2), dtype=np.float32),
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.int32),
+            )
+
+        mask = np.full(gray.shape[:2], 255, dtype=np.uint8)
+        for point in existing_points:
+            if not np.isfinite(point).all():
+                continue
+            cv2.circle(mask, tuple(np.rint(point).astype(int)), 8, 0, -1)
+        keypoints, _ = self.tracker.detectAndCompute(gray, mask=mask)
+        points = np.asarray([kp.pt for kp in keypoints], dtype=np.float32).reshape(-1, 2)
+        if points.shape[0] > need:
+            points = points[:need]
+        count = points.shape[0]
+        ids = np.arange(self.next_track_id, self.next_track_id + count, dtype=np.int64)
+        ages = np.ones(count, dtype=np.int32)
+        self.next_track_id += count
+        return points, ids, ages
 
     def _estimate_pose_inliers(self, ref_pts, cur_pts):
         if ref_pts.shape[0] < 5:
