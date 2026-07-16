@@ -141,6 +141,7 @@ class SparseFlowConfig:
     max_features: int = 2000
     keyframe_parallax: float = 20.0
     keyframe_gap: int = 5
+    min_tracks_for_redetect: int = 500
 
 
 @dataclass
@@ -180,6 +181,7 @@ class SparseFlowFrontend:
             max_features=2000,
             keyframe_parallax=float(cfg_dict.get("keyframe_parallax", 20.0)),
             keyframe_gap=int(cfg_dict.get("keyframe_gap", 5)),
+            min_tracks_for_redetect=int(cfg_dict.get("min_tracks_for_redetect", 500)),
         )
         return cls(K, width, height, cfg)
 
@@ -206,7 +208,7 @@ class SparseFlowFrontend:
         cur_pts = tracked.kps_cur_matched.astype(np.float32)
         ids = self.ref_ids[idxs_ref]
         ages = self.ref_ages[idxs_ref] + 1
-        inlier_mask = self._estimate_pose_inliers(prev_pts, cur_pts)
+        inlier_mask = np.ones(cur_pts.shape[0], dtype=bool)
         avg_parallax = (
             float(np.mean(np.abs(prev_pts - cur_pts)))
             if cur_pts.shape[0] > 0
@@ -218,7 +220,12 @@ class SparseFlowFrontend:
             or avg_parallax >= self.cfg.keyframe_parallax
             or gap >= self.cfg.keyframe_gap
         )
-        new_pts, new_ids, new_ages = self._new_points(gray, cur_pts)
+        if cur_pts.shape[0] < self.cfg.min_tracks_for_redetect:
+            new_pts, new_ids, new_ages = self._new_points(gray, cur_pts)
+        else:
+            new_pts = np.empty((0, 2), dtype=np.float32)
+            new_ids = np.empty(0, dtype=np.int64)
+            new_ages = np.empty(0, dtype=np.int32)
         if new_pts.shape[0] > 0:
             display_pts = np.concatenate([cur_pts, new_pts], axis=0)
             display_prev_pts = np.concatenate(
@@ -247,6 +254,13 @@ class SparseFlowFrontend:
             new_keyframe,
             avg_parallax,
             frames_since_keyframe,
+        )
+        result.debug.update(
+            {
+                "tracked_num": float(cur_pts.shape[0]),
+                "tracked_inlier_num": float(np.count_nonzero(inlier_mask)),
+                "new_point_num": float(new_pts.shape[0]),
+            }
         )
 
         self.ref_gray = gray
@@ -372,16 +386,6 @@ class SparseFlowFrontend:
             return np.zeros(ref_pts.shape[0], dtype=bool)
         essential = None if essential is None else np.asarray(essential)
         if essential is None or essential.size < 9 or mask is None:
-            return np.zeros(ref_pts.shape[0], dtype=bool)
-        try:
-            cv2.recoverPose(
-                np.ascontiguousarray(essential),
-                cur_norm,
-                ref_norm,
-                focal=1,
-                pp=(0.0, 0.0),
-            )
-        except cv2.error:
             return np.zeros(ref_pts.shape[0], dtype=bool)
         return mask.reshape(-1).astype(bool)
 

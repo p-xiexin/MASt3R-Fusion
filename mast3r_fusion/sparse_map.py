@@ -66,6 +66,7 @@ class SparseMap:
         self.last_tracking_result = None
         self.map_ready = False
         self.initialized = False
+        self.parallax_since_keyframe = 0.0
 
         self.max_local_keyframes = int(cfg.get("local_keyframes", 80))
         self.max_points_per_keyframe = int(cfg.get("map_points_per_keyframe", 2000))
@@ -102,12 +103,17 @@ class SparseMap:
             frames_since_keyframe=frames_since_keyframe,
         )
         tracking = self._empty_tracking_result()
-        if self.map_ready:
-            tracking = self._track_local_map(
-                frame, self.flow.frame_gray(frame)
+        self.parallax_since_keyframe += float(
+            flow_result.debug.get("avg_parallax", 0.0)
+        )
+        tracking.reference_tracked_points = int(
+            flow_result.debug.get("tracked_num", flow_result.pts.shape[0])
+        )
+        tracking.matched_inlier_map_points = int(
+            flow_result.debug.get(
+                "tracked_inlier_num", np.count_nonzero(flow_result.inlier_mask)
             )
-            if tracking.tracking_ok:
-                self.initialized = True
+        )
         tracking.flow = flow_result
         flow_result.debug.update(
             {
@@ -122,6 +128,7 @@ class SparseMap:
                     if tracking.reference_tracked_points > 0
                     else 0.0
                 ),
+                "parallax_since_keyframe": self.parallax_since_keyframe,
             }
         )
         self.last_tracking_result = tracking
@@ -175,20 +182,20 @@ class SparseMap:
                 and np.count_nonzero(result.flow.inlier_mask)
                 >= self.initializer_min_inliers
             )
-        if not result.tracking_ok:
-            return False
 
-        enough_points = result.matched_inlier_map_points > self.min_points_for_keyframe
-        tracking_weakened = (
-            result.reference_tracked_points > 0
-            and result.matched_inlier_map_points
-            < result.reference_tracked_points * self.ref_ratio
+        track_count = int(
+            result.flow.debug.get(
+                "tracked_inlier_num", np.count_nonzero(result.flow.inlier_mask)
+            )
         )
+        enough_points = track_count > self.min_points_for_keyframe
+        tracking_weakened = track_count < self.min_tracking_inliers
+        enough_motion = self.parallax_since_keyframe >= self.flow.cfg.keyframe_parallax
         max_interval_reached = gap >= self.max_keyframe_gap
         return bool(
-            (max_interval_reached or local_mapping_idle)
-            and tracking_weakened
-            and enough_points
+            (enough_motion and enough_points)
+            or tracking_weakened
+            or max_interval_reached
         )
 
     def register_keyframe(self, keyframe_idx, frame, result=None):
@@ -225,6 +232,8 @@ class SparseMap:
         )
         if not self.map_ready:
             self.initialized = False
+        else:
+            self.initialized = True
         if not was_ready or added > 0:
             print(
                 f"[INFO] SparseMap keyframe={record.keyframe_idx} "
@@ -240,6 +249,9 @@ class SparseMap:
             )
             if not self.map_ready:
                 self.initialized = False
+            else:
+                self.initialized = True
+        self.parallax_since_keyframe = 0.0
 
     def optimize_local_bundle_adjustment(self):
         """Reserved for a future sparse visual-inertial BA stage."""
@@ -248,9 +260,11 @@ class SparseMap:
     def align_world_to_keyframe(self, keyframe_idx, frame):
         record = self.keyframes.get(int(keyframe_idx))
         if record is None:
-            return
+            return False
         old_pose = record.pose_data
         new_pose = self._pose_data(frame)
+        if np.allclose(old_pose, new_pose, rtol=1e-6, atol=1e-8):
+            return False
         old_rotation = Rotation.from_quat(old_pose[3:7]).as_matrix()
         new_rotation = Rotation.from_quat(new_pose[3:7]).as_matrix()
         correction_rotation = new_rotation @ old_rotation.T
@@ -278,6 +292,7 @@ class SparseMap:
                 ]
             )
         record.pose_data = new_pose
+        return True
 
     def prune_before(self, first_keyframe_idx):
         first_keyframe_idx = int(first_keyframe_idx)
@@ -616,7 +631,7 @@ class SparseMap:
         record = self.keyframes.get(self.reference_keyframe_idx)
         if record is None:
             return 0
-        min_observations = 2 if len(self.keyframes) <= 2 else 3
+        min_observations = 2
         return sum(
             1
             for point_id in record.observed_point_ids

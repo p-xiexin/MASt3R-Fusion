@@ -377,9 +377,9 @@ def update_sparse_map_points(states, sparse_map):
 def align_sparse_map_to_last_keyframe(sparse_map, keyframes):
     last_kf = keyframes.last_keyframe()
     if last_kf is None:
-        return
+        return False
     last_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
-    sparse_map.align_world_to_keyframe(last_kf_idx, last_kf)
+    return sparse_map.align_world_to_keyframe(last_kf_idx, last_kf)
 
 
 def initialize_delayed_keyframe_placeholders(states, frame):
@@ -606,7 +606,8 @@ if __name__ == "__main__":
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
         if use_calib:
             frame.K = K
-        align_sparse_map_to_last_keyframe(sparse_map, keyframes)
+        if align_sparse_map_to_last_keyframe(sparse_map, keyframes):
+            update_sparse_map_points(states, sparse_map)
         last_kf = keyframes.last_keyframe()
         last_kf_frame_id = last_kf.frame_id if last_kf is not None else -1
         tracking_result = sparse_map.process_frame(
@@ -653,6 +654,7 @@ if __name__ == "__main__":
                             frame,
                             tracking_result,
                         )
+                        update_sparse_map_points(states, sparse_map)
                     run_delayed_imu_backend(states, keyframes, delayed_kf_idx)
                     if not sparse_map_was_initialized:
                         sparse_map.register_keyframe(
@@ -660,6 +662,7 @@ if __name__ == "__main__":
                             keyframes[delayed_kf_idx],
                             tracking_result,
                         )
+                        update_sparse_map_points(states, sparse_map)
                     if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
                         run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
                 else:
@@ -668,6 +671,7 @@ if __name__ == "__main__":
                         frame,
                         tracking_result,
                     )
+                    update_sparse_map_points(states, sparse_map)
                     run_pi3x_window_backend_indices(states, keyframes, [delayed_kf_idx])
             else:
                 update_current_state(states, frame, sparse_map_overlay)
@@ -758,9 +762,7 @@ if __name__ == "__main__":
             if rollup > 0:
                 keyframes.roll_up(rollup)
                 sparse_map.prune_before(keyframes.rollup_sum.value)
-
-        align_sparse_map_to_last_keyframe(sparse_map, keyframes)
-        update_sparse_map_points(states, sparse_map)
+                update_sparse_map_points(states, sparse_map)
 
         # log time
         if i % 30 == 0:
