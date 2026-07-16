@@ -112,6 +112,17 @@ class LkFeatureTracker:
             image_ref, image_cur, kps_ref, None, **self.lk_params
         )
         del err
+        if kps_cur is None or st is None:
+            res = FeatureTrackingResult()
+            res.idxs_ref = []
+            res.idxs_cur = []
+            res.kps_ref_matched = np.empty((0, 2), dtype=np.float32)
+            res.kps_cur_matched = np.empty((0, 2), dtype=np.float32)
+            res.kps_ref = res.kps_ref_matched
+            res.kps_cur = res.kps_cur_matched
+            res.des_ref = None
+            res.des_cur = None
+            return res
         st = st.reshape(st.shape[0])
         res = FeatureTrackingResult()
         res.idxs_ref = [i for i, v in enumerate(st) if v == 1]
@@ -196,7 +207,11 @@ class SparseFlowFrontend:
         ids = self.ref_ids[idxs_ref]
         ages = self.ref_ages[idxs_ref] + 1
         inlier_mask = self._estimate_pose_inliers(prev_pts, cur_pts)
-        avg_parallax = float(np.mean(np.abs(prev_pts - cur_pts)))
+        avg_parallax = (
+            float(np.mean(np.abs(prev_pts - cur_pts)))
+            if cur_pts.shape[0] > 0
+            else 0.0
+        )
         gap = 0 if frames_since_keyframe is None else int(frames_since_keyframe)
         new_keyframe = (
             cur_pts.shape[0] < 20
@@ -254,32 +269,38 @@ class SparseFlowFrontend:
 
     def _estimate_pose_inliers(self, ref_pts, cur_pts):
         if ref_pts.shape[0] < 5:
-            raise ValueError("pySLAM LK frontend needs at least five matches for pose estimation.")
+            return np.zeros(ref_pts.shape[0], dtype=bool)
         ref_norm = cv2.undistortPoints(
             np.ascontiguousarray(ref_pts).reshape(-1, 1, 2), self.K, None
         ).reshape(-1, 2)
         cur_norm = cv2.undistortPoints(
             np.ascontiguousarray(cur_pts).reshape(-1, 1, 2), self.K, None
         ).reshape(-1, 2)
-        essential, mask = cv2.findEssentialMat(
-            cur_norm,
-            ref_norm,
-            focal=1,
-            pp=(0.0, 0.0),
-            method=cv2.RANSAC,
-            prob=0.999,
-            threshold=0.0004,
-        )
+        try:
+            essential, mask = cv2.findEssentialMat(
+                cur_norm,
+                ref_norm,
+                focal=1,
+                pp=(0.0, 0.0),
+                method=cv2.RANSAC,
+                prob=0.999,
+                threshold=0.0004,
+            )
+        except cv2.error:
+            return np.zeros(ref_pts.shape[0], dtype=bool)
         essential = None if essential is None else np.asarray(essential)
         if essential is None or essential.size < 9 or mask is None:
-            raise ValueError("findEssentialMat failed to produce a valid essential matrix.")
-        cv2.recoverPose(
-            np.ascontiguousarray(essential),
-            cur_norm,
-            ref_norm,
-            focal=1,
-            pp=(0.0, 0.0),
-        )
+            return np.zeros(ref_pts.shape[0], dtype=bool)
+        try:
+            cv2.recoverPose(
+                np.ascontiguousarray(essential),
+                cur_norm,
+                ref_norm,
+                focal=1,
+                pp=(0.0, 0.0),
+            )
+        except cv2.error:
+            return np.zeros(ref_pts.shape[0], dtype=bool)
         return mask.reshape(-1).astype(bool)
 
     def _result(

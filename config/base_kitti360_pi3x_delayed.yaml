@@ -5,19 +5,13 @@ pi3x:
   delayed_matching: true
   viz_matching: true
   delayed_batch_keyframes: 5
-  delayed_keyframe_stride: 2
-  sparse_flow_frontend:
+  sparse_map:
     enabled: true
-    max_features: 400
-    min_distance: 15
-    quality: 0.01
-    keyframe_gap: 5
-    keyframe_parallax: 20.0
-    min_keyframe_gap: 2
     max_keyframe_gap: 20
-    force_keyframe_gyro_deg: 30.0
-    suppress_keyframe_gyro_deg: 5.0
-    suppress_keyframe_parallax: 3.0
-    reject_with_f: true
-    f_ransac_thresh: 1.5
-    use_imu_prior: true
+    keyframe_ref_ratio: 0.9
+    min_tracked_points_for_keyframe: 15
+    min_tracking_inliers: 20
+    local_keyframes: 80
+    map_points_per_keyframe: 2000
+    map_point_confidence: 0.3
+    reprojection_error: 3.0
