@@ -16,8 +16,8 @@ from mast3r_fusion.foxglove_debug import run_foxglove_publisher
 from mast3r_fusion.frame import Mode, SharedKeyframes, SharedStates, create_frame
 from mast3r_fusion.frontend_model import load_frontend_model
 from mast3r_fusion.multiprocess_utils import new_queue, try_get_msg
-from mast3r_fusion.sparse_map import SparseMap
 from mast3r_fusion.sparse_flow_frontend import overlay_to_uimg_tensor
+from mast3r_fusion.sparse_map import SparseMap
 from mast3r_fusion.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
 import numpy as np
@@ -91,6 +91,26 @@ def save_pi3x_pose_debug(window_indices, window_frames, pi3x_poses):
                     *pi3x_T.tolist(),
                 ]
             )
+
+
+def integrate_camera_gyro_prior(factor_graph, t0, t1):
+    if t0 is None or t1 is None or t1 <= t0 or not hasattr(factor_graph, "imu_pool"):
+        return None
+    try:
+        records = factor_graph.imu_pool.get_records(float(t0), float(t1))
+    except Exception as exc:
+        print(f"[WARN] sparse flow IMU prior skipped: {exc}")
+        return None
+
+    R_imu = np.eye(3, dtype=np.float64)
+    for seg_t0, seg_t1, data in records:
+        dt = float(seg_t1 - seg_t0)
+        if dt <= 0:
+            continue
+        R_imu = R_imu @ Rotation.from_rotvec(np.asarray(data[0:3], dtype=np.float64) * np.pi / 180.0 * dt).as_matrix()
+
+    R_ic = np.asarray(factor_graph.Tic[:3, :3], dtype=np.float64)
+    return R_ic.T @ R_imu @ R_ic
 
 
 def get_backend_edges(idx):
@@ -253,7 +273,7 @@ def add_precomputed_factor_matches(factor_graph, ii, jj, matches, min_match_frac
     return valid_edges.sum() > 0
 
 
-def run_pi3x_window_backend_indices(states, keyframes, indices, sparse_map):
+def run_pi3x_window_backend_indices(states, keyframes, indices):
     mode = states.get_mode()
     if mode == Mode.INIT or states.is_paused() or not indices:
         return False
@@ -267,7 +287,6 @@ def run_pi3x_window_backend_indices(states, keyframes, indices, sparse_map):
         all_frame_idx += frame_idx
     if not all_kf_idx:
         finish_backend_update(states, keyframes)
-        sparse_map.sync_keyframes(keyframes)
         indices.clear()
         return True
 
@@ -312,12 +331,11 @@ def run_pi3x_window_backend_indices(states, keyframes, indices, sparse_map):
         window_end=window_end,
         marginalize_to=max(window_end - factor_graph.window_num, 0),
     )
-    sparse_map.sync_keyframes(keyframes)
     indices.clear()
     return True
 
 
-def run_delayed_imu_backend(states, keyframes, idx, sparse_map):
+def run_delayed_imu_backend(states, keyframes, idx):
     mode = states.get_mode()
     if mode == Mode.INIT or states.is_paused():
         return False
@@ -327,7 +345,6 @@ def run_delayed_imu_backend(states, keyframes, idx, sparse_map):
     if optimized:
         latest_frame = keyframes[idx]
         states.T_WC[:] = latest_frame.T_WC[:].data
-        sparse_map.sync_keyframes(keyframes)
     print('[INFO] delayed imu backend.', time.time(), optimized)
     return optimized
 
@@ -511,6 +528,7 @@ if __name__ == "__main__":
     pending_delayed_kf_idx = []
     i = 0
     fps_timer = time.time()
+    prev_frame_timestamp = None
 
     while True:
         mode = states.get_mode()
@@ -530,14 +548,16 @@ if __name__ == "__main__":
 
         if i == len(dataset):
             if pending_delayed_kf_idx:
-                run_pi3x_window_backend_indices(
-                    states, keyframes, pending_delayed_kf_idx, sparse_map
-                )
+                run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
             states.set_mode(Mode.TERMINATED)
             break
 
         timestamp, img = dataset[i]
         # time.sleep(0.2)
+
+        camera_gyro_R = None
+        if pi3x_cfg.get("imu_predict", False):
+            camera_gyro_R = integrate_camera_gyro_prior(factor_graph, prev_frame_timestamp, timestamp)
 
         TSim3 = lietorch.Sim3.Identity(1, device='cpu')
         Tic0 = np.array([1, 0,  0, 0,
@@ -575,10 +595,13 @@ if __name__ == "__main__":
             frame.K = K
         last_kf = keyframes.last_keyframe()
         last_kf_frame_id = last_kf.frame_id if last_kf is not None else -1
-        sparse_map_overlay = None
+        if last_kf is not None:
+            last_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
+            sparse_map.align_world_to_keyframe(last_kf_idx, last_kf)
         tracking_result = sparse_map.process_frame(
             frame,
             timestamp,
+            gyro_R=camera_gyro_R,
             frames_since_keyframe=frame.frame_id - last_kf_frame_id,
         )
         sparse_map_overlay = sparse_map.draw_overlay(tracking_result)
@@ -590,10 +613,10 @@ if __name__ == "__main__":
             keyframes.append(frame)
             initial_keyframe_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
             sparse_map.register_keyframe(initial_keyframe_idx, frame)
-            sparse_map.update_keyframe_map(initial_keyframe_idx, frame)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame, notify=sparse_map_overlay is None)
             set_sparse_map_overlay(states, sparse_map_overlay)
+            prev_frame_timestamp = timestamp
             i += 1
             continue
 
@@ -604,32 +627,42 @@ if __name__ == "__main__":
                 tracking_result,
             )
             if add_new_kf:
+                sparse_map_was_initialized = sparse_map.initialized
                 initialize_delayed_keyframe_placeholders(states, frame)
                 keyframes.append(frame)
                 delayed_kf_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
-                sparse_map.register_keyframe(delayed_kf_idx, frame, tracking_result)
                 states.set_frame(frame, notify=sparse_map_overlay is None)
                 set_sparse_map_overlay(states, sparse_map_overlay)
                 if factor_graph.enable_ms:
                     pending_delayed_kf_idx.append(delayed_kf_idx)
-                    run_delayed_imu_backend(
-                        states, keyframes, delayed_kf_idx, sparse_map
-                    )
-                    if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
-                        run_pi3x_window_backend_indices(
-                            states,
-                            keyframes,
-                            pending_delayed_kf_idx,
-                            sparse_map,
+                    if sparse_map_was_initialized:
+                        sparse_map.register_keyframe(
+                            delayed_kf_idx,
+                            frame,
+                            tracking_result,
                         )
+                    run_delayed_imu_backend(states, keyframes, delayed_kf_idx)
+                    if not sparse_map_was_initialized:
+                        sparse_map.register_keyframe(
+                            delayed_kf_idx,
+                            keyframes[delayed_kf_idx],
+                            tracking_result,
+                        )
+                    if len(pending_delayed_kf_idx) >= delayed_batch_keyframes:
+                        run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
                 else:
-                    run_pi3x_window_backend_indices(
-                        states, keyframes, [delayed_kf_idx], sparse_map
+                    sparse_map.register_keyframe(
+                        delayed_kf_idx,
+                        frame,
+                        tracking_result,
                     )
+                    run_pi3x_window_backend_indices(states, keyframes, [delayed_kf_idx])
             else:
                 update_current_state(states, frame, sparse_map_overlay)
         else:
             raise Exception("Invalid mode")
+        prev_frame_timestamp = timestamp
+
         print('[INFO] backend',time.time())
 
         print(factor_graph.frames_to_save)
@@ -707,9 +740,7 @@ if __name__ == "__main__":
         # generally 8 GB is enough
         if len(keyframes) > 30:
             if pending_delayed_kf_idx:
-                run_pi3x_window_backend_indices(
-                    states, keyframes, pending_delayed_kf_idx, sparse_map
-                )
+                run_pi3x_window_backend_indices(states, keyframes, pending_delayed_kf_idx)
             rollup = 15
             rollup = min(rollup, max(factor_graph.last_pin - keyframes.rollup_sum.value, 0))
             if rollup > 0:

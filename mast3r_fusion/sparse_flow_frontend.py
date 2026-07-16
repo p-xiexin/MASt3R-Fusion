@@ -258,6 +258,51 @@ class SparseFlowFrontend:
                 cv2.circle(image, cur_pt, 1, (0, 255, 0), -1, cv2.LINE_AA)
         return image
 
+    def frame_gray(self, frame) -> np.ndarray:
+        return self._gray(self._frame_rgb(frame))
+
+    def detect_points(self, gray: np.ndarray) -> np.ndarray:
+        keypoints, _ = self.tracker.detectAndCompute(gray)
+        return np.asarray(
+            [keypoint.pt for keypoint in keypoints], dtype=np.float32
+        ).reshape(-1, 2)
+
+    def track_points(self, reference_gray, current_gray, reference_points):
+        reference_points = np.asarray(
+            reference_points, dtype=np.float32
+        ).reshape(-1, 2)
+        if reference_points.shape[0] < 5:
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0, 2), dtype=np.float32),
+            )
+        try:
+            tracked = self.tracker.track(
+                reference_gray, current_gray, reference_points
+            )
+            indices = np.asarray(tracked.idxs_ref, dtype=np.int64)
+            reference_matched = np.asarray(
+                tracked.kps_ref_matched, dtype=np.float32
+            ).reshape(-1, 2)
+            current_matched = np.asarray(
+                tracked.kps_cur_matched, dtype=np.float32
+            ).reshape(-1, 2)
+            inliers = self._estimate_pose_inliers(
+                reference_matched, current_matched
+            )
+        except (cv2.error, AttributeError, ValueError):
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0, 2), dtype=np.float32),
+            )
+        return (
+            indices[inliers],
+            reference_matched[inliers],
+            current_matched[inliers],
+        )
+
     def _redetect(self, gray):
         keypoints, _ = self.tracker.detectAndCompute(gray)
         self.ref_gray = gray
