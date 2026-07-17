@@ -600,6 +600,7 @@ if __name__ == "__main__":
         )
         wTc_pred = None
         pred_dt = float("inf")
+        imu_delta = None
         use_imu_pose_prior = (
             pi3x_cfg.get("imu_predict", False)
             and factor_graph.enable_ms
@@ -608,6 +609,7 @@ if __name__ == "__main__":
         if use_imu_pose_prior:
             dT, wTc_pred, pred_dt = factor_graph.predict_pose(i)
             if pred_dt <= pi3x_cfg.get("pose_prior_max_dt", 5.0):
+                imu_delta = dT
                 T_WC = matrix_to_sim3(wTc_pred)
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
         if use_calib:
@@ -644,17 +646,8 @@ if __name__ == "__main__":
                 frame.frame_id,
                 last_kf_frame_id,
                 tracking_result,
+                relative_motion=imu_delta,
             )
-            # Match the original backend's IMU-based keyframe selection adjustment.
-            if factor_graph.enable_ms and frame.frame_id > 100:
-                dT, wTc_pred, pred_dt = factor_graph.predict_pose(frame.frame_id)
-                if pred_dt <= 5.0:
-                    rot_norm = np.linalg.norm(Rotation.from_matrix(dT[0:3, 0:3]).as_rotvec())
-                    trans_norm = np.linalg.norm(dT[0:3, 3])
-                    if (not add_new_kf) and rot_norm > 30.0 / 57.3:
-                        add_new_kf = True
-                    if add_new_kf and trans_norm < 1.0 and rot_norm < 5.0 / 57.3:
-                        add_new_kf = False
             if add_new_kf:
                 sparse_map_was_initialized = sparse_map.initialized
                 initialize_delayed_keyframe_placeholders(states, frame)

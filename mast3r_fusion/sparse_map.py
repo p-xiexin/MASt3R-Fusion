@@ -80,7 +80,20 @@ class SparseMap:
         self.min_tracking_inliers = int(cfg.get("min_tracking_inliers", 20))
         self.ref_ratio = float(cfg.get("keyframe_ref_ratio", 0.9))
         self.min_points_for_keyframe = int(cfg.get("min_tracked_points_for_keyframe", 15))
+        self.min_keyframe_gap = int(cfg.get("min_keyframe_gap", 2))
         self.max_keyframe_gap = int(cfg.get("max_keyframe_gap", 20))
+        self.force_keyframe_rotation = np.deg2rad(
+            float(cfg.get("force_keyframe_gyro_deg", 30.0))
+        )
+        self.suppress_keyframe_rotation = np.deg2rad(
+            float(cfg.get("suppress_keyframe_gyro_deg", 5.0))
+        )
+        self.suppress_keyframe_translation = float(
+            cfg.get("suppress_keyframe_translation", 1.0)
+        )
+        self.suppress_keyframe_parallax = float(
+            cfg.get("suppress_keyframe_parallax", 3.0)
+        )
         self.min_triangulation_angle = np.deg2rad(
             float(cfg.get("min_triangulation_angle_deg", 0.5))
         )
@@ -103,16 +116,15 @@ class SparseMap:
             frames_since_keyframe=frames_since_keyframe,
         )
         tracking = self._empty_tracking_result()
+        if self.map_ready:
+            tracking = self._track_local_map(
+                frame,
+                self.flow.frame_gray(frame),
+            )
+            if tracking.tracking_ok:
+                self.initialized = True
         self.parallax_since_keyframe += float(
             flow_result.debug.get("avg_parallax", 0.0)
-        )
-        tracking.reference_tracked_points = int(
-            flow_result.debug.get("tracked_num", flow_result.pts.shape[0])
-        )
-        tracking.matched_inlier_map_points = int(
-            flow_result.debug.get(
-                "tracked_inlier_num", np.count_nonzero(flow_result.inlier_mask)
-            )
         )
         tracking.flow = flow_result
         flow_result.debug.update(
@@ -173,30 +185,95 @@ class SparseMap:
         last_keyframe_frame_id,
         result,
         local_mapping_idle=True,
+        relative_motion=None,
     ):
+        del local_mapping_idle
         gap = int(frame_id) - int(last_keyframe_frame_id)
-        if not self.initialized:
-            return bool(
-                gap >= self.initializer_min_frame_gap
-                and result.flow.pts.shape[0] >= self.initializer_min_features
-                and np.count_nonzero(result.flow.inlier_mask)
-                >= self.initializer_min_inliers
-            )
-
-        track_count = int(
+        flow_inliers = int(
             result.flow.debug.get(
                 "tracked_inlier_num", np.count_nonzero(result.flow.inlier_mask)
             )
         )
-        enough_points = track_count > self.min_points_for_keyframe
-        tracking_weakened = track_count < self.min_tracking_inliers
-        enough_motion = self.parallax_since_keyframe >= self.flow.cfg.keyframe_parallax
-        max_interval_reached = gap >= self.max_keyframe_gap
-        return bool(
-            (enough_motion and enough_points)
-            or tracking_weakened
-            or max_interval_reached
+        avg_parallax = float(result.flow.debug.get("avg_parallax", 0.0))
+        rotation = 0.0
+        translation = -1.0
+        has_relative_motion = relative_motion is not None
+        if relative_motion is not None:
+            relative_motion = np.asarray(relative_motion, dtype=np.float64)
+            rotation = float(
+                Rotation.from_matrix(relative_motion[:3, :3]).magnitude()
+            )
+            translation = float(np.linalg.norm(relative_motion[:3, 3]))
+
+        reference_points = int(result.reference_tracked_points)
+        matched_points = int(result.matched_inlier_map_points)
+        map_ratio = (
+            float(matched_points) / float(reference_points)
+            if reference_points > 0
+            else 0.0
         )
+        debug = result.flow.debug
+        debug.update(
+            {
+                "keyframe_gap": float(gap),
+                "keyframe_map_ratio": map_ratio,
+                "keyframe_rotation_deg": float(np.rad2deg(rotation)),
+                "keyframe_translation": translation,
+            }
+        )
+
+        def decide(value, reason):
+            debug["keyframe_selected"] = float(value)
+            debug["keyframe_reason"] = reason
+            return bool(value)
+
+        if gap < self.min_keyframe_gap:
+            return decide(False, "min_gap")
+        if gap >= self.max_keyframe_gap:
+            return decide(True, "max_gap")
+        if rotation >= self.force_keyframe_rotation:
+            return decide(True, "large_rotation")
+
+        if not self.initialized:
+            enough_features = (
+                result.flow.pts.shape[0] >= self.initializer_min_features
+            )
+            enough_inliers = flow_inliers >= self.initializer_min_inliers
+            candidate = bool(
+                gap >= self.initializer_min_frame_gap
+                and enough_features
+                and enough_inliers
+                and result.flow.new_keyframe
+            )
+            reason = "flow_initialization"
+        elif result.tracking_ok:
+            enough_map_points = matched_points >= self.min_points_for_keyframe
+            map_weakened = reference_points > 0 and map_ratio < self.ref_ratio
+            enough_motion = (
+                self.parallax_since_keyframe
+                >= self.flow.cfg.keyframe_parallax
+            )
+            candidate = bool(
+                enough_map_points and (map_weakened or enough_motion)
+            )
+            reason = "map_weakened" if map_weakened else "map_motion"
+        else:
+            candidate = bool(
+                result.flow.new_keyframe
+                and flow_inliers >= self.initializer_min_inliers
+            )
+            reason = "flow_fallback"
+
+        low_rotation = rotation < self.suppress_keyframe_rotation
+        low_translation = (
+            has_relative_motion
+            and translation < self.suppress_keyframe_translation
+        )
+        low_parallax = avg_parallax < self.suppress_keyframe_parallax
+        if candidate and low_rotation and low_translation and low_parallax:
+            return decide(False, "low_motion")
+
+        return decide(candidate, reason if candidate else "no_trigger")
 
     def register_keyframe(self, keyframe_idx, frame, result=None):
         previous_idx = self.last_keyframe_idx
@@ -452,6 +529,8 @@ class SparseMap:
         if correspondences is None:
             return empty
         world_points, image_points, point_ids = correspondences
+        correspondence_count = int(world_points.shape[0])
+        empty.reference_tracked_points = correspondence_count
         if world_points.shape[0] < 6:
             return empty
 
@@ -474,7 +553,7 @@ class SparseMap:
             flow=None,
             tracking_ok=True,
             reference_keyframe_idx=self.reference_keyframe_idx,
-            reference_tracked_points=self._reference_point_count(),
+            reference_tracked_points=correspondence_count,
             matched_inlier_map_points=int(inlier_ids.shape[0]),
             inlier_point_ids=inlier_ids.astype(np.int64),
             inlier_image_points=image_points[inlier_mask].astype(np.float64),
