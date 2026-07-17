@@ -639,6 +639,16 @@ if __name__ == "__main__":
                 last_kf_frame_id,
                 tracking_result,
             )
+            # Match the original backend's IMU-based keyframe selection adjustment.
+            if factor_graph.enable_ms and frame.frame_id > 100:
+                dT, wTc_pred, pred_dt = factor_graph.predict_pose(frame.frame_id)
+                if pred_dt <= 5.0:
+                    rot_norm = np.linalg.norm(Rotation.from_matrix(dT[0:3, 0:3]).as_rotvec())
+                    trans_norm = np.linalg.norm(dT[0:3, 3])
+                    if (not add_new_kf) and rot_norm > 30.0 / 57.3:
+                        add_new_kf = True
+                    if add_new_kf and trans_norm < 1.0 and rot_norm < 5.0 / 57.3:
+                        add_new_kf = False
             if add_new_kf:
                 sparse_map_was_initialized = sparse_map.initialized
                 initialize_delayed_keyframe_placeholders(states, frame)
