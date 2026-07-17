@@ -306,8 +306,14 @@ def run_pi3x_window_backend_indices(states, keyframes, indices):
     )
     save_pi3x_pose_debug(window_indices, window_frames, poses)
     for local_idx, frame in enumerate(window_frames):
-        frame.update_pointmap(Xs[local_idx : local_idx + 1], Cs[local_idx : local_idx + 1])
-        keyframes[window_indices[local_idx]] = frame
+        # A persistent keyframe pointmap must stay fixed after its first visual
+        # initialization. Pair/window geometry is only used to build matches.
+        if frame.N == 0:
+            frame.update_pointmap(
+                Xs[local_idx : local_idx + 1],
+                Cs[local_idx : local_idx + 1],
+            )
+            keyframes[window_indices[local_idx]] = frame
 
     matches = [constraints[edge] for edge in local_edges]
     window_start = min(all_kf_idx + all_frame_idx)

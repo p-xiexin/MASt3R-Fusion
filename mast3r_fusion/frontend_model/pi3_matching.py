@@ -120,7 +120,11 @@ def project_to_index(
     max_3d_distance: float = None,
     return_debug: bool = False,
 ):
-    """Project source-grid points in destination coordinates to destination indices."""
+    """Project source-grid points to destination indices using geometry only.
+
+    Confidence diagnostics and ``pair_conf`` are returned separately so the
+    tracker or factor graph can apply its own confidence policy once.
+    """
 
     points_dst = _ensure_batch_points(points_dst)
     target_points = _ensure_batch_points(target_points)
@@ -174,8 +178,6 @@ def project_to_index(
         & finite_projection
         & positive_depth
         & positive_target_depth
-        & valid_conf_src
-        & valid_conf_dst
         & valid_distance
         & in_bounds
     )

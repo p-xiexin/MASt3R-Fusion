@@ -436,14 +436,16 @@ def pi3x_match_window_edges(model, frames, edges, subpixel_factor=1):
         pose_j = poses[edge_j : edge_j + 1]
         K_i = _frame_intrinsics_for_match(frames[edge_i], Xii)
         K_j = _frame_intrinsics_for_match(frames[edge_j], Xjj)
-        idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
+        idx_i2j, valid_match_j, _ = pi3_matching.match(
             Xjj, Xii, pose_j, pose_i, Cjj, Cii, K_dst=K_i,
             conf_threshold=conf_threshold
         )
-        idx_j2i, valid_match_i, pair_conf_j2i = pi3_matching.match(
+        idx_j2i, valid_match_i, _ = pi3_matching.match(
             Xii, Xjj, pose_i, pose_j, Cii, Cjj, K_dst=K_j,
             conf_threshold=conf_threshold
         )
+        # The factor graph combines destination and source confidences itself.
+        # Keep Qji/Qij as single-frame values, matching MASt3R's contract.
         constraints[(edge_i, edge_j)] = (
             idx_i2j,
             idx_j2i,
@@ -451,8 +453,8 @@ def pi3x_match_window_edges(model, frames, edges, subpixel_factor=1):
             valid_match_i,
             C_flat[edge_i : edge_i + 1],
             C_flat[edge_j : edge_j + 1],
-            pair_conf_i2j,
-            pair_conf_j2i,
+            C_flat[edge_j : edge_j + 1],
+            C_flat[edge_i : edge_i + 1],
         )
 
     return X_flat, C_flat, poses, constraints
@@ -634,11 +636,11 @@ def pi3x_match_symmetric(
     K_j = None if any(K is None for K in K_j) else torch.stack(K_j)
 
     conf_threshold = _match_conf_threshold()
-    idx_i2j, valid_match_j, pair_conf_i2j = pi3_matching.match(
+    idx_i2j, valid_match_j, _ = pi3_matching.match(
         Xjj, Xii, pose_j, pose_i, Cjj, Cii, K_dst=K_i,
         conf_threshold=conf_threshold
     )
-    idx_j2i, valid_match_i, pair_conf_j2i = pi3_matching.match(
+    idx_j2i, valid_match_i, _ = pi3_matching.match(
         Xii, Xjj, pose_i, pose_j, Cii, Cjj, K_dst=K_j,
         conf_threshold=conf_threshold
     )
@@ -650,8 +652,8 @@ def pi3x_match_symmetric(
         valid_match_i,
         Qii.view(b, -1, 1),
         Qjj.view(b, -1, 1),
-        pair_conf_i2j,
-        pair_conf_j2i,
+        Qji.view(b, -1, 1),
+        Qij.view(b, -1, 1),
     )
 
 
@@ -722,5 +724,4 @@ def pi3x_match_asymmetric(
     Xii, Xji = einops.rearrange(X, "b h w c -> b (h w) c")
     Cii, Cji = einops.rearrange(C, "b h w -> b (h w) 1")
     Qii, Qji = einops.rearrange(Q, "b h w -> b (h w) 1")
-    Qji = pair_conf_i2j[0]
     return idx_i2j, valid_match_j, Xii, Cii, Qii, Xji, Cji, Qji
