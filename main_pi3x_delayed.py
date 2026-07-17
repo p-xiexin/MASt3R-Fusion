@@ -632,7 +632,11 @@ if __name__ == "__main__":
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
             initial_keyframe_idx = len(keyframes) - 1 + keyframes.rollup_sum.value
-            sparse_map.register_keyframe(initial_keyframe_idx, frame)
+            sparse_map.register_keyframe(
+                initial_keyframe_idx,
+                frame,
+                tracking_result,
+            )
             update_sparse_map_points(states, sparse_map)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame, notify=sparse_map_overlay is None)
@@ -647,6 +651,7 @@ if __name__ == "__main__":
                 last_kf_frame_id,
                 tracking_result,
                 relative_motion=imu_delta,
+                gyro_R=camera_gyro_R,
             )
             if add_new_kf:
                 sparse_map_was_initialized = sparse_map.initialized

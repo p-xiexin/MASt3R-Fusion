@@ -67,6 +67,7 @@ class SparseMap:
         self.map_ready = False
         self.initialized = False
         self.parallax_since_keyframe = 0.0
+        self.reference_flow_tracks = 0
 
         self.max_local_keyframes = int(cfg.get("local_keyframes", 80))
         self.max_points_per_keyframe = int(cfg.get("map_points_per_keyframe", 2000))
@@ -116,17 +117,20 @@ class SparseMap:
             frames_since_keyframe=frames_since_keyframe,
         )
         tracking = self._empty_tracking_result()
-        if self.map_ready:
-            tracking = self._track_local_map(
-                frame,
-                self.flow.frame_gray(frame),
-            )
-            if tracking.tracking_ok:
-                self.initialized = True
         self.parallax_since_keyframe += float(
             flow_result.debug.get("avg_parallax", 0.0)
         )
         tracking.flow = flow_result
+        flow_inliers = int(
+            flow_result.debug.get(
+                "tracked_inlier_num", np.count_nonzero(flow_result.inlier_mask)
+            )
+        )
+        flow_ref_ratio = (
+            float(flow_inliers) / float(self.reference_flow_tracks)
+            if self.reference_flow_tracks > 0
+            else 1.0
+        )
         flow_result.debug.update(
             {
                 "map_ready": float(self.map_ready),
@@ -140,6 +144,8 @@ class SparseMap:
                     if tracking.reference_tracked_points > 0
                     else 0.0
                 ),
+                "flow_ref_track_num": float(self.reference_flow_tracks),
+                "flow_ref_ratio": flow_ref_ratio,
                 "parallax_since_keyframe": self.parallax_since_keyframe,
             }
         )
@@ -186,6 +192,7 @@ class SparseMap:
         result,
         local_mapping_idle=True,
         relative_motion=None,
+        gyro_R=None,
     ):
         del local_mapping_idle
         gap = int(frame_id) - int(last_keyframe_frame_id)
@@ -204,19 +211,22 @@ class SparseMap:
                 Rotation.from_matrix(relative_motion[:3, :3]).magnitude()
             )
             translation = float(np.linalg.norm(relative_motion[:3, 3]))
+        elif gyro_R is not None:
+            gyro_R = np.asarray(gyro_R, dtype=np.float64)
+            rotation = float(Rotation.from_matrix(gyro_R[:3, :3]).magnitude())
 
-        reference_points = int(result.reference_tracked_points)
-        matched_points = int(result.matched_inlier_map_points)
-        map_ratio = (
-            float(matched_points) / float(reference_points)
+        reference_points = int(self.reference_flow_tracks)
+        track_ratio = (
+            float(flow_inliers) / float(reference_points)
             if reference_points > 0
-            else 0.0
+            else 1.0
         )
         debug = result.flow.debug
         debug.update(
             {
                 "keyframe_gap": float(gap),
-                "keyframe_map_ratio": map_ratio,
+                "keyframe_reference_tracks": float(reference_points),
+                "keyframe_track_ratio": track_ratio,
                 "keyframe_rotation_deg": float(np.rad2deg(rotation)),
                 "keyframe_translation": translation,
             }
@@ -234,40 +244,33 @@ class SparseMap:
         if rotation >= self.force_keyframe_rotation:
             return decide(True, "large_rotation")
 
-        if not self.initialized:
-            enough_features = (
-                result.flow.pts.shape[0] >= self.initializer_min_features
-            )
-            enough_inliers = flow_inliers >= self.initializer_min_inliers
-            candidate = bool(
-                gap >= self.initializer_min_frame_gap
-                and enough_features
-                and enough_inliers
-                and result.flow.new_keyframe
-            )
-            reason = "flow_initialization"
-        elif result.tracking_ok:
-            enough_map_points = matched_points >= self.min_points_for_keyframe
-            map_weakened = reference_points > 0 and map_ratio < self.ref_ratio
-            enough_motion = (
-                self.parallax_since_keyframe
-                >= self.flow.cfg.keyframe_parallax
-            )
-            candidate = bool(
-                enough_map_points and (map_weakened or enough_motion)
-            )
-            reason = "map_weakened" if map_weakened else "map_motion"
+        enough_points = flow_inliers >= self.min_points_for_keyframe
+        tracking_weakened = (
+            reference_points > 0 and track_ratio < self.ref_ratio
+        )
+        enough_motion = (
+            self.parallax_since_keyframe >= self.flow.cfg.keyframe_parallax
+        )
+        flow_fallback = bool(
+            result.flow.new_keyframe
+            and flow_inliers >= self.initializer_min_inliers
+        )
+        candidate = bool(
+            (tracking_weakened and enough_points)
+            or (enough_motion and enough_points)
+            or flow_fallback
+        )
+        if tracking_weakened and enough_points:
+            reason = "track_ratio"
+        elif enough_motion and enough_points:
+            reason = "flow_motion"
         else:
-            candidate = bool(
-                result.flow.new_keyframe
-                and flow_inliers >= self.initializer_min_inliers
-            )
             reason = "flow_fallback"
 
         low_rotation = rotation < self.suppress_keyframe_rotation
         low_translation = (
-            has_relative_motion
-            and translation < self.suppress_keyframe_translation
+            not has_relative_motion
+            or translation < self.suppress_keyframe_translation
         )
         low_parallax = avg_parallax < self.suppress_keyframe_parallax
         if candidate and low_rotation and low_translation and low_parallax:
@@ -303,6 +306,14 @@ class SparseMap:
 
         self.last_keyframe_idx = record.keyframe_idx
         self.reference_keyframe_idx = record.keyframe_idx
+        if result is not None and result.flow is not None:
+            self.reference_flow_tracks = int(
+                np.count_nonzero(result.flow.inlier_mask)
+            )
+        else:
+            self.reference_flow_tracks = int(self.flow.ref_pts.shape[0])
+            if self.reference_flow_tracks == 0:
+                self.reference_flow_tracks = int(keypoints.shape[0])
         was_ready = self.map_ready
         self.map_ready = (
             self._reference_point_count() >= self.min_tracking_inliers
@@ -529,8 +540,6 @@ class SparseMap:
         if correspondences is None:
             return empty
         world_points, image_points, point_ids = correspondences
-        correspondence_count = int(world_points.shape[0])
-        empty.reference_tracked_points = correspondence_count
         if world_points.shape[0] < 6:
             return empty
 
@@ -553,7 +562,7 @@ class SparseMap:
             flow=None,
             tracking_ok=True,
             reference_keyframe_idx=self.reference_keyframe_idx,
-            reference_tracked_points=correspondence_count,
+            reference_tracked_points=self._reference_point_count(),
             matched_inlier_map_points=int(inlier_ids.shape[0]),
             inlier_point_ids=inlier_ids.astype(np.int64),
             inlier_image_points=image_points[inlier_mask].astype(np.float64),
